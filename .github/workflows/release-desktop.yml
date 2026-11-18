@@ -5,13 +5,56 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version identifier (e.g. v.1.0.0 or v1.0.0)'
+        required: true
+        default: 'v.1.0.0'
+        type: string
+      publish_release:
+        description: 'Create GitHub Release with all installers'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
 
 jobs:
+  prepare:
+    name: Resolve Release Version
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.ver.outputs.release_tag }}
+      semver: ${{ steps.ver.outputs.semver }}
+    steps:
+      - name: Compute version identifier
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW_TAG="${{ github.event.inputs.version }}"
+          else
+            RAW_TAG="${{ github.ref_name }}"
+          fi
+          RAW_TAG="$(echo "$RAW_TAG" | tr -d '[:space:]')"
+          if [ -z "$RAW_TAG" ]; then
+            RAW_TAG="v.1.0.0"
+          fi
+
+          # Strip leading "v." or "v" to produce valid SemVer for electron-builder & installers
+          CLEAN_VER="$(echo "$RAW_TAG" | sed -E 's/^[vV]\.?//')"
+          if ! echo "$CLEAN_VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            CLEAN_VER="1.0.0"
+          fi
+
+          echo "release_tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "semver=$CLEAN_VER" >> "$GITHUB_OUTPUT"
+          echo "Resolved release_tag=$RAW_TAG, semver=$CLEAN_VER"
+
   build-desktop:
-    name: Build ${{ matrix.platform }}
+    name: Build ${{ matrix.platform }} (${{ needs.prepare.outputs.release_tag }})
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -35,26 +78,40 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
 
       - name: Install application dependencies
-        run: npm ci
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Set package version (${{ needs.prepare.outputs.semver }})
+        shell: bash
+        run: npm version "${{ needs.prepare.outputs.semver }}" --no-git-tag-version --allow-same-version
 
       - name: Build DocuTrack web bundle
+        shell: bash
         run: npm run build
 
       - name: Install Electron & electron-builder
-        run: npm install --no-save electron@^34.0.0 electron-builder@^25.1.8
+        shell: bash
+        run: npm install --no-save --no-audit --no-fund electron@^34.0.0 electron-builder@^25.1.8
 
       - name: Package ${{ matrix.platform }} installer
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npx electron-builder --config electron-builder.yml ${{ matrix.builder_args }} --publish never
 
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: docutrack-${{ matrix.platform }}
+          name: docutrack-${{ matrix.platform }}-${{ needs.prepare.outputs.semver }}
+          if-no-files-found: error
           path: |
             release/*.exe
             release/*.AppImage
@@ -63,9 +120,9 @@ jobs:
             !release/*unpacked*
 
   publish-release:
-    name: Publish GitHub Release
-    needs: build-desktop
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Publish GitHub Release (${{ needs.prepare.outputs.release_tag }})
+    needs: [prepare, build-desktop]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == true)
     runs-on: ubuntu-latest
     steps:
       - name: Download all platform artifacts
@@ -79,6 +136,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: DocuTrack ${{ needs.prepare.outputs.release_tag }}
           generate_release_notes: true
           files: |
             artifacts/*.exe

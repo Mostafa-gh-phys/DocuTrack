@@ -347,7 +347,9 @@ export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
               Automated multi-OS Electron packaging configured in{' '}
               <code className="font-mono text-[11px]">.github/workflows/release-desktop.yml</code> and{' '}
               <code className="font-mono text-[11px]">electron-builder.yml</code>. Push a{' '}
-              <code className="font-mono text-[11px]">v*</code> tag or dispatch the workflow on GitHub to build native binaries.
+              <code className="font-mono text-[11px]">v*</code> tag or run{' '}
+              <code className="font-mono text-[11px]">workflow_dispatch</code> with a version identifier (e.g.{' '}
+              <code className="font-mono text-[11px]">v.1.0.0</code>) on GitHub to build and publish native binaries.
             </p>
           </div>
         </div>

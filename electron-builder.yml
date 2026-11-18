@@ -1,6 +1,8 @@
 appId: app.docutrack.reader
 productName: DocuTrack
+executableName: DocuTrack
 copyright: Copyright © DocuTrack Contributors
+npmRebuild: false
 directories:
   output: release
 files:
@@ -8,6 +10,7 @@ files:
   - electron/**/*
   - package.json
 extraMetadata:
+  name: docutrack
   main: electron/main.cjs
 fileAssociations:
   - ext: pdf
@@ -20,6 +23,7 @@ fileAssociations:
     name: DjVu Archive
     role: Viewer
 win:
+  icon: public/pwa-512x512.png
   target:
     - target: nsis
       arch:
@@ -30,6 +34,7 @@ nsis:
   perMachine: false
   allowToChangeInstallationDirectory: true
 linux:
+  icon: public/pwa-512x512.png
   target:
     - target: AppImage
       arch:
@@ -37,6 +42,8 @@ linux:
   category: Office;Education;Viewer
   artifactName: DocuTrack-${version}-${arch}.${ext}
 mac:
+  icon: public/pwa-512x512.png
+  identity: null
   target:
     - target: dmg
       arch:
@@ -48,3 +55,5 @@ mac:
         - arm64
   category: public.app-category.productivity
   artifactName: DocuTrack-${version}-${arch}.${ext}
+dmg:
+  sign: false
