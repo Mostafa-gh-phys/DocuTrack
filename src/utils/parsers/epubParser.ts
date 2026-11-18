@@ -148,3 +148,122 @@ export async function parseEpubDocument(buffer: ArrayBuffer): Promise<ParsedEpub
 
   return {title, author, language, chapters};
 }
+
+function fastStripHtmlToText(rawHtml: string): string {
+  return rawHtml
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export async function parseEpubQuickIndex(
+  buffer: ArrayBuffer,
+  maxSampleChapters = 10,
+): Promise<{
+  title?: string;
+  author?: string;
+  language?: string;
+  chapterCount: number;
+  chapters: {index: number; title: string; plainText: string}[];
+}> {
+  const zip = await JSZip.loadAsync(buffer);
+  const parser = new DOMParser();
+
+  let opfPath = 'OEBPS/content.opf';
+  const containerFile = zip.file('META-INF/container.xml');
+  if (containerFile) {
+    const containerXml = await containerFile.async('text');
+    const containerDoc = parser.parseFromString(containerXml, 'application/xml');
+    const fullPath = containerDoc.querySelector('rootfile')?.getAttribute('full-path');
+    if (fullPath) opfPath = fullPath;
+  }
+
+  const opfFile = zip.file(opfPath);
+  if (!opfFile) {
+    throw new Error('Invalid EPUB archive: missing content.opf');
+  }
+
+  const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/')) : '';
+  const opfXml = await opfFile.async('text');
+  const opfDoc = parser.parseFromString(opfXml, 'application/xml');
+
+  const getMetaText = (selector: string): string | undefined => {
+    const val = opfDoc.querySelector(selector)?.textContent?.trim();
+    return val || undefined;
+  };
+
+  const title = getMetaText('title, dc\\:title');
+  const author = getMetaText('creator, dc\\:creator');
+  const language = getMetaText('language, dc\\:language');
+
+  const manifest = new Map<string, string>();
+  opfDoc.querySelectorAll('manifest > item').forEach((item) => {
+    const id = item.getAttribute('id');
+    const href = item.getAttribute('href');
+    if (id && href) {
+      manifest.set(id, resolvePath(opfDir, decodeURIComponent(href)));
+    }
+  });
+
+  const tocTitleByHref = new Map<string, string>();
+  const ncxId = opfDoc.querySelector('spine')?.getAttribute('toc');
+  const ncxHref =
+    (ncxId && manifest.get(ncxId)) || Array.from(manifest.values()).find((href) => href.endsWith('.ncx'));
+  if (ncxHref) {
+    const ncxFile = zip.file(ncxHref);
+    if (ncxFile) {
+      const ncxXml = await ncxFile.async('text');
+      const ncxDoc = parser.parseFromString(ncxXml, 'application/xml');
+      const ncxDir = ncxHref.includes('/') ? ncxHref.slice(0, ncxHref.lastIndexOf('/')) : '';
+      ncxDoc.querySelectorAll('navPoint').forEach((np) => {
+        const label = np.querySelector('navLabel > text')?.textContent?.trim();
+        const src = np.querySelector('content')?.getAttribute('src');
+        if (label && src) {
+          tocTitleByHref.set(resolvePath(ncxDir, decodeURIComponent(src)), label);
+        }
+      });
+    }
+  }
+
+  const spineHrefs = Array.from(opfDoc.querySelectorAll('spine > itemref'))
+    .map((ref) => ref.getAttribute('idref'))
+    .filter((id): id is string => Boolean(id))
+    .map((id) => manifest.get(id))
+    .filter((href): href is string => Boolean(href));
+
+  if (spineHrefs.length === 0) {
+    throw new Error('EPUB contains no readable chapters in spine');
+  }
+
+  const sampleLimit = maxSampleChapters > 0 ? Math.min(spineHrefs.length, maxSampleChapters) : spineHrefs.length;
+  const sampleHrefs = spineHrefs.slice(0, sampleLimit);
+
+  const sampled = await Promise.all(
+    sampleHrefs.map(async (href, i) => {
+      const chapterFile = zip.file(href);
+      const rawHtml = chapterFile ? await chapterFile.async('text') : '';
+      const plainText = fastStripHtmlToText(rawHtml);
+      const chTitle = tocTitleByHref.get(href) || `Chapter ${i + 1}`;
+      return {
+        index: i + 1,
+        title: chTitle,
+        plainText,
+      };
+    }),
+  );
+
+  return {
+    title,
+    author,
+    language,
+    chapterCount: spineHrefs.length,
+    chapters: sampled,
+  };
+}

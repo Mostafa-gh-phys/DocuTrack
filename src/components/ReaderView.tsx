@@ -49,7 +49,7 @@ import {
 import {getBookBinary, getBookTextChunks} from '../utils/offlineStorage';
 import {openDjvuDocument, renderDjvuPageToCanvas} from '../utils/parsers/djvuParser';
 import {parseEpubDocument, type ParsedEpubDocument} from '../utils/parsers/epubParser';
-import {extractPdfMetadataAndText, loadPdfDocument, renderPdfPageToCanvas} from '../utils/parsers/pdfParser';
+import {extractPdfOutlineAndMeta, loadPdfDocument, renderPdfPageToCanvas} from '../utils/parsers/pdfParser';
 
 export type ZoteroTool = 'select' | 'highlight' | 'underline' | 'note' | 'area' | 'ink';
 
@@ -313,22 +313,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           setTotalPages(parsed.chapters.length);
         } else if (book.format === 'pdf') {
           const doc = await loadPdfDocument(buffer);
-          const info = await extractPdfMetadataAndText(buffer);
+          const info = await extractPdfOutlineAndMeta(doc);
           if (cancelled) return;
           setPdfDoc(doc);
           setPdfOutline(info.outline);
           setTotalPages(doc.numPages);
-          if (storedChunks.length === 0) {
-            setTextChunks(
-              info.pageTexts.map((p) => ({
-                bookId: book.id,
-                bookTitle: book.title,
-                page: p.page,
-                chapterTitle: `Page ${p.page}`,
-                text: p.text,
-              })),
-            );
-          }
         } else if (book.format === 'djvu') {
           const doc = await openDjvuDocument(buffer);
           if (cancelled) return;
@@ -419,8 +408,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     if (book.format === 'djvu' && djvuPageText) {
       return djvuPageText;
     }
-    return textChunks.find((c) => c.page === currentPage)?.text || book.excerpt || '';
-  }, [book.format, book.excerpt, epubDoc, currentPage, djvuPageText, textChunks]);
+    const chunkText = textChunks.find((c) => c.page === currentPage)?.text;
+    if (chunkText) return chunkText;
+    if (book.format === 'pdf' && pdfTextItems.length > 0) {
+      return pdfTextItems.map((item) => item.str).join(' ').replace(/\s+/g, ' ').trim();
+    }
+    return book.excerpt || '';
+  }, [book.format, book.excerpt, epubDoc, currentPage, djvuPageText, textChunks, pdfTextItems]);
 
   const currentChapterTitle = useMemo(() => {
     if (book.format === 'epub' && epubDoc) {

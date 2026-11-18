@@ -42,7 +42,9 @@ import {
   buildFolderTree,
   calculateProgress,
   createDefaultReadingGoal,
+  detectSupportedBookFormat,
   recordReadingActivity,
+  runWithConcurrency,
   sanitizeId,
   searchLocalSemanticChunks,
   sortAndFilterBooks,
@@ -55,6 +57,7 @@ import {
   deleteBookLocal,
   estimateOfflineStorageBytes,
   getBackupArchiveById,
+  indexRemainingBookChunks,
   ingestImportedFile,
   initializeLibraryStore,
   restoreFromArchive,
@@ -297,34 +300,60 @@ export default function App() {
   );
 
   const handleImportFileList = async (files: FileList | File[]) => {
-    const fileArr = Array.from(files);
-    if (fileArr.length === 0) return;
-
-    const ownerId = user?.uid || 'local';
-    let importedCount = 0;
-    const newBooks: BookMetadata[] = [];
-    const newChunks: DocumentTextChunk[] = [];
-
-    for (const file of fileArr) {
-      const res = await ingestImportedFile(file, ownerId);
-      if (res) {
-        importedCount += 1;
-        newBooks.push(res.book);
-        newChunks.push(...res.chunks);
-        if (user?.emailVerified && isOnline && !simulatedOffline) {
-          void syncBookToCloud(user.uid, res.book);
-        }
-      }
+    const supportedFiles = Array.from(files).filter((f) => detectSupportedBookFormat(f.name) !== null);
+    if (supportedFiles.length === 0) {
+      setImportNotice('No supported PDF, EPUB, or DjVu files were found in the selection.');
+      window.setTimeout(() => setImportNotice(null), 4500);
+      return;
     }
 
-    if (importedCount > 0) {
+    const ownerId = user?.uid || 'local';
+    setImportNotice(
+      `Importing ${supportedFiles.length} document${supportedFiles.length > 1 ? 's' : ''}...`,
+    );
+
+    const results = await runWithConcurrency(supportedFiles, 3, async (file) => {
+      const res = await ingestImportedFile(file, ownerId);
+      if (res && user?.emailVerified && isOnline && !simulatedOffline) {
+        void syncBookToCloud(user.uid, res.book);
+      }
+      return res;
+    });
+
+    const successful = results.filter(
+      (r): r is NonNullable<typeof r> => r !== null,
+    );
+
+    if (successful.length > 0) {
+      const newBooks = successful.map((r) => r.book);
+      const newChunks = successful.flatMap((r) => r.chunks);
       setBooks((prev) => [...newBooks, ...prev]);
       setTextChunks((prev) => [...newChunks, ...prev]);
       setOfflineBytes(await estimateOfflineStorageBytes());
-      setImportNotice(`Imported ${importedCount} document${importedCount > 1 ? 's' : ''} into your library.`);
+      setImportNotice(
+        `Imported ${successful.length} document${successful.length > 1 ? 's' : ''} into your library.`,
+      );
       scheduleAutoBackup();
+
+      // Quietly index remaining pages of multi-page documents in background without blocking UI
+      const pendingIndex = successful.filter((r) => r.needsFullIndex);
+      if (pendingIndex.length > 0) {
+        window.setTimeout(() => {
+          void (async () => {
+            for (const item of pendingIndex) {
+              const fullChunks = await indexRemainingBookChunks(item.book, item.chunks);
+              if (fullChunks.length > item.chunks.length) {
+                setTextChunks((prev) => [
+                  ...prev.filter((c) => c.bookId !== item.book.id),
+                  ...fullChunks,
+                ]);
+              }
+            }
+          })();
+        }, 120);
+      }
     } else {
-      setImportNotice('No supported PDF, EPUB, or DjVu files were found in the selection.');
+      setImportNotice('No supported PDF, EPUB, or DjVu files could be imported.');
     }
     window.setTimeout(() => setImportNotice(null), 4500);
   };
@@ -341,6 +370,7 @@ export default function App() {
           if (!handle.values) return;
           for await (const entry of handle.values()) {
             if (entry.kind === 'file' && entry.getFile) {
+              if (!detectSupportedBookFormat(entry.name)) continue;
               const f = await entry.getFile();
               Object.defineProperty(f, 'webkitRelativePath', {
                 value: `${prefix}/${f.name}`,

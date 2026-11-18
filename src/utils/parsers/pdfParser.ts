@@ -1,4 +1,4 @@
-import * as pdfjsLib from 'pdfjs-dist';
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/workers/pdf.worker.min.mjs';
 
@@ -16,64 +16,100 @@ export async function loadPdfDocument(buffer: ArrayBuffer): Promise<pdfjsLib.PDF
   return await loadingTask.promise;
 }
 
-export async function extractPdfMetadataAndText(buffer: ArrayBuffer): Promise<ParsedPdfInfo> {
-  const doc = await loadPdfDocument(buffer);
-  const pageTexts: {page: number; text: string}[] = [];
-
-  for (let i = 1; i <= doc.numPages; i++) {
-    const page = await doc.getPage(i);
-    const content = await page.getTextContent();
-    const text = content.items
-      .map((item) => ('str' in item ? item.str : ''))
-      .join(' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-    pageTexts.push({page: i, text});
-  }
-
+export async function extractPdfOutlineAndMeta(doc: pdfjsLib.PDFDocumentProxy): Promise<{
+  title?: string;
+  author?: string;
+  outline: {title: string; page: number}[];
+}> {
   let title: string | undefined;
   let author: string | undefined;
-  try {
-    const meta = await doc.getMetadata();
-    const info = meta.info as Record<string, unknown> | undefined;
-    if (info && typeof info.Title === 'string' && info.Title.trim()) title = info.Title.trim();
-    if (info && typeof info.Author === 'string' && info.Author.trim()) author = info.Author.trim();
-  } catch {
-    // Metadata optional
-  }
-
   const outline: {title: string; page: number}[] = [];
-  try {
-    const rawOutline = await doc.getOutline();
-    if (rawOutline) {
-      for (const item of rawOutline.slice(0, 30)) {
-        let pageNum = 1;
-        if (Array.isArray(item.dest) && item.dest[0]) {
-          try {
-            const idx = await doc.getPageIndex(item.dest[0]);
-            pageNum = idx + 1;
-          } catch {
-            pageNum = 1;
+
+  await Promise.all([
+    (async () => {
+      try {
+        const meta = await doc.getMetadata();
+        const info = meta.info as Record<string, unknown> | undefined;
+        if (info && typeof info.Title === 'string' && info.Title.trim()) title = info.Title.trim();
+        if (info && typeof info.Author === 'string' && info.Author.trim()) author = info.Author.trim();
+      } catch {
+        // Metadata optional
+      }
+    })(),
+    (async () => {
+      try {
+        const rawOutline = await doc.getOutline();
+        if (rawOutline) {
+          for (const item of rawOutline.slice(0, 30)) {
+            let pageNum = 1;
+            if (Array.isArray(item.dest) && item.dest[0]) {
+              try {
+                const idx = await doc.getPageIndex(item.dest[0]);
+                pageNum = idx + 1;
+              } catch {
+                pageNum = 1;
+              }
+            }
+            outline.push({title: item.title, page: pageNum});
           }
         }
-        outline.push({title: item.title, page: pageNum});
+      } catch {
+        // Outline optional
       }
-    }
-  } catch {
-    // Outline optional
-  }
+    })(),
+  ]);
 
   if (outline.length === 0) {
-    for (let i = 1; i <= doc.numPages; i++) {
+    const cap = Math.min(doc.numPages, 200);
+    for (let i = 1; i <= cap; i++) {
       outline.push({title: `Page ${i}`, page: i});
     }
   }
 
+  return {title, author, outline};
+}
+
+export async function extractPdfPageTextRange(
+  doc: pdfjsLib.PDFDocumentProxy,
+  startPage: number,
+  endPage: number,
+): Promise<{page: number; text: string}[]> {
+  const start = Math.max(1, startPage);
+  const end = Math.min(doc.numPages, endPage);
+  if (end < start) return [];
+
+  const pageNumbers = Array.from({length: end - start + 1}, (_, i) => start + i);
+  return await Promise.all(
+    pageNumbers.map(async (pageNum) => {
+      const page = await doc.getPage(pageNum);
+      const content = await page.getTextContent();
+      const text = content.items
+        .map((item) => ('str' in item ? item.str : ''))
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return {page: pageNum, text};
+    }),
+  );
+}
+
+export async function extractPdfMetadataAndText(
+  buffer: ArrayBuffer,
+  maxPagesToIndex = 10,
+): Promise<ParsedPdfInfo> {
+  const doc = await loadPdfDocument(buffer);
+  const sampleLimit = maxPagesToIndex > 0 ? Math.min(doc.numPages, maxPagesToIndex) : doc.numPages;
+
+  const [metaAndOutline, pageTexts] = await Promise.all([
+    extractPdfOutlineAndMeta(doc),
+    extractPdfPageTextRange(doc, 1, sampleLimit),
+  ]);
+
   return {
     pageCount: doc.numPages,
-    title,
-    author,
-    outline,
+    title: metaAndOutline.title,
+    author: metaAndOutline.author,
+    outline: metaAndOutline.outline,
     pageTexts,
   };
 }

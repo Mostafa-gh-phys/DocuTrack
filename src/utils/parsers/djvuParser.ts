@@ -20,16 +20,32 @@ export async function openDjvuDocument(buffer: ArrayBuffer): Promise<WasmDocumen
   return WasmDocument.from_bytes(bytes);
 }
 
-export async function extractDjvuMetadataAndText(buffer: ArrayBuffer): Promise<ParsedDjvuInfo> {
-  const doc = await openDjvuDocument(buffer);
+export function extractDjvuPageTextRange(
+  doc: WasmDocument,
+  startPage: number,
+  endPage: number,
+): {page: number; text: string}[] {
   const pageCount = doc.page_count();
+  const start = Math.max(1, startPage);
+  const end = Math.min(pageCount, endPage);
   const pageTexts: {page: number; text: string}[] = [];
 
-  for (let i = 0; i < pageCount; i++) {
-    const page = doc.page(i);
+  for (let p = start; p <= end; p++) {
+    const page = doc.page(p - 1);
     const text = page.text() || '';
-    pageTexts.push({page: i + 1, text: text.trim()});
+    pageTexts.push({page: p, text: text.trim()});
   }
+  return pageTexts;
+}
+
+export async function extractDjvuMetadataAndText(
+  buffer: ArrayBuffer,
+  maxPagesToIndex = 10,
+): Promise<ParsedDjvuInfo> {
+  const doc = await openDjvuDocument(buffer);
+  const pageCount = doc.page_count();
+  const sampleLimit = maxPagesToIndex > 0 ? Math.min(pageCount, maxPagesToIndex) : pageCount;
+  const pageTexts = extractDjvuPageTextRange(doc, 1, sampleLimit);
 
   return {pageCount, pageTexts};
 }

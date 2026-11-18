@@ -10,10 +10,23 @@ import type {
   ReadingGoal,
   StudyCourse,
 } from '../types/library';
-import {createDefaultReadingGoal, deriveFolderFromRelativePath, sanitizeId} from './libraryLogic';
-import {extractDjvuMetadataAndText} from './parsers/djvuParser';
+import {
+  createDefaultReadingGoal,
+  deriveFolderFromRelativePath,
+  detectSupportedBookFormat,
+  sanitizeId,
+} from './libraryLogic';
+import {
+  extractDjvuMetadataAndText,
+  extractDjvuPageTextRange,
+  openDjvuDocument,
+} from './parsers/djvuParser';
 import {extractEpubInfoFallback, parseEpubForIndex} from './parsers/epubIndexHelper';
-import {extractPdfMetadataAndText} from './parsers/pdfParser';
+import {
+  extractPdfMetadataAndText,
+  extractPdfPageTextRange,
+  loadPdfDocument,
+} from './parsers/pdfParser';
 import {createSeedLibraryBundle} from './sampleDocuments';
 
 interface FolioDB extends DBSchema {
@@ -166,13 +179,18 @@ export async function getBookTextChunks(bookId: string): Promise<DocumentTextChu
 
 export async function saveBookLocal(book: BookMetadata, binary?: ArrayBuffer, chunks?: DocumentTextChunk[]): Promise<void> {
   const db = await getDb();
-  await db.put('books', book);
+  const stores: Array<'books' | 'binaries' | 'textChunks'> = ['books'];
+  if (binary) stores.push('binaries');
+  if (chunks) stores.push('textChunks');
+  const tx = db.transaction(stores, 'readwrite');
+  await tx.objectStore('books').put(book);
   if (binary) {
-    await db.put('binaries', binary, book.id);
+    await tx.objectStore('binaries').put(binary, book.id);
   }
   if (chunks) {
-    await db.put('textChunks', chunks, book.id);
+    await tx.objectStore('textChunks').put(chunks, book.id);
   }
+  await tx.done;
 }
 
 export async function deleteBookLocal(bookId: string): Promise<void> {
@@ -213,11 +231,13 @@ export async function saveReadingGoalLocal(goal: ReadingGoal): Promise<void> {
 
 export async function estimateOfflineStorageBytes(): Promise<number> {
   const db = await getDb();
-  const books = await db.getAll('books');
+  const [books, binaryKeys] = await Promise.all([db.getAll('books'), db.getAllKeys('binaries')]);
+  const keySet = new Set(binaryKeys.map((k) => String(k)));
   let total = 0;
   for (const b of books) {
-    const bin = await db.get('binaries', b.id);
-    if (bin) total += bin.byteLength;
+    if (keySet.has(b.id)) {
+      total += b.fileSize || 0;
+    }
   }
   return total;
 }
@@ -309,20 +329,21 @@ export async function restoreFromArchive(archive: BackupArchive): Promise<void> 
   await tx.done;
 }
 
+const INITIAL_INDEX_PAGE_LIMIT = 8;
+
 export async function ingestImportedFile(
   file: File,
   ownerId: string,
   explicitFolder?: string,
-): Promise<{book: BookMetadata; chunks: DocumentTextChunk[]} | null> {
-  const ext = file.name.split('.').pop()?.toLowerCase();
-  if (ext !== 'pdf' && ext !== 'epub' && ext !== 'djvu') {
+): Promise<{book: BookMetadata; chunks: DocumentTextChunk[]; needsFullIndex: boolean} | null> {
+  const format = detectSupportedBookFormat(file.name);
+  if (!format) {
     return null;
   }
 
-  const format: BookFormat = ext;
   const buffer = await file.arrayBuffer();
   const baseName = file.name.replace(/\.(pdf|epub|djvu)$/i, '');
-  const id = sanitizeId(`doc_${Date.now()}_${baseName.slice(0, 24)}`);
+  const id = sanitizeId(`doc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_${baseName.slice(0, 20)}`);
   const relPath = (file as File & {webkitRelativePath?: string}).webkitRelativePath;
   const folderPath = explicitFolder || deriveFolderFromRelativePath(relPath, '/Local Drive');
 
@@ -334,7 +355,7 @@ export async function ingestImportedFile(
 
   try {
     if (format === 'pdf') {
-      const info = await extractPdfMetadataAndText(buffer);
+      const info = await extractPdfMetadataAndText(buffer, INITIAL_INDEX_PAGE_LIMIT);
       if (info.title) title = info.title;
       if (info.author) author = info.author;
       pageCount = Math.max(1, info.pageCount);
@@ -346,11 +367,11 @@ export async function ingestImportedFile(
         text: p.text,
       }));
     } else if (format === 'epub') {
-      const epub = await parseEpubForIndex(buffer);
+      const epub = await parseEpubForIndex(buffer, INITIAL_INDEX_PAGE_LIMIT);
       if (epub.title) title = epub.title;
       if (epub.author) author = epub.author;
       if (epub.language) language = epub.language;
-      pageCount = Math.max(1, epub.chapters.length);
+      pageCount = Math.max(1, epub.chapterCount);
       chunks = epub.chapters.map((ch) => ({
         bookId: id,
         bookTitle: title,
@@ -359,7 +380,7 @@ export async function ingestImportedFile(
         text: ch.plainText,
       }));
     } else if (format === 'djvu') {
-      const djvu = await extractDjvuMetadataAndText(buffer);
+      const djvu = await extractDjvuMetadataAndText(buffer, INITIAL_INDEX_PAGE_LIMIT);
       pageCount = Math.max(1, djvu.pageCount);
       chunks = djvu.pageTexts.map((p) => ({
         bookId: id,
@@ -407,5 +428,73 @@ export async function ingestImportedFile(
   };
 
   await saveBookLocal(book, buffer, chunks);
-  return {book, chunks};
+  const needsFullIndex = pageCount > INITIAL_INDEX_PAGE_LIMIT;
+  return {book, chunks, needsFullIndex};
+}
+
+export async function indexRemainingBookChunks(
+  book: BookMetadata,
+  initialChunks: DocumentTextChunk[],
+): Promise<DocumentTextChunk[]> {
+  if (book.pageCount <= INITIAL_INDEX_PAGE_LIMIT) return initialChunks;
+  const buffer = await getBookBinary(book.id);
+  if (!buffer) return initialChunks;
+
+  let fullChunks: DocumentTextChunk[] = [...initialChunks];
+  const indexedPages = new Set(initialChunks.map((c) => c.page));
+
+  try {
+    if (book.format === 'pdf') {
+      const doc = await loadPdfDocument(buffer);
+      const batchSize = 16;
+      for (let start = INITIAL_INDEX_PAGE_LIMIT + 1; start <= doc.numPages; start += batchSize) {
+        const end = Math.min(doc.numPages, start + batchSize - 1);
+        const batch = await extractPdfPageTextRange(doc, start, end);
+        for (const p of batch) {
+          if (!indexedPages.has(p.page)) {
+            indexedPages.add(p.page);
+            fullChunks.push({
+              bookId: book.id,
+              bookTitle: book.title,
+              page: p.page,
+              chapterTitle: `Page ${p.page}`,
+              text: p.text,
+            });
+          }
+        }
+        await new Promise((r) => window.setTimeout(r, 20));
+      }
+    } else if (book.format === 'epub') {
+      const epub = await parseEpubForIndex(buffer, 0);
+      fullChunks = epub.chapters.map((ch) => ({
+        bookId: book.id,
+        bookTitle: book.title,
+        page: ch.index,
+        chapterTitle: ch.title,
+        text: ch.plainText,
+      }));
+    } else if (book.format === 'djvu') {
+      const doc = await openDjvuDocument(buffer);
+      const batch = extractDjvuPageTextRange(doc, INITIAL_INDEX_PAGE_LIMIT + 1, doc.page_count());
+      for (const p of batch) {
+        if (!indexedPages.has(p.page)) {
+          indexedPages.add(p.page);
+          fullChunks.push({
+            bookId: book.id,
+            bookTitle: book.title,
+            page: p.page,
+            chapterTitle: `Page ${p.page}`,
+            text: p.text || extractEpubInfoFallback(book.title, p.page),
+          });
+        }
+      }
+    }
+
+    const db = await getDb();
+    await db.put('textChunks', fullChunks, book.id);
+  } catch (err) {
+    console.warn(`Background full-text indexing skipped for ${book.title}:`, err);
+  }
+
+  return fullChunks;
 }

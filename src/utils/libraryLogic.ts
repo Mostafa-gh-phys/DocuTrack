@@ -569,3 +569,36 @@ export function validateBackupArchive(input: unknown): input is BackupArchive {
     Array.isArray(obj.courses)
   );
 }
+
+export function detectSupportedBookFormat(filename: string): BookFormat | null {
+  const dot = filename.lastIndexOf('.');
+  if (dot <= 0) return null;
+  const ext = filename.slice(dot + 1).toLowerCase();
+  if (ext === 'pdf' || ext === 'epub' || ext === 'djvu') {
+    return ext;
+  }
+  return null;
+}
+
+export async function runWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const limit = Math.max(1, Math.min(concurrency, items.length));
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  async function runWorker(): Promise<void> {
+    while (true) {
+      const current = nextIndex;
+      nextIndex += 1;
+      if (current >= items.length) return;
+      results[current] = await worker(items[current], current);
+    }
+  }
+
+  await Promise.all(Array.from({length: limit}, () => runWorker()));
+  return results;
+}

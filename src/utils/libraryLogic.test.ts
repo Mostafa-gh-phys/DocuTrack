@@ -10,11 +10,13 @@ import {
   clampReadingGoalPayload,
   createDefaultReadingGoal,
   deriveFolderFromRelativePath,
+  detectSupportedBookFormat,
   exportAnnotationsToMarkdown,
   formatZoteroCitation,
   getReadingGoalStats,
   normalizeFolderPath,
   recordReadingActivity,
+  runWithConcurrency,
   searchLocalSemanticChunks,
   sortAndFilterBooks,
   validateBackupArchive,
@@ -280,4 +282,28 @@ test('validateBackupArchive validates structure cleanly', () => {
     true,
   );
   assert.equal(validateBackupArchive({version: 1}), false);
+});
+
+test('detectSupportedBookFormat filters supported formats before file reads', () => {
+  assert.equal(detectSupportedBookFormat('paper.PDF'), 'pdf');
+  assert.equal(detectSupportedBookFormat('notes.epub'), 'epub');
+  assert.equal(detectSupportedBookFormat('archive.DjVu'), 'djvu');
+  assert.equal(detectSupportedBookFormat('photo.png'), null);
+  assert.equal(detectSupportedBookFormat('.pdf'), null);
+  assert.equal(detectSupportedBookFormat('README'), null);
+});
+
+test('runWithConcurrency preserves order while bounding parallel workers', async () => {
+  let active = 0;
+  let maxActive = 0;
+  const inputs = [10, 20, 30, 40, 50, 60];
+  const out = await runWithConcurrency(inputs, 2, async (val) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((r) => setTimeout(r, 5));
+    active -= 1;
+    return val * 2;
+  });
+  assert.deepEqual(out, [20, 40, 60, 80, 100, 120]);
+  assert.ok(maxActive <= 2);
 });
