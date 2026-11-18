@@ -1,0 +1,372 @@
+import React, {useRef, useState} from 'react';
+import type {User} from 'firebase/auth';
+import {
+  Cloud,
+  Download,
+  FolderSync,
+  HardDrive,
+  Laptop,
+  LogOut,
+  RefreshCw,
+  ShieldCheck,
+  Upload,
+} from 'lucide-react';
+import type {
+  BackupFrequency,
+  BackupSnapshotRecord,
+  BookMetadata,
+  ReaderPreferences,
+} from '../types/library';
+import {formatBytes} from '../utils/libraryLogic';
+
+interface SyncBackupViewProps {
+  user: User | null;
+  syncStatus: string;
+  books: BookMetadata[];
+  offlineBytes: number;
+  backups: BackupSnapshotRecord[];
+  preferences: ReaderPreferences;
+  linkedBackupDirName: string | null;
+  onSignIn: () => void;
+  onSignOut: () => void;
+  onSyncAllToCloud: () => void;
+  onToggleOfflinePin: (book: BookMetadata) => void;
+  onPinAllOffline: () => void;
+  onChangeBackupFrequency: (freq: BackupFrequency) => void;
+  onTriggerManualBackup: () => void;
+  onDownloadBackupFile: (backupId?: string) => void;
+  onRestoreBackupFile: (file: File) => void;
+  onRestoreSnapshot: (backupId: string) => void;
+  onLinkLocalBackupFolder: () => void;
+}
+
+export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
+  user,
+  syncStatus,
+  books,
+  offlineBytes,
+  backups,
+  preferences,
+  linkedBackupDirName,
+  onSignIn,
+  onSignOut,
+  onSyncAllToCloud,
+  onToggleOfflinePin,
+  onPinAllOffline,
+  onChangeBackupFrequency,
+  onTriggerManualBackup,
+  onDownloadBackupFile,
+  onRestoreBackupFile,
+  onRestoreSnapshot,
+  onLinkLocalBackupFolder,
+}) => {
+  const restoreInputRef = useRef<HTMLInputElement | null>(null);
+  const [restoreFeedback, setRestoreFeedback] = useState<string | null>(null);
+
+  const supportsDirectoryPicker =
+    typeof window !== 'undefined' && 'showDirectoryPicker' in window;
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      onRestoreBackupFile(file);
+      setRestoreFeedback(`Restoring archive from ${file.name}...`);
+      e.target.value = '';
+    }
+  };
+
+  return (
+    <div className="flex-1 p-6 max-w-5xl mx-auto w-full space-y-8">
+      <div className="pb-4 border-b border-slate-200 dark:border-slate-800">
+        <h1 className="text-xl font-semibold text-slate-900 dark:text-slate-100 tracking-tight">
+          Cross-Device Cloud Sync, Offline Vault & Automated Backups
+        </h1>
+        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+          Keep reading progress, highlights, AI lecture courses, and reader preferences synchronized across devices while storing offline binaries and automated local backups.
+        </p>
+      </div>
+
+      {/* 1. Cross-Device Cloud Sync Section */}
+      <section className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <Cloud className="w-5 h-5 text-blue-700 dark:text-blue-400" aria-hidden="true" />
+            <div>
+              <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                Cross-Device Cloud Library Sync
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                {user
+                  ? `Signed in as ${user.displayName || user.email} · Real-time Firestore synchronization active`
+                  : 'Sign in with Google to synchronize library metadata, annotations, reading positions, and AI courses across devices.'}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {user ? (
+              <>
+                <button
+                  type="button"
+                  onClick={onSyncAllToCloud}
+                  className="px-3.5 py-2 rounded-lg bg-blue-800 text-white text-xs font-medium hover:bg-blue-900 flex items-center gap-1.5"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" aria-hidden="true" />
+                  Sync Now
+                </button>
+                <button
+                  type="button"
+                  onClick={onSignOut}
+                  className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center gap-1.5"
+                >
+                  <LogOut className="w-3.5 h-3.5" aria-hidden="true" />
+                  Sign Out
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={onSignIn}
+                className="px-4 py-2 rounded-lg bg-blue-800 text-white text-xs font-medium hover:bg-blue-900"
+              >
+                Sign In with Google
+              </button>
+            )}
+          </div>
+        </div>
+        {syncStatus && (
+          <div className="text-xs text-slate-600 dark:text-slate-300 pt-2 border-t border-slate-100 dark:border-slate-800">
+            Sync status: {syncStatus}
+          </div>
+        )}
+      </section>
+
+      {/* 2. Offline Reading Cache Section */}
+      <section className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <HardDrive className="w-5 h-5 text-emerald-700 dark:text-emerald-400" aria-hidden="true" />
+            <div>
+              <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                Offline Reading Vault
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                {books.filter((b) => b.offlinePinned).length} of {books.length} documents pinned offline ·{' '}
+                {formatBytes(offlineBytes)} cached in local IndexedDB
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onPinAllOffline}
+            className="px-3.5 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
+          >
+            Pin All Synchronized Books Offline
+          </button>
+        </div>
+
+        <div className="divide-y divide-slate-100 dark:divide-slate-800">
+          {books.map((b) => (
+            <div key={b.id} className="py-2.5 flex items-center justify-between gap-4 text-sm">
+              <div className="min-w-0">
+                <p className="font-medium text-slate-900 dark:text-slate-100 truncate">{b.title}</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                  {b.format.toUpperCase()} · {formatBytes(b.fileSize)} · {b.folderPath}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => onToggleOfflinePin(b)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium border whitespace-nowrap shrink-0 ${
+                  b.offlinePinned
+                    ? 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300'
+                    : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                }`}
+              >
+                {b.offlinePinned ? 'Available Offline' : 'Pin Offline'}
+              </button>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* 3. Automated Local Storage Backups */}
+      <section className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-5">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <ShieldCheck className="w-5 h-5 text-slate-700 dark:text-slate-300" aria-hidden="true" />
+            <div>
+              <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                Automated Local Storage Backups
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Automatically snapshot your library index, annotations, AI courses, and reader settings to local storage or a chosen hard drive folder.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 flex-wrap">
+            <label htmlFor="backup-freq" className="text-xs text-slate-500 dark:text-slate-400">
+              Schedule
+            </label>
+            <select
+              id="backup-freq"
+              value={preferences.backupFrequency}
+              onChange={(e) => onChangeBackupFrequency(e.target.value as BackupFrequency)}
+              className="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-800 dark:text-slate-200"
+            >
+              <option value="onChange">Automatic (On Every Change)</option>
+              <option value="hourly">Automatic (Every Hour)</option>
+              <option value="daily">Automatic (Daily)</option>
+              <option value="manual">Manual Only</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 pt-1">
+          <button
+            type="button"
+            onClick={onTriggerManualBackup}
+            className="px-4 py-2 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-medium hover:opacity-90"
+          >
+            Run Backup Snapshot Now
+          </button>
+
+          <button
+            type="button"
+            onClick={() => onDownloadBackupFile()}
+            className="px-3.5 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center gap-1.5"
+          >
+            <Download className="w-3.5 h-3.5" aria-hidden="true" />
+            Export .docutrack-backup.json
+          </button>
+
+          {supportsDirectoryPicker && (
+            <button
+              type="button"
+              onClick={onLinkLocalBackupFolder}
+              className="px-3.5 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center gap-1.5"
+            >
+              <FolderSync className="w-3.5 h-3.5" aria-hidden="true" />
+              {linkedBackupDirName ? `Linked Folder: ${linkedBackupDirName}` : 'Link Local Disk Folder'}
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => restoreInputRef.current?.click()}
+            className="px-3.5 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center gap-1.5"
+          >
+            <Upload className="w-3.5 h-3.5" aria-hidden="true" />
+            Restore Backup File
+          </button>
+          <input
+            ref={restoreInputRef}
+            type="file"
+            accept=".json,.docutrack-backup.json,.folio-backup.json"
+            onChange={handleFileChange}
+            className="hidden"
+          />
+        </div>
+
+        {restoreFeedback && (
+          <p className="text-xs text-blue-700 dark:text-blue-400">{restoreFeedback}</p>
+        )}
+
+        <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
+          <h3 className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-2">
+            Snapshot History ({backups.length})
+          </h3>
+          {backups.length === 0 ? (
+            <p className="text-xs text-slate-400">No backup snapshots recorded yet.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500">
+                    <th className="py-2 pr-3">Timestamp</th>
+                    <th className="py-2 px-3">Trigger</th>
+                    <th className="py-2 px-3">Destination</th>
+                    <th className="py-2 px-3 text-right">Contents</th>
+                    <th className="py-2 px-3 text-right">Size</th>
+                    <th className="py-2 pl-3 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {backups.map((bkp) => (
+                    <tr key={bkp.id}>
+                      <td className="py-2 pr-3 tabular-nums text-slate-700 dark:text-slate-300">
+                        {new Date(bkp.createdAtMs).toLocaleString()}
+                      </td>
+                      <td className="py-2 px-3 capitalize text-slate-600 dark:text-slate-400">
+                        {bkp.trigger}
+                      </td>
+                      <td className="py-2 px-3 text-slate-600 dark:text-slate-400">
+                        {bkp.destination}
+                      </td>
+                      <td className="py-2 px-3 text-right tabular-nums text-slate-600 dark:text-slate-400">
+                        {bkp.bookCount} books · {bkp.annotationCount} notes
+                      </td>
+                      <td className="py-2 px-3 text-right tabular-nums text-slate-500">
+                        {formatBytes(bkp.sizeBytes)}
+                      </td>
+                      <td className="py-2 pl-3 text-right whitespace-nowrap space-x-2">
+                        <button
+                          type="button"
+                          onClick={() => onDownloadBackupFile(bkp.id)}
+                          className="text-blue-700 dark:text-blue-400 hover:underline"
+                        >
+                          Download
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onRestoreSnapshot(bkp.id)}
+                          className="text-slate-700 dark:text-slate-300 hover:underline"
+                        >
+                          Restore
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* 4. Desktop Installers & GitHub Release Pipeline */}
+      <section className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4">
+        <div className="flex items-center gap-3">
+          <Laptop className="w-5 h-5 text-blue-700 dark:text-blue-400" aria-hidden="true" />
+          <div>
+            <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+              Desktop Installers (GitHub Actions CI)
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Automated multi-OS Electron packaging configured in{' '}
+              <code className="font-mono text-[11px]">.github/workflows/release-desktop.yml</code> and{' '}
+              <code className="font-mono text-[11px]">electron-builder.yml</code>. Push a{' '}
+              <code className="font-mono text-[11px]">v*</code> tag or dispatch the workflow on GitHub to build native binaries.
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+          <div className="rounded-lg border border-slate-200 dark:border-slate-800 p-3.5 space-y-1">
+            <div className="font-semibold text-slate-900 dark:text-slate-100">Windows (x64)</div>
+            <p className="text-slate-500 dark:text-slate-400">NSIS Installer (.exe) with PDF, EPUB &amp; DjVu file associations</p>
+          </div>
+          <div className="rounded-lg border border-slate-200 dark:border-slate-800 p-3.5 space-y-1">
+            <div className="font-semibold text-slate-900 dark:text-slate-100">Linux (x64)</div>
+            <p className="text-slate-500 dark:text-slate-400">Portable AppImage (.AppImage) bundle</p>
+          </div>
+          <div className="rounded-lg border border-slate-200 dark:border-slate-800 p-3.5 space-y-1">
+            <div className="font-semibold text-slate-900 dark:text-slate-100">macOS (Universal / Apple Silicon)</div>
+            <p className="text-slate-500 dark:text-slate-400">Disk Image (.dmg) &amp; Archive (.zip) for x64 + arm64</p>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+};

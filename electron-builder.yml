@@ -1,0 +1,50 @@
+appId: app.docutrack.reader
+productName: DocuTrack
+copyright: Copyright © DocuTrack Contributors
+directories:
+  output: release
+files:
+  - dist/**/*
+  - electron/**/*
+  - package.json
+extraMetadata:
+  main: electron/main.cjs
+fileAssociations:
+  - ext: pdf
+    name: PDF Document
+    role: Viewer
+  - ext: epub
+    name: EPUB Book
+    role: Viewer
+  - ext: djvu
+    name: DjVu Archive
+    role: Viewer
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: DocuTrack-Setup-${version}-${arch}.${ext}
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+  category: Office;Education;Viewer
+  artifactName: DocuTrack-${version}-${arch}.${ext}
+mac:
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    - target: zip
+      arch:
+        - x64
+        - arm64
+  category: public.app-category.productivity
+  artifactName: DocuTrack-${version}-${arch}.${ext}

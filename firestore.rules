@@ -1,0 +1,339 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Hardened Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isSignedIn()
+        && request.auth.uid == userId
+        && request.auth.token.email_verified == true;
+    }
+
+    function isOwnerRead(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // 3. Entity Validation Blueprints
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'email', 'photoURL', 'createdAt', 'updatedAt'])
+        && data.uid == userId
+        && isValidId(data.uid)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && (!('email' in data) || (data.email is string && data.email.size() <= 254))
+        && (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 500))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidTagList(tags) {
+      return tags is list
+        && tags.size() <= 10
+        && (tags.size() == 0 || (tags[0] is string && tags[0].size() <= 40));
+    }
+
+    function isValidAnnotationPosition(pos) {
+      return pos is map
+        && pos.keys().hasAll(['x', 'y', 'width', 'height'])
+        && pos.keys().hasOnly(['x', 'y', 'width', 'height'])
+        && pos.x is number && pos.x >= 0 && pos.x <= 1
+        && pos.y is number && pos.y >= 0 && pos.y <= 1
+        && pos.width is number && pos.width >= 0 && pos.width <= 1
+        && pos.height is number && pos.height >= 0 && pos.height <= 1;
+    }
+
+    function isValidInkStrokes(strokes) {
+      return strokes is list
+        && strokes.size() <= 30
+        && (strokes.size() == 0 || (strokes[0] is string && strokes[0].size() <= 2000));
+    }
+
+    function isValidDailyHistory(history) {
+      return history is list
+        && history.size() <= 90
+        && (history.size() == 0 || (history[0] is string && history[0].size() <= 40));
+    }
+
+    function isValidBook(data, userId, bookId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'title', 'author', 'format', 'folderPath',
+          'fileSize', 'pageCount', 'currentPage', 'progress',
+          'isFavorite', 'offlinePinned', 'addedAt', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerId', 'title', 'author', 'format', 'folderPath',
+          'fileSize', 'pageCount', 'currentPage', 'progress',
+          'isFavorite', 'offlinePinned', 'tags', 'coverUrl', 'excerpt',
+          'language', 'addedAt', 'lastOpenedAt', 'createdAt', 'updatedAt'
+        ])
+        && data.id == bookId
+        && isValidId(data.id)
+        && data.ownerId == userId
+        && isValidId(data.ownerId)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 240
+        && data.author is string && data.author.size() <= 160
+        && data.format in ['pdf', 'epub', 'djvu']
+        && data.folderPath is string && data.folderPath.size() >= 1 && data.folderPath.size() <= 320
+        && data.fileSize is number && data.fileSize >= 0
+        && data.pageCount is int && data.pageCount >= 1
+        && data.currentPage is int && data.currentPage >= 1 && data.currentPage <= data.pageCount
+        && data.progress is number && data.progress >= 0 && data.progress <= 100
+        && data.isFavorite is bool
+        && data.offlinePinned is bool
+        && (!('tags' in data) || isValidTagList(data.tags))
+        && (!('coverUrl' in data) || (data.coverUrl is string && data.coverUrl.size() <= 500))
+        && (!('excerpt' in data) || (data.excerpt is string && data.excerpt.size() <= 2000))
+        && (!('language' in data) || (data.language is string && data.language.size() <= 32))
+        && data.addedAt is number && data.addedAt >= 0
+        && (!('lastOpenedAt' in data) || (data.lastOpenedAt is number && data.lastOpenedAt >= 0))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAnnotation(data, userId, annotationId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'bookId', 'page', 'quote', 'note', 'color', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerId', 'bookId', 'page', 'chapterTitle', 'kind', 'quote', 'note',
+          'color', 'tags', 'position', 'inkStrokes', 'createdAt', 'updatedAt'
+        ])
+        && data.id == annotationId
+        && isValidId(data.id)
+        && data.ownerId == userId
+        && isValidId(data.ownerId)
+        && isValidId(data.bookId)
+        && data.page is int && data.page >= 1
+        && (!('chapterTitle' in data) || (data.chapterTitle is string && data.chapterTitle.size() <= 200))
+        && (!('kind' in data) || (data.kind in ['highlight', 'underline', 'note', 'area', 'ink']))
+        && data.quote is string && data.quote.size() >= 1 && data.quote.size() <= 2000
+        && data.note is string && data.note.size() <= 4000
+        && data.color in ['amber', 'sage', 'sky', 'rose', 'violet']
+        && (!('tags' in data) || isValidTagList(data.tags))
+        && (!('position' in data) || isValidAnnotationPosition(data.position))
+        && (!('inkStrokes' in data) || isValidInkStrokes(data.inkStrokes))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCourse(data, userId, courseId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'bookId', 'title', 'summary', 'keyConcepts', 'modules', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerId', 'bookId', 'title', 'summary', 'keyConcepts', 'modules', 'createdAt', 'updatedAt'
+        ])
+        && data.id == courseId
+        && isValidId(data.id)
+        && data.ownerId == userId
+        && isValidId(data.ownerId)
+        && isValidId(data.bookId)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 240
+        && data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 8000
+        && data.keyConcepts is list && data.keyConcepts.size() <= 16
+        && (data.keyConcepts.size() == 0 || (data.keyConcepts[0] is string && data.keyConcepts[0].size() <= 160))
+        && data.modules is list && data.modules.size() <= 16
+        && (data.modules.size() == 0 || data.modules[0] is map)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPreferences(data, userId) {
+      return data.keys().hasAll([
+          'ownerId', 'theme', 'uiTheme', 'fontFamily', 'fontSize', 'lineHeight',
+          'maxWidth', 'columnCount', 'backupFrequency', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'theme', 'uiTheme', 'fontFamily', 'fontSize', 'lineHeight',
+          'maxWidth', 'columnCount', 'backupFrequency', 'updatedAt'
+        ])
+        && data.ownerId == userId
+        && isValidId(data.ownerId)
+        && data.theme in ['paper', 'sepia', 'dusk', 'night']
+        && data.uiTheme in ['light', 'dark']
+        && data.fontFamily in ['serif', 'sans', 'mono']
+        && data.fontSize is number && data.fontSize >= 12 && data.fontSize <= 32
+        && data.lineHeight is number && data.lineHeight >= 1.1 && data.lineHeight <= 2.4
+        && data.maxWidth is number && data.maxWidth >= 480 && data.maxWidth <= 1200
+        && data.columnCount is int && data.columnCount >= 1 && data.columnCount <= 2
+        && data.backupFrequency in ['manual', 'onChange', 'hourly', 'daily']
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidReadingGoal(data, userId, goalId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'dailyPagesTarget', 'weeklyMinutesTarget', 'yearlyBooksTarget',
+          'currentStreakDays', 'longestStreakDays', 'totalPagesRead', 'totalMinutesRead',
+          'dailyHistory', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerId', 'dailyPagesTarget', 'weeklyMinutesTarget', 'yearlyBooksTarget',
+          'currentStreakDays', 'longestStreakDays', 'totalPagesRead', 'totalMinutesRead',
+          'dailyHistory', 'updatedAt'
+        ])
+        && data.id == goalId
+        && isValidId(data.id)
+        && data.ownerId == userId
+        && isValidId(data.ownerId)
+        && data.dailyPagesTarget is int && data.dailyPagesTarget >= 1 && data.dailyPagesTarget <= 1000
+        && data.weeklyMinutesTarget is int && data.weeklyMinutesTarget >= 10 && data.weeklyMinutesTarget <= 5000
+        && data.yearlyBooksTarget is int && data.yearlyBooksTarget >= 1 && data.yearlyBooksTarget <= 500
+        && data.currentStreakDays is int && data.currentStreakDays >= 0 && data.currentStreakDays <= 3650
+        && data.longestStreakDays is int && data.longestStreakDays >= 0 && data.longestStreakDays <= 3650
+        && data.totalPagesRead is int && data.totalPagesRead >= 0 && data.totalPagesRead <= 1000000
+        && data.totalMinutesRead is int && data.totalMinutesRead >= 0 && data.totalMinutesRead <= 1000000
+        && isValidDailyHistory(data.dailyHistory)
+        && data.updatedAt is timestamp;
+    }
+
+    // 4. Collection Rules
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwnerRead(userId);
+      allow list: if false;
+      allow create: if isValidId(userId)
+        && isVerifiedOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isVerifiedOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email', 'photoURL', 'updatedAt']);
+      allow delete: if isValidId(userId) && isVerifiedOwner(userId);
+
+      match /books/{bookId} {
+        allow get: if isValidId(userId) && isValidId(bookId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(bookId)
+          && isVerifiedOwner(userId)
+          && isValidBook(incoming(), userId, bookId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(userId) && isValidId(bookId)
+          && isVerifiedOwner(userId)
+          && isValidBook(incoming(), userId, bookId)
+          && incoming().id == existing().id
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['currentPage', 'progress', 'lastOpenedAt', 'isFavorite', 'offlinePinned', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['title', 'author', 'folderPath', 'tags', 'isFavorite', 'offlinePinned', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['pageCount', 'excerpt', 'language', 'updatedAt'])
+          );
+        allow delete: if isValidId(userId) && isValidId(bookId) && isVerifiedOwner(userId);
+      }
+
+      match /annotations/{annotationId} {
+        allow get: if isValidId(userId) && isValidId(annotationId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(annotationId)
+          && isVerifiedOwner(userId)
+          && isValidAnnotation(incoming(), userId, annotationId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (
+            exists(/databases/$(database)/documents/users/$(userId)/books/$(incoming().bookId))
+            || existsAfter(/databases/$(database)/documents/users/$(userId)/books/$(incoming().bookId))
+          );
+        allow update: if isValidId(userId) && isValidId(annotationId)
+          && isVerifiedOwner(userId)
+          && isValidAnnotation(incoming(), userId, annotationId)
+          && incoming().id == existing().id
+          && incoming().ownerId == existing().ownerId
+          && incoming().bookId == existing().bookId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['note', 'color', 'tags', 'updatedAt']);
+        allow delete: if isValidId(userId) && isValidId(annotationId) && isVerifiedOwner(userId);
+      }
+
+      match /courses/{courseId} {
+        allow get: if isValidId(userId) && isValidId(courseId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(courseId)
+          && isVerifiedOwner(userId)
+          && isValidCourse(incoming(), userId, courseId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (
+            exists(/databases/$(database)/documents/users/$(userId)/books/$(incoming().bookId))
+            || existsAfter(/databases/$(database)/documents/users/$(userId)/books/$(incoming().bookId))
+          );
+        allow update: if isValidId(userId) && isValidId(courseId)
+          && isVerifiedOwner(userId)
+          && isValidCourse(incoming(), userId, courseId)
+          && incoming().id == existing().id
+          && incoming().ownerId == existing().ownerId
+          && incoming().bookId == existing().bookId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'summary', 'keyConcepts', 'modules', 'updatedAt']);
+        allow delete: if isValidId(userId) && isValidId(courseId) && isVerifiedOwner(userId);
+      }
+
+      match /preferences/{prefId} {
+        allow get: if isValidId(userId) && isValidId(prefId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(prefId)
+          && isVerifiedOwner(userId)
+          && isValidPreferences(incoming(), userId)
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(userId) && isValidId(prefId)
+          && isVerifiedOwner(userId)
+          && isValidPreferences(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'theme', 'uiTheme', 'fontFamily', 'fontSize', 'lineHeight',
+            'maxWidth', 'columnCount', 'backupFrequency', 'updatedAt'
+          ]);
+        allow delete: if isValidId(userId) && isValidId(prefId) && isVerifiedOwner(userId);
+      }
+
+      match /goals/{goalId} {
+        allow get: if isValidId(userId) && isValidId(goalId) && isOwnerRead(userId);
+        allow list: if isOwnerRead(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(goalId)
+          && isVerifiedOwner(userId)
+          && isValidReadingGoal(incoming(), userId, goalId)
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(userId) && isValidId(goalId)
+          && isVerifiedOwner(userId)
+          && isValidReadingGoal(incoming(), userId, goalId)
+          && incoming().id == existing().id
+          && incoming().ownerId == existing().ownerId
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'dailyPagesTarget', 'weeklyMinutesTarget', 'yearlyBooksTarget',
+            'currentStreakDays', 'longestStreakDays', 'totalPagesRead', 'totalMinutesRead',
+            'dailyHistory', 'updatedAt'
+          ]);
+        allow delete: if isValidId(userId) && isValidId(goalId) && isVerifiedOwner(userId);
+      }
+    }
+  }
+}

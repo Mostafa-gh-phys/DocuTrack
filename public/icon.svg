@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <rect width="64" height="64" rx="14" fill="#0F172A"/>
+  <rect x="4" y="4" width="56" height="56" rx="11" stroke="#334155" stroke-width="1.5"/>
+  <text
+    x="32"
+    y="42"
+    text-anchor="middle"
+    font-family="'Computer Modern Serif', 'CMU Serif', 'Latin Modern Roman', Georgia, serif"
+    font-size="30"
+    font-weight="700"
+    letter-spacing="-2"
+    fill="#F8FAFC"
+  >DT</text>
+  <rect x="14" y="48" width="36" height="3.5" rx="1.75" fill="#1D4ED8"/>
+</svg>

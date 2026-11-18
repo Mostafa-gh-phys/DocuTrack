@@ -1,0 +1,380 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Private profile metadata for an authenticated library owner.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "displayName", "createdAt", "updatedAt"]
+    },
+    "BookMetadata": {
+      "title": "BookMetadata",
+      "description": "Document library entry with folder path, format, reading progress, and offline pin state.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "author": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "format": {
+          "type": "string",
+          "enum": ["pdf", "epub", "djvu"]
+        },
+        "folderPath": {
+          "type": "string",
+          "maxLength": 320
+        },
+        "fileSize": {
+          "type": "number"
+        },
+        "pageCount": {
+          "type": "integer"
+        },
+        "currentPage": {
+          "type": "integer"
+        },
+        "progress": {
+          "type": "number"
+        },
+        "isFavorite": {
+          "type": "boolean"
+        },
+        "offlinePinned": {
+          "type": "boolean"
+        },
+        "tags": {
+          "type": "array",
+          "description": "Up to 10 short topic tags"
+        },
+        "coverUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "excerpt": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "language": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "addedAt": {
+          "type": "number"
+        },
+        "lastOpenedAt": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "title",
+        "author",
+        "format",
+        "folderPath",
+        "fileSize",
+        "pageCount",
+        "currentPage",
+        "progress",
+        "isFavorite",
+        "offlinePinned",
+        "addedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Annotation": {
+      "title": "Annotation",
+      "description": "Zotero-style highlight, underline, sticky note, area capture, or ink stroke linked to a document page.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "bookId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "page": {
+          "type": "integer"
+        },
+        "chapterTitle": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["highlight", "underline", "note", "area", "ink"]
+        },
+        "quote": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "color": {
+          "type": "string",
+          "enum": ["amber", "sage", "sky", "rose", "violet"]
+        },
+        "tags": {
+          "type": "array",
+          "description": "Up to 10 Zotero-style annotation tags"
+        },
+        "position": {
+          "type": "object",
+          "description": "Normalized page coordinate box (x, y, width, height in 0..1)"
+        },
+        "inkStrokes": {
+          "type": "array",
+          "description": "Up to 30 normalized freehand SVG point strings"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerId", "bookId", "page", "quote", "note", "color", "createdAt", "updatedAt"]
+    },
+    "StudyCourse": {
+      "title": "StudyCourse",
+      "description": "AI-generated executive summary and structured lecture course for a book.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "bookId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 8000
+        },
+        "keyConcepts": {
+          "type": "array"
+        },
+        "modules": {
+          "type": "array"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerId", "bookId", "title", "summary", "keyConcepts", "modules", "createdAt", "updatedAt"]
+    },
+    "ReaderPreferences": {
+      "title": "ReaderPreferences",
+      "description": "Synchronized typography, theme, and automated backup cadence preferences.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "theme": {
+          "type": "string",
+          "enum": ["paper", "sepia", "dusk", "night"]
+        },
+        "uiTheme": {
+          "type": "string",
+          "enum": ["light", "dark"]
+        },
+        "fontFamily": {
+          "type": "string",
+          "enum": ["serif", "sans", "mono"]
+        },
+        "fontSize": {
+          "type": "number"
+        },
+        "lineHeight": {
+          "type": "number"
+        },
+        "maxWidth": {
+          "type": "number"
+        },
+        "columnCount": {
+          "type": "integer"
+        },
+        "backupFrequency": {
+          "type": "string",
+          "enum": ["manual", "onChange", "hourly", "daily"]
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "theme", "uiTheme", "fontFamily", "fontSize", "lineHeight", "maxWidth", "columnCount", "backupFrequency", "updatedAt"]
+    },
+    "ReadingGoal": {
+      "title": "ReadingGoal",
+      "description": "Daily, weekly, and annual reading goals with streak and activity history.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "dailyPagesTarget": {
+          "type": "integer"
+        },
+        "weeklyMinutesTarget": {
+          "type": "integer"
+        },
+        "yearlyBooksTarget": {
+          "type": "integer"
+        },
+        "currentStreakDays": {
+          "type": "integer"
+        },
+        "longestStreakDays": {
+          "type": "integer"
+        },
+        "totalPagesRead": {
+          "type": "integer"
+        },
+        "totalMinutesRead": {
+          "type": "integer"
+        },
+        "dailyHistory": {
+          "type": "array",
+          "description": "Up to 90 serialized YYYY-MM-DD|pages|minutes daily log entries"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "dailyPagesTarget",
+        "weeklyMinutesTarget",
+        "yearlyBooksTarget",
+        "currentStreakDays",
+        "longestStreakDays",
+        "totalPagesRead",
+        "totalMinutesRead",
+        "dailyHistory",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private owner profile document isolated per authenticated user."
+    },
+    "/users/{userId}/books/{bookId}": {
+      "schema": { "$ref": "#/entities/BookMetadata" },
+      "description": "Personal book library metadata synced across devices."
+    },
+    "/users/{userId}/annotations/{annotationId}": {
+      "schema": { "$ref": "#/entities/Annotation" },
+      "description": "Zotero-style highlights, underlines, sticky notes, areas, and ink annotations tied to a user book."
+    },
+    "/users/{userId}/courses/{courseId}": {
+      "schema": { "$ref": "#/entities/StudyCourse" },
+      "description": "AI-generated lecture courses and summaries synced per user."
+    },
+    "/users/{userId}/preferences/{prefId}": {
+      "schema": { "$ref": "#/entities/ReaderPreferences" },
+      "description": "Synced reader typography, theme, and backup preferences."
+    },
+    "/users/{userId}/goals/{goalId}": {
+      "schema": { "$ref": "#/entities/ReadingGoal" },
+      "description": "Synced reading goals, streaks, and daily activity logs per user."
+    }
+  }
+}

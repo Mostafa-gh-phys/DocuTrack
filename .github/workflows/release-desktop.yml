@@ -1,0 +1,87 @@
+name: Build & Release DocuTrack Desktop Installers
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-desktop:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            os: windows-latest
+            builder_args: --win nsis --x64
+          - platform: linux
+            os: ubuntu-latest
+            builder_args: --linux AppImage --x64
+          - platform: macos
+            os: macos-latest
+            builder_args: --mac dmg zip --x64 --arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install application dependencies
+        run: npm ci
+
+      - name: Build DocuTrack web bundle
+        run: npm run build
+
+      - name: Install Electron & electron-builder
+        run: npm install --no-save electron@^34.0.0 electron-builder@^25.1.8
+
+      - name: Package ${{ matrix.platform }} installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --config electron-builder.yml ${{ matrix.builder_args }} --publish never
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: docutrack-${{ matrix.platform }}
+          path: |
+            release/*.exe
+            release/*.AppImage
+            release/*.dmg
+            release/*.zip
+            !release/*unpacked*
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-desktop
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release with installers
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*.exe
+            artifacts/*.AppImage
+            artifacts/*.dmg
+            artifacts/*.zip

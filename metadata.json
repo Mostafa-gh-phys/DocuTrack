@@ -1,0 +1,6 @@
+{
+  "name": "Folio",
+  "description": "A Readest-inspired multi-format document library and distraction-free reader for PDF, EPUB, and DjVu with cloud sync, offline reading, annotations, semantic search, inline translation, and AI lecture courses.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
