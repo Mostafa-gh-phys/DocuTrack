@@ -1,5 +1,4 @@
 const {app, BrowserWindow, shell} = require('electron');
-const express = require('express');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
@@ -7,24 +6,58 @@ const path = require('path');
 let mainWindow = null;
 let serverInstance = null;
 
+const MIME_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.ico': 'image/x-icon',
+  '.wasm': 'application/wasm',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.webmanifest': 'application/manifest+json',
+};
+
 function startDesktopServer() {
   return new Promise((resolve, reject) => {
-    const serverApp = express();
-    serverApp.use(express.json({limit: '4mb'}));
-
     const distDir = path.join(__dirname, '..', 'dist');
-    if (fs.existsSync(distDir)) {
-      serverApp.use(express.static(distDir));
-      serverApp.get('/{*splat}', (_req, res) => {
-        res.sendFile(path.join(distDir, 'index.html'));
-      });
-    } else {
-      serverApp.get('/{*splat}', (_req, res) => {
-        res.status(200).send('DocuTrack desktop build missing dist/ bundle. Run npm run build first.');
-      });
-    }
+    const indexHtmlPath = path.join(distDir, 'index.html');
 
-    const server = http.createServer(serverApp);
+    const server = http.createServer((req, res) => {
+      try {
+        const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
+        let relPath = decodeURIComponent(reqUrl.pathname).replace(/^\/+/, '');
+        if (!relPath) relPath = 'index.html';
+
+        const candidate = path.normalize(path.join(distDir, relPath));
+        const insideDist = candidate.startsWith(distDir);
+
+        let targetFile = insideDist && fs.existsSync(candidate) && fs.statSync(candidate).isFile()
+          ? candidate
+          : indexHtmlPath;
+
+        if (!fs.existsSync(targetFile)) {
+          res.writeHead(200, {'Content-Type': 'text/plain; charset=utf-8'});
+          res.end('DocuTrack desktop build missing dist/ bundle. Run npm run build first.');
+          return;
+        }
+
+        const ext = path.extname(targetFile).toLowerCase();
+        const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+        const data = fs.readFileSync(targetFile);
+        res.writeHead(200, {'Content-Type': contentType});
+        res.end(data);
+      } catch (err) {
+        res.writeHead(500, {'Content-Type': 'text/plain; charset=utf-8'});
+        res.end(err instanceof Error ? err.message : 'Internal Server Error');
+      }
+    });
+
     server.on('error', reject);
     server.listen(0, '127.0.0.1', () => {
       const addr = server.address();

@@ -83,9 +83,9 @@ jobs:
         shell: bash
         run: |
           if [ -f package-lock.json ]; then
-            npm ci
+            npm ci --legacy-peer-deps --no-audit --no-fund
           else
-            npm install --no-audit --no-fund
+            npm install --legacy-peer-deps --no-audit --no-fund
           fi
 
       - name: Set package version (${{ needs.prepare.outputs.semver }})
@@ -98,7 +98,7 @@ jobs:
 
       - name: Install Electron & electron-builder
         shell: bash
-        run: npm install --no-save --no-audit --no-fund electron@^34.0.0 electron-builder@^25.1.8
+        run: npm install --no-save --legacy-peer-deps --no-audit --no-fund electron@^34.0.0 electron-builder@^25.1.8
 
       - name: Package ${{ matrix.platform }} installer
         shell: bash
@@ -122,7 +122,7 @@ jobs:
   publish-release:
     name: Publish GitHub Release (${{ needs.prepare.outputs.release_tag }})
     needs: [prepare, build-desktop]
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == true)
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.publish_release == true || inputs.publish_release == 'true'))
     runs-on: ubuntu-latest
     steps:
       - name: Download all platform artifacts

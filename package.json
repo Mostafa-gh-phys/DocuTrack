@@ -2,6 +2,8 @@
   "name": "react-example",
   "private": true,
   "version": "1.0.0",
+  "description": "DocuTrack — Multi-format document library and deep reader for PDF, EPUB, and DjVu",
+  "author": "DocuTrack Contributors",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
