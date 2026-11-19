@@ -188,6 +188,14 @@ test('payload clampers enforce blueprint boundaries and calculateProgress bounds
       color: 'violet',
       tags: ['key-figure', 'architecture'],
       position: {x: -0.2, y: 0.3, width: 1.5, height: 0.25},
+      rects: [
+        ...Array.from({length: 30}, (_, idx) => ({
+          x: idx === 0 ? -0.5 : 0.1,
+          y: 0.2,
+          width: idx === 0 ? 1.8 : 0.4,
+          height: 0.03,
+        })),
+      ],
       createdAtMs: 1,
       updatedAtMs: 1,
     },
@@ -199,19 +207,33 @@ test('payload clampers enforce blueprint boundaries and calculateProgress bounds
   assert.equal(clampedAnn.quote, 'Highlighted passage');
   assert.equal(clampedAnn.position?.x, 0);
   assert.equal(clampedAnn.position?.width, 1);
+  assert.equal(clampedAnn.rects?.length, 24);
+  assert.equal(clampedAnn.rects?.[0].x, 0);
+  assert.equal(clampedAnn.rects?.[0].width, 1);
 
   const prefs: ReaderPreferences = {
-    theme: 'sepia',
-    uiTheme: 'dark',
-    fontFamily: 'serif',
+    theme: 'nord',
+    uiTheme: 'parchment',
+    accentColor: 'burgundy',
+    fontFamily: 'literary',
     fontSize: 99,
     lineHeight: 0.5,
     maxWidth: 2000,
     columnCount: 2,
+    epubViewMode: 'spread',
+    novelIndent: true,
+    novelJustify: true,
+    novelDropCap: false,
     backupFrequency: 'hourly',
     updatedAtMs: 1,
   };
   const clampedPrefs = clampPreferencesPayload(prefs, 'u1');
+  assert.equal(clampedPrefs.theme, 'nord');
+  assert.equal(clampedPrefs.uiTheme, 'parchment');
+  assert.equal(clampedPrefs.accentColor, 'burgundy');
+  assert.equal(clampedPrefs.fontFamily, 'literary');
+  assert.equal(clampedPrefs.epubViewMode, 'spread');
+  assert.equal(clampedPrefs.novelDropCap, false);
   assert.equal(clampedPrefs.fontSize, 32);
   assert.equal(clampedPrefs.lineHeight, 1.1);
   assert.equal(clampedPrefs.maxWidth, 1200);

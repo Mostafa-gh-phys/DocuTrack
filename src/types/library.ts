@@ -11,11 +11,41 @@ export interface AnnotationPosition {
   height: number;
 }
 
-export type ReaderTheme = 'paper' | 'sepia' | 'dusk' | 'night';
+export type ReaderTheme =
+  | 'paper'
+  | 'sepia'
+  | 'parchment'
+  | 'sage'
+  | 'dusk'
+  | 'nord'
+  | 'night'
+  | 'amoled';
 
-export type UITheme = 'light' | 'dark';
+export type UITheme = 'light' | 'parchment' | 'sage' | 'dark' | 'obsidian';
 
-export type ReaderFontFamily = 'serif' | 'sans' | 'mono';
+export type AppAccentColor = 'cobalt' | 'forest' | 'burgundy' | 'ochre' | 'indigo' | 'graphite';
+
+export type ReaderFontFamily =
+  | 'serif'
+  | 'literary'
+  | 'garamond'
+  | 'merriweather'
+  | 'sans'
+  | 'humanist'
+  | 'accessible'
+  | 'mono';
+
+export type EpubViewMode = 'scroll' | 'paginated' | 'spread';
+
+export type ScanPreset = 'original' | 'clean-scan' | 'high-contrast' | 'bleed-reduce';
+
+export interface ScanEnhanceSettings {
+  preset: ScanPreset;
+  contrast: number; // 0.6 to 2.4
+  brightness: number; // -60 to 60
+  sharpness: number; // 0 to 1
+  cleanBackground: boolean;
+}
 
 export type BackupFrequency = 'manual' | 'onChange' | 'hourly' | 'daily';
 
@@ -74,6 +104,7 @@ export interface Annotation {
   color: HighlightColor;
   tags?: string[];
   position?: AnnotationPosition;
+  rects?: AnnotationPosition[];
   inkStrokes?: string[];
   createdAtMs: number;
   updatedAtMs: number;
@@ -104,11 +135,16 @@ export interface StudyCourse {
 export interface ReaderPreferences {
   theme: ReaderTheme;
   uiTheme: UITheme;
+  accentColor?: AppAccentColor;
   fontFamily: ReaderFontFamily;
   fontSize: number;
   lineHeight: number;
   maxWidth: number;
   columnCount: 1 | 2;
+  epubViewMode?: EpubViewMode;
+  novelIndent?: boolean;
+  novelJustify?: boolean;
+  novelDropCap?: boolean;
   backupFrequency: BackupFrequency;
   updatedAtMs: number;
 }

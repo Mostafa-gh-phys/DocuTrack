@@ -2,16 +2,193 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 @layer base {
+  :root,
+  :root[data-ui-theme="light"] {
+    --app-bg: #F8F9FA;
+    --app-surface: #FFFFFF;
+    --app-surface-muted: #F1F5F9;
+    --app-border: #E2E8F0;
+    --app-text: #0F172A;
+    --app-muted: #64748B;
+  }
+
+  :root[data-ui-theme="parchment"] {
+    --app-bg: #F3EDE0;
+    --app-surface: #FBF7EE;
+    --app-surface-muted: #EFE6D3;
+    --app-border: #DDD0B8;
+    --app-text: #2C2217;
+    --app-muted: #6E5D47;
+  }
+
+  :root[data-ui-theme="sage"] {
+    --app-bg: #EDF2EE;
+    --app-surface: #F7FAF7;
+    --app-surface-muted: #E1EAE3;
+    --app-border: #C9D9CD;
+    --app-text: #1B2B22;
+    --app-muted: #526A5C;
+  }
+
+  :root[data-ui-theme="dark"] {
+    --app-bg: #0B1120;
+    --app-surface: #111827;
+    --app-surface-muted: #1E293B;
+    --app-border: #1F2937;
+    --app-text: #F1F5F9;
+    --app-muted: #94A3B8;
+  }
+
+  :root[data-ui-theme="obsidian"] {
+    --app-bg: #06070A;
+    --app-surface: #0F1117;
+    --app-surface-muted: #181B24;
+    --app-border: #232734;
+    --app-text: #EAECEF;
+    --app-muted: #8B93A7;
+  }
+
+  :root,
+  :root[data-accent="cobalt"] {
+    --accent: #1E40AF;
+    --accent-hover: #1E3A8A;
+    --accent-soft: rgba(30, 64, 175, 0.11);
+    --accent-fg: #1E40AF;
+  }
+  .dark:root[data-accent="cobalt"],
+  .dark:root {
+    --accent: #2563EB;
+    --accent-hover: #1D4ED8;
+    --accent-soft: rgba(59, 130, 246, 0.18);
+    --accent-fg: #93C5FD;
+  }
+
+  :root[data-accent="forest"] {
+    --accent: #166534;
+    --accent-hover: #14532D;
+    --accent-soft: rgba(22, 101, 52, 0.12);
+    --accent-fg: #166534;
+  }
+  .dark:root[data-accent="forest"] {
+    --accent: #15803D;
+    --accent-hover: #166534;
+    --accent-soft: rgba(34, 197, 94, 0.18);
+    --accent-fg: #86EFAC;
+  }
+
+  :root[data-accent="burgundy"] {
+    --accent: #881337;
+    --accent-hover: #6B0F2B;
+    --accent-soft: rgba(136, 19, 55, 0.11);
+    --accent-fg: #881337;
+  }
+  .dark:root[data-accent="burgundy"] {
+    --accent: #BE123C;
+    --accent-hover: #9F1239;
+    --accent-soft: rgba(244, 63, 94, 0.18);
+    --accent-fg: #FDA4AF;
+  }
+
+  :root[data-accent="ochre"] {
+    --accent: #B45309;
+    --accent-hover: #92400E;
+    --accent-soft: rgba(180, 83, 9, 0.12);
+    --accent-fg: #B45309;
+  }
+  .dark:root[data-accent="ochre"] {
+    --accent: #D97706;
+    --accent-hover: #B45309;
+    --accent-soft: rgba(245, 158, 11, 0.18);
+    --accent-fg: #FCD34D;
+  }
+
+  :root[data-accent="indigo"] {
+    --accent: #4338CA;
+    --accent-hover: #3730A3;
+    --accent-soft: rgba(67, 56, 202, 0.12);
+    --accent-fg: #4338CA;
+  }
+  .dark:root[data-accent="indigo"] {
+    --accent: #4F46E5;
+    --accent-hover: #4338CA;
+    --accent-soft: rgba(129, 140, 248, 0.18);
+    --accent-fg: #A5B4FC;
+  }
+
+  :root[data-accent="graphite"] {
+    --accent: #334155;
+    --accent-hover: #1E293B;
+    --accent-soft: rgba(51, 65, 85, 0.12);
+    --accent-fg: #334155;
+  }
+  .dark:root[data-accent="graphite"] {
+    --accent: #475569;
+    --accent-hover: #334155;
+    --accent-soft: rgba(148, 163, 184, 0.18);
+    --accent-fg: #CBD5E1;
+  }
+
   :root {
     --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+    --font-humanist: "DM Sans", "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+    --font-accessible: "Atkinson Hyperlegible", "Plus Jakarta Sans", system-ui, sans-serif;
     --font-serif: "Source Serif 4", ui-serif, Georgia, Cambria, serif;
+    --font-literary: "Lora", "Source Serif 4", Georgia, serif;
+    --font-garamond: "EB Garamond", Georgia, serif;
+    --font-merriweather: "Merriweather", Georgia, serif;
     --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
     --font-brand: "Computer Modern Serif", "CMU Serif", "Latin Modern Roman", "Source Serif 4", Georgia, serif;
   }
 
   html {
     font-family: var(--font-sans);
+    background-color: var(--app-bg);
+    color: var(--app-text);
   }
+
+  input[type="range"],
+  input[type="checkbox"] {
+    accent-color: var(--accent);
+  }
+}
+
+.app-shell-bg {
+  background-color: var(--app-bg);
+  color: var(--app-text);
+}
+
+.app-surface {
+  background-color: var(--app-surface);
+  border-color: var(--app-border);
+}
+
+.app-surface-muted {
+  background-color: var(--app-surface-muted);
+}
+
+.app-border {
+  border-color: var(--app-border);
+}
+
+.accent-btn {
+  background-color: var(--accent);
+  color: #ffffff;
+}
+.accent-btn:hover {
+  background-color: var(--accent-hover);
+}
+
+.accent-soft {
+  background-color: var(--accent-soft);
+  color: var(--accent-fg);
+}
+
+.accent-border {
+  border-color: var(--accent);
+}
+
+.accent-text {
+  color: var(--accent-fg);
 }
 
 .font-docutrack-logo {
@@ -20,43 +197,55 @@
   letter-spacing: -0.025em;
 }
 
-.font-serif-reader {
-  font-family: var(--font-serif);
-}
-
-.font-sans-reader {
-  font-family: var(--font-sans);
-}
-
-.font-mono-reader {
-  font-family: var(--font-mono);
-}
+.font-serif-reader { font-family: var(--font-serif); }
+.font-literary-reader { font-family: var(--font-literary); }
+.font-garamond-reader { font-family: var(--font-garamond); }
+.font-merriweather-reader { font-family: var(--font-merriweather); }
+.font-sans-reader { font-family: var(--font-sans); }
+.font-humanist-reader { font-family: var(--font-humanist); }
+.font-accessible-reader { font-family: var(--font-accessible); }
+.font-mono-reader { font-family: var(--font-mono); }
 
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
 
-/* Smooth reader typography & highlight styling */
+/* EPUB prose & dedicated Novel Reading typography */
 .epub-prose p {
-  margin-bottom: 1.15em;
+  margin-bottom: 1.05em;
+}
+
+.epub-prose.epub-novel-justify p {
+  text-align: justify;
+  hyphens: auto;
+}
+
+.epub-prose.epub-novel-indent p + p {
+  text-indent: 1.55em;
+  margin-top: -0.45em;
+  margin-bottom: 0.75em;
+}
+
+.epub-prose.epub-novel-dropcap > p:first-of-type::first-letter {
+  float: left;
+  font-size: 3.35em;
+  line-height: 0.84;
+  padding-top: 0.06em;
+  padding-right: 0.14em;
+  font-weight: 600;
 }
 
 .epub-prose h1,
 .epub-prose h2,
 .epub-prose h3 {
   font-weight: 600;
-  line-height: 1.3;
-  margin-top: 1.5em;
+  line-height: 1.28;
+  margin-top: 1.4em;
   margin-bottom: 0.65em;
 }
 
-.epub-prose h1 {
-  font-size: 1.65em;
-}
-
-.epub-prose h2 {
-  font-size: 1.3em;
-}
+.epub-prose h1 { font-size: 1.6em; }
+.epub-prose h2 { font-size: 1.28em; }
 
 .epub-prose blockquote {
   padding-left: 1.1em;
@@ -64,6 +253,30 @@
   font-style: italic;
   margin: 1.25em 0;
   border-left: 1px solid currentColor;
+}
+
+/* Book spread central gutter */
+.epub-spread-surface {
+  background-image: linear-gradient(
+    90deg,
+    transparent calc(50% - 22px),
+    rgba(0, 0, 0, 0.05) calc(50% - 2px),
+    rgba(0, 0, 0, 0.09) 50%,
+    rgba(0, 0, 0, 0.04) calc(50% + 2px),
+    transparent calc(50% + 22px)
+  );
+}
+
+/* Live inline EPUB highlight & underline marks */
+mark[data-ann-id] {
+  border-radius: 3px;
+  padding: 0.06em 0.12em;
+  cursor: pointer;
+  color: inherit;
+  transition: filter 120ms ease;
+}
+mark[data-ann-id]:hover {
+  filter: brightness(0.95);
 }
 
 @media (prefers-reduced-motion: reduce) {

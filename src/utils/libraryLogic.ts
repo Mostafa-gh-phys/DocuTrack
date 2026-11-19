@@ -2,20 +2,25 @@ import type {
   Annotation,
   AnnotationKind,
   AnnotationPosition,
+  AppAccentColor,
   BackupArchive,
   BookFormat,
   BookMetadata,
   DocumentTextChunk,
+  EpubViewMode,
   FolderNode,
   HighlightColor,
   LibraryCollection,
+  ReaderFontFamily,
   ReaderPreferences,
+  ReaderTheme,
   ReadingDayLog,
   ReadingGoal,
   SemanticSearchResult,
   SortDirection,
   SortField,
   StudyCourse,
+  UITheme,
 } from '../types/library';
 
 export const ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
@@ -494,6 +499,7 @@ export function clampAnnotationPayload(ann: Annotation, ownerId: string) {
     color: HighlightColor;
     tags: string[];
     position?: AnnotationPosition;
+    rects?: AnnotationPosition[];
     inkStrokes?: string[];
   } = {
     id: sanitizeId(ann.id),
@@ -509,6 +515,12 @@ export function clampAnnotationPayload(ann: Annotation, ownerId: string) {
   };
   const pos = clampPosition(ann.position);
   if (pos) payload.position = pos;
+  if (Array.isArray(ann.rects) && ann.rects.length > 0) {
+    payload.rects = ann.rects
+      .slice(0, 24)
+      .map((r) => clampPosition(r))
+      .filter((r): r is AnnotationPosition => Boolean(r));
+  }
   if (Array.isArray(ann.inkStrokes) && ann.inkStrokes.length > 0) {
     payload.inkStrokes = ann.inkStrokes.slice(0, 30).map((s) => String(s).slice(0, 2000));
   }
@@ -527,16 +539,38 @@ export function clampCoursePayload(course: StudyCourse, ownerId: string) {
   };
 }
 
+const VALID_READER_THEMES: ReaderTheme[] = ['paper', 'sepia', 'parchment', 'sage', 'dusk', 'nord', 'night', 'amoled'];
+const VALID_UI_THEMES: UITheme[] = ['light', 'parchment', 'sage', 'dark', 'obsidian'];
+const VALID_ACCENT_COLORS: AppAccentColor[] = ['cobalt', 'forest', 'burgundy', 'ochre', 'indigo', 'graphite'];
+const VALID_FONTS: ReaderFontFamily[] = [
+  'serif',
+  'literary',
+  'garamond',
+  'merriweather',
+  'sans',
+  'humanist',
+  'accessible',
+  'mono',
+];
+const VALID_EPUB_MODES: EpubViewMode[] = ['scroll', 'paginated', 'spread'];
+
 export function clampPreferencesPayload(prefs: ReaderPreferences, ownerId: string) {
   return {
     ownerId: sanitizeId(ownerId),
-    theme: ['paper', 'sepia', 'dusk', 'night'].includes(prefs.theme) ? prefs.theme : 'paper',
-    uiTheme: prefs.uiTheme === 'dark' ? 'dark' : 'light',
-    fontFamily: ['serif', 'sans', 'mono'].includes(prefs.fontFamily) ? prefs.fontFamily : 'serif',
+    theme: VALID_READER_THEMES.includes(prefs.theme) ? prefs.theme : 'paper',
+    uiTheme: VALID_UI_THEMES.includes(prefs.uiTheme) ? prefs.uiTheme : 'light',
+    accentColor:
+      prefs.accentColor && VALID_ACCENT_COLORS.includes(prefs.accentColor) ? prefs.accentColor : 'cobalt',
+    fontFamily: VALID_FONTS.includes(prefs.fontFamily) ? prefs.fontFamily : 'serif',
     fontSize: Math.max(12, Math.min(32, Number(prefs.fontSize) || 18)),
     lineHeight: Math.max(1.1, Math.min(2.4, Number(prefs.lineHeight) || 1.65)),
     maxWidth: Math.max(480, Math.min(1200, Number(prefs.maxWidth) || 740)),
     columnCount: prefs.columnCount === 2 ? 2 : 1,
+    epubViewMode:
+      prefs.epubViewMode && VALID_EPUB_MODES.includes(prefs.epubViewMode) ? prefs.epubViewMode : 'scroll',
+    novelIndent: Boolean(prefs.novelIndent ?? true),
+    novelJustify: Boolean(prefs.novelJustify ?? true),
+    novelDropCap: Boolean(prefs.novelDropCap ?? true),
     backupFrequency: ['manual', 'onChange', 'hourly', 'daily'].includes(prefs.backupFrequency)
       ? prefs.backupFrequency
       : 'onChange',

@@ -10,7 +10,6 @@ import {
   Columns2,
   Copy,
   Download,
-  EyeOff,
   GraduationCap,
   Highlighter,
   Languages,
@@ -20,6 +19,7 @@ import {
   Minimize2,
   MousePointer,
   PenTool,
+  ScanLine,
   SlidersHorizontal,
   SquareDashedMousePointer,
   StickyNote,
@@ -36,11 +36,15 @@ import type {
   AnnotationPosition,
   BookMetadata,
   DocumentTextChunk,
+  EpubViewMode,
   HighlightColor,
   ReaderPreferences,
   ReaderTheme,
+  ScanEnhanceSettings,
+  ScanPreset,
   StudyCourse,
 } from '../types/library';
+import {renderEpubChapterWithAnnotations} from '../utils/epubHighlighter';
 import {
   calculateProgress,
   exportAnnotationsToMarkdown,
@@ -50,6 +54,14 @@ import {getBookBinary, getBookTextChunks} from '../utils/offlineStorage';
 import {openDjvuDocument, renderDjvuPageToCanvas} from '../utils/parsers/djvuParser';
 import {parseEpubDocument, type ParsedEpubDocument} from '../utils/parsers/epubParser';
 import {extractPdfOutlineAndMeta, loadPdfDocument, renderPdfPageToCanvas} from '../utils/parsers/pdfParser';
+import {
+  applyScanEnhancementToCanvas,
+  DEFAULT_SCAN_SETTINGS,
+  getScanPresetSettings,
+  isScanEnhancementActive,
+} from '../utils/scanEnhance';
+import {FONT_OPTIONS, getReaderFontClass, READER_THEMES} from '../utils/themeTokens';
+import {AnnotationPopover} from './AnnotationPopover';
 
 export type ZoteroTool = 'select' | 'highlight' | 'underline' | 'note' | 'area' | 'ink';
 
@@ -74,75 +86,44 @@ interface ReaderViewProps {
   onRecordReadingSession?: (pagesDelta: number, minutesDelta: number) => void;
 }
 
-const THEME_STYLES: Record<ReaderTheme, {bg: string; surface: string; text: string; muted: string; border: string}> = {
-  paper: {
-    bg: 'bg-[#FDFCF8]',
-    surface: 'bg-white',
-    text: 'text-[#1F2937]',
-    muted: 'text-slate-500',
-    border: 'border-stone-200',
-  },
-  sepia: {
-    bg: 'bg-[#F4ECD8]',
-    surface: 'bg-[#FAF5E8]',
-    text: 'text-[#433422]',
-    muted: 'text-[#7A664D]',
-    border: 'border-[#E2D5B9]',
-  },
-  dusk: {
-    bg: 'bg-[#1E2430]',
-    surface: 'bg-[#262D3B]',
-    text: 'text-[#D8DEE9]',
-    muted: 'text-[#94A3B8]',
-    border: 'border-[#353E50]',
-  },
-  night: {
-    bg: 'bg-[#0B0F17]',
-    surface: 'bg-[#111827]',
-    text: 'text-[#E2E8F0]',
-    muted: 'text-slate-400',
-    border: 'border-slate-800',
-  },
-};
-
 const HIGHLIGHT_COLORS: Record<
   HighlightColor,
-  {label: string; swatch: string; bg: string; hex: string; borderClass: string}
+  {label: string; swatch: string; bg: string; hex: string; fillRgba: string}
 > = {
   amber: {
     label: 'Amber',
     swatch: 'bg-amber-400',
     bg: 'bg-amber-200/60 dark:bg-amber-900/40',
     hex: '#d97706',
-    borderClass: 'border-amber-500',
+    fillRgba: 'rgba(251, 191, 36, 0.34)',
   },
   sage: {
     label: 'Sage',
     swatch: 'bg-emerald-400',
     bg: 'bg-emerald-200/60 dark:bg-emerald-900/40',
     hex: '#059669',
-    borderClass: 'border-emerald-500',
+    fillRgba: 'rgba(52, 211, 153, 0.32)',
   },
   sky: {
     label: 'Sky',
     swatch: 'bg-sky-400',
     bg: 'bg-sky-200/60 dark:bg-sky-900/40',
     hex: '#0284c7',
-    borderClass: 'border-sky-500',
+    fillRgba: 'rgba(56, 189, 248, 0.32)',
   },
   rose: {
     label: 'Rose',
     swatch: 'bg-rose-400',
     bg: 'bg-rose-200/60 dark:bg-rose-900/40',
     hex: '#e11d48',
-    borderClass: 'border-rose-500',
+    fillRgba: 'rgba(251, 113, 133, 0.30)',
   },
   violet: {
     label: 'Violet',
     swatch: 'bg-violet-400',
     bg: 'bg-violet-200/60 dark:bg-violet-900/40',
     hex: '#7c3aed',
-    borderClass: 'border-violet-500',
+    fillRgba: 'rgba(167, 139, 250, 0.32)',
   },
 };
 
@@ -180,7 +161,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const [loadingDoc, setLoadingDoc] = useState(true);
   const [docError, setDocError] = useState<string | null>(null);
 
-  const [leftTab, setLeftTab] = useState<'toc' | 'annotations' | null>('toc');
+  // Left drawer stays CLOSED unless explicitly opened by the user — zero unwanted sidebar popouts!
+  const [leftTab, setLeftTab] = useState<'toc' | 'annotations' | null>(null);
   const [rightTab, setRightTab] = useState<'typography' | 'translate' | 'course' | null>(initialRightTab);
   const [distractionFree, setDistractionFree] = useState(false);
 
@@ -194,16 +176,33 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const [djvuBlankBitmap, setDjvuBlankBitmap] = useState(false);
   const [djvuPageText, setDjvuPageText] = useState('');
   const [zoomScale, setZoomScale] = useState(1.35);
+  const [fitWidthMode, setFitWidthMode] = useState(false);
   const [textChunks, setTextChunks] = useState<DocumentTextChunk[]>([]);
+
+  // Scanned PDF & DjVu Enhancement State
+  const [scanOpen, setScanOpen] = useState(false);
+  const [scanSettings, setScanSettings] = useState<ScanEnhanceSettings>(DEFAULT_SCAN_SETTINGS);
+
+  // EPUB Novel Paginated / Spread Sub-Page State
+  const epubViewMode: EpubViewMode = preferences.epubViewMode || 'scroll';
+  const novelIndent = preferences.novelIndent ?? true;
+  const novelJustify = preferences.novelJustify ?? true;
+  const novelDropCap = preferences.novelDropCap ?? true;
+  const [epubSubPage, setEpubSubPage] = useState(0);
+  const [epubSubPageCount, setEpubSubPageCount] = useState(1);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const pageStageRef = useRef<HTMLDivElement | null>(null);
+  const readerViewportRef = useRef<HTMLElement | null>(null);
+  const epubBodyRef = useRef<HTMLDivElement | null>(null);
+  const epubSpreadViewportRef = useRef<HTMLDivElement | null>(null);
   const visitedPagesRef = useRef<Set<number>>(new Set([book.currentPage || 1]));
 
   // Zotero Tooling & Selection Composer state
   const [activeTool, setActiveTool] = useState<ZoteroTool>('select');
   const [selectedColor, setSelectedColor] = useState<HighlightColor>('amber');
   const [selectedText, setSelectedText] = useState('');
+  const [selectedRects, setSelectedRects] = useState<AnnotationPosition[] | undefined>(undefined);
   const [noteDraft, setNoteDraft] = useState('');
   const [tagsDraft, setTagsDraft] = useState('');
   const [pendingPosition, setPendingPosition] = useState<AnnotationPosition | undefined>(undefined);
@@ -242,13 +241,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const [courseError, setCourseError] = useState<string | null>(null);
   const [revealedQuiz, setRevealedQuiz] = useState<Record<number, boolean>>({});
 
-  // Track active reading minutes every 60s
   useEffect(() => {
     if (!onRecordReadingSession) return;
     const id = window.setInterval(() => {
-      if (!document.hidden) {
-        onRecordReadingSession(0, 1);
-      }
+      if (!document.hidden) onRecordReadingSession(0, 1);
     }, 60000);
     return () => window.clearInterval(id);
   }, [onRecordReadingSession]);
@@ -261,6 +257,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const pageAnnotations = useMemo(
     () => bookAnnotations.filter((a) => a.page === currentPage),
     [bookAnnotations, currentPage],
+  );
+
+  const focusedAnnotation = useMemo(
+    () => (focusedAnnotationId ? bookAnnotations.find((a) => a.id === focusedAnnotationId) || null : null),
+    [bookAnnotations, focusedAnnotationId],
   );
 
   const filteredInspectorAnnotations = useMemo(() => {
@@ -338,7 +339,28 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     };
   }, [book.id, book.format, book.title]);
 
-  // Render PDF or DjVu page onto canvas
+  // Fit-width zoom auto-calculation for PDF
+  useEffect(() => {
+    if (!fitWidthMode || book.format !== 'pdf' || !pdfDoc || !readerViewportRef.current) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const page = await pdfDoc.getPage(Math.max(1, Math.min(currentPage, pdfDoc.numPages)));
+        if (cancelled || !readerViewportRef.current) return;
+        const baseViewport = page.getViewport({scale: 1});
+        const availWidth = Math.max(360, readerViewportRef.current.clientWidth - 72);
+        const computed = Number(Math.min(2.4, Math.max(0.75, availWidth / baseViewport.width)).toFixed(2));
+        setZoomScale(computed);
+      } catch {
+        // Ignore fit calc error
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [fitWidthMode, book.format, pdfDoc, currentPage]);
+
+  // Render PDF or DjVu page onto canvas + apply low-quality scan optimization
   useEffect(() => {
     let cancelled = false;
     async function renderCanvasPage() {
@@ -349,22 +371,24 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         try {
           const clampedPage = Math.max(1, Math.min(currentPage, pdfDoc.numPages));
           const res = await renderPdfPageToCanvas(pdfDoc, clampedPage, canvas, zoomScale);
-          if (!cancelled) {
-            setPdfCanvasSize({width: res.width, height: res.height});
-            setPdfTextItems(res.textItems);
-          }
+          if (cancelled) return;
+          applyScanEnhancementToCanvas(canvas, scanSettings);
+          setPdfCanvasSize({width: res.width, height: res.height});
+          setPdfTextItems(res.textItems);
         } catch (err) {
           console.error('PDF page render error:', err);
         }
       } else if (book.format === 'djvu' && djvuDoc) {
         try {
-          const dpi = Math.round(110 * zoomScale);
+          const dpi = Math.round((isScanEnhancementActive(scanSettings) ? 145 : 120) * zoomScale);
           const res = renderDjvuPageToCanvas(djvuDoc, currentPage, canvas, dpi);
-          if (!cancelled) {
-            setDjvuBlankBitmap(res.isBlankBitmap);
-            const fallbackChunk = textChunks.find((c) => c.page === currentPage)?.text || '';
-            setDjvuPageText(res.text || fallbackChunk);
+          if (cancelled) return;
+          if (!res.isBlankBitmap) {
+            applyScanEnhancementToCanvas(canvas, scanSettings);
           }
+          setDjvuBlankBitmap(res.isBlankBitmap);
+          const fallbackChunk = textChunks.find((c) => c.page === currentPage)?.text || '';
+          setDjvuPageText(res.text || fallbackChunk);
         } catch (err) {
           console.error('DjVu page render error:', err);
         }
@@ -374,24 +398,54 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [book.format, pdfDoc, djvuDoc, currentPage, zoomScale, textChunks]);
+  }, [book.format, pdfDoc, djvuDoc, currentPage, zoomScale, textChunks, scanSettings]);
 
+  // Populate EPUB chapter DOM + wrap in-page <mark data-ann-id> highlights & underlines cleanly
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (distractionFree) setDistractionFree(false);
-        if (composerOpen) setComposerOpen(false);
-        setActiveTool('select');
+    if (book.format !== 'epub' || !epubDoc || !epubBodyRef.current) return;
+    const chapterHtml = epubDoc.chapters[currentPage - 1]?.html || '<p>Empty chapter.</p>';
+    const bodyEl = epubBodyRef.current;
+    renderEpubChapterWithAnnotations(bodyEl, chapterHtml, pageAnnotations, focusedAnnotationId);
+
+    // Recalculate paginated / two-page spread column pages on next frame
+    const raf = window.requestAnimationFrame(() => {
+      if (epubViewMode !== 'scroll' && epubSpreadViewportRef.current) {
+        const el = epubSpreadViewportRef.current;
+        const pageW = Math.max(1, el.clientWidth);
+        const totalW = el.scrollWidth;
+        const count = Math.max(1, Math.round(totalW / pageW));
+        setEpubSubPageCount(count);
+        setEpubSubPage((prev) => Math.min(prev, count - 1));
+      } else {
+        setEpubSubPage(0);
+        setEpubSubPageCount(1);
       }
+    });
+    return () => {
+      window.cancelAnimationFrame(raf);
     };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [distractionFree, composerOpen]);
+  }, [
+    book.format,
+    epubDoc,
+    currentPage,
+    pageAnnotations,
+    focusedAnnotationId,
+    epubViewMode,
+    preferences.fontSize,
+    preferences.lineHeight,
+    preferences.maxWidth,
+    preferences.fontFamily,
+    novelIndent,
+    novelJustify,
+    novelDropCap,
+  ]);
 
   const goToPage = useCallback(
     (nextPage: number) => {
       const clamped = Math.max(1, Math.min(nextPage, totalPages));
       setCurrentPage(clamped);
+      setEpubSubPage(0);
+      setFocusedAnnotationId(null);
       onUpdateProgress(book.id, clamped, totalPages);
       if (!visitedPagesRef.current.has(clamped)) {
         visitedPagesRef.current.add(clamped);
@@ -400,6 +454,53 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     },
     [book.id, onRecordReadingSession, onUpdateProgress, totalPages],
   );
+
+  // Keyboard navigation (Esc, ArrowLeft, ArrowRight)
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const isEditingText =
+        target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT');
+
+      if (e.key === 'Escape') {
+        if (distractionFree) setDistractionFree(false);
+        if (composerOpen) setComposerOpen(false);
+        if (focusedAnnotationId) setFocusedAnnotationId(null);
+        setScanOpen(false);
+        setActiveTool('select');
+        return;
+      }
+
+      if (isEditingText) return;
+
+      if (e.key === 'ArrowRight') {
+        if (book.format === 'epub' && epubViewMode !== 'scroll' && epubSubPage < epubSubPageCount - 1) {
+          setEpubSubPage((p) => p + 1);
+        } else if (currentPage < totalPages) {
+          goToPage(currentPage + 1);
+        }
+      } else if (e.key === 'ArrowLeft') {
+        if (book.format === 'epub' && epubViewMode !== 'scroll' && epubSubPage > 0) {
+          setEpubSubPage((p) => p - 1);
+        } else if (currentPage > 1) {
+          goToPage(currentPage - 1);
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [
+    distractionFree,
+    composerOpen,
+    focusedAnnotationId,
+    book.format,
+    epubViewMode,
+    epubSubPage,
+    epubSubPageCount,
+    currentPage,
+    totalPages,
+    goToPage,
+  ]);
 
   const currentPagePlainText = useMemo(() => {
     if (book.format === 'epub' && epubDoc) {
@@ -426,6 +527,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     return `Page ${currentPage}`;
   }, [book.format, epubDoc, pdfOutline, currentPage]);
 
+  const estimatedChapterMinutes = useMemo(() => {
+    const words = currentPagePlainText.trim().split(/\s+/).filter(Boolean).length;
+    return Math.max(1, Math.round(words / 225));
+  }, [currentPagePlainText]);
+
   const parseTagList = (raw: string): string[] =>
     raw
       .split(/[\s,]+/)
@@ -433,13 +539,38 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       .filter(Boolean)
       .slice(0, 10);
 
+  // Compute normalized ClientRects relative to pageStageRef for crisp PDF/DjVu overlays
+  const captureSelectionRects = (): AnnotationPosition[] | undefined => {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || !pageStageRef.current) return undefined;
+    const stageRect = pageStageRef.current.getBoundingClientRect();
+    if (stageRect.width < 10 || stageRect.height < 10) return undefined;
+
+    const rawRects = Array.from(sel.getRangeAt(0).getClientRects());
+    const normalized: AnnotationPosition[] = [];
+    for (const r of rawRects) {
+      if (r.width < 2 || r.height < 2) continue;
+      const x = Math.max(0, Math.min(1, Number(((r.left - stageRect.left) / stageRect.width).toFixed(4))));
+      const y = Math.max(0, Math.min(1, Number(((r.top - stageRect.top) / stageRect.height).toFixed(4))));
+      const width = Math.max(0, Math.min(1 - x, Number((r.width / stageRect.width).toFixed(4))));
+      const height = Math.max(0, Math.min(1 - y, Number((r.height / stageRect.height).toFixed(4))));
+      if (width > 0.002 && height > 0.002) {
+        normalized.push({x, y, width, height});
+      }
+      if (normalized.length >= 24) break;
+    }
+    return normalized.length > 0 ? normalized : undefined;
+  };
+
   const handleMouseUpSelection = () => {
     if (activeTool === 'note' || activeTool === 'area' || activeTool === 'ink') return;
-    const sel = window.getSelection()?.toString().trim() || '';
+    const selObj = window.getSelection();
+    const sel = selObj?.toString().trim() || '';
     if (sel.length < 3) return;
     const clipped = sel.slice(0, 1800);
+    const rects = book.format === 'epub' ? undefined : captureSelectionRects();
 
-    // Zotero-style instant highlight or underline when those tools are toggled on!
+    // Instant in-page highlight or underline when those tools are active — NO sidebar popout!
     if (activeTool === 'highlight' || activeTool === 'underline') {
       onAddAnnotation({
         bookId: book.id,
@@ -450,17 +581,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         note: '',
         color: selectedColor,
         tags: [],
+        rects,
+        position: rects?.[0],
       });
-      window.getSelection()?.removeAllRanges();
-      setLeftTab('annotations');
+      selObj?.removeAllRanges();
+      setSelectedText('');
+      setSelectedRects(undefined);
       return;
     }
 
     setSelectedText(clipped);
+    setSelectedRects(rects);
   };
 
-  // Spatial coordinate helper (0..1)
-  const getNormalizedCoords = (e: React.MouseEvent<HTMLDivElement>) => {
+  // Pointer-event normalized coordinate helper (0..1)
+  const getNormalizedPointerCoords = (e: React.PointerEvent<HTMLDivElement>) => {
     const rect = pageStageRef.current?.getBoundingClientRect();
     if (!rect || rect.width === 0 || rect.height === 0) return {x: 0.5, y: 0.5};
     return {
@@ -469,9 +604,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     };
   };
 
-  const handleStageMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+  const handleStagePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (activeTool === 'note') {
-      const pt = getNormalizedCoords(e);
+      const pt = getNormalizedPointerCoords(e);
       setPendingKind('note');
       setPendingPosition({x: pt.x, y: pt.y, width: 0.04, height: 0.04});
       setSelectedText(`Pinned note at (${Math.round(pt.x * 100)}%, ${Math.round(pt.y * 100)}%)`);
@@ -479,32 +614,34 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       return;
     }
     if (activeTool === 'area') {
-      const pt = getNormalizedCoords(e);
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+      const pt = getNormalizedPointerCoords(e);
       setDragBoxStart(pt);
       setDragBoxCurrent(pt);
       return;
     }
     if (activeTool === 'ink') {
-      const pt = getNormalizedCoords(e);
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+      const pt = getNormalizedPointerCoords(e);
       setDrawingStroke([pt]);
     }
   };
 
-  const handleStageMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+  const handleStagePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (activeTool === 'area' && dragBoxStart) {
-      setDragBoxCurrent(getNormalizedCoords(e));
+      setDragBoxCurrent(getNormalizedPointerCoords(e));
     } else if (activeTool === 'ink' && drawingStroke) {
-      const pt = getNormalizedCoords(e);
+      const pt = getNormalizedPointerCoords(e);
       setDrawingStroke((prev) => {
         if (!prev) return [pt];
         const last = prev[prev.length - 1];
-        if (last && Math.hypot(pt.x - last.x, pt.y - last.y) < 0.005) return prev;
+        if (last && Math.hypot(pt.x - last.x, pt.y - last.y) < 0.004) return prev;
         return [...prev, pt];
       });
     }
   };
 
-  const handleStageMouseUp = useCallback(() => {
+  const finishSpatialStroke = useCallback(() => {
     if (activeTool === 'area' && dragBoxStart && dragBoxCurrent) {
       const x = Math.min(dragBoxStart.x, dragBoxCurrent.x);
       const y = Math.min(dragBoxStart.y, dragBoxCurrent.y);
@@ -513,7 +650,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       setDragBoxStart(null);
       setDragBoxCurrent(null);
 
-      if (width >= 0.025 && height >= 0.025) {
+      if (width >= 0.02 && height >= 0.02) {
         onAddAnnotation({
           bookId: book.id,
           page: currentPage,
@@ -525,7 +662,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           tags: ['figure'],
           position: {x, y, width, height},
         });
-        setLeftTab('annotations');
       }
       return;
     }
@@ -558,17 +694,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           },
           inkStrokes: [d],
         });
-        setLeftTab('annotations');
       }
     }
   }, [activeTool, book.id, currentChapterTitle, currentPage, dragBoxCurrent, dragBoxStart, drawingStroke, onAddAnnotation, selectedColor]);
-
-  useEffect(() => {
-    if (!dragBoxStart && !drawingStroke) return;
-    const onWinUp = () => handleStageMouseUp();
-    window.addEventListener('mouseup', onWinUp);
-    return () => window.removeEventListener('mouseup', onWinUp);
-  }, [dragBoxStart, drawingStroke, handleStageMouseUp]);
 
   const handleCreateAnnotation = (e: React.FormEvent) => {
     e.preventDefault();
@@ -583,15 +711,16 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       note: noteDraft.trim(),
       color: selectedColor,
       tags: parseTagList(tagsDraft),
-      position: pendingPosition,
+      position: pendingPosition || selectedRects?.[0],
+      rects: selectedRects,
     });
     setNoteDraft('');
     setTagsDraft('');
     setSelectedText('');
+    setSelectedRects(undefined);
     setPendingPosition(undefined);
     setPendingKind('highlight');
     setComposerOpen(false);
-    setLeftTab('annotations');
   };
 
   const handleCopyCitation = async (ann: Annotation) => {
@@ -671,19 +800,23 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     }
   };
 
-  const theme = THEME_STYLES[preferences.theme];
-  const fontClass =
-    preferences.fontFamily === 'serif'
-      ? 'font-serif-reader'
-      : preferences.fontFamily === 'mono'
-        ? 'font-mono-reader'
-        : 'font-sans-reader';
-
+  const theme = READER_THEMES[preferences.theme] || READER_THEMES.paper;
+  const fontClass = getReaderFontClass(preferences.fontFamily);
   const progressPct = calculateProgress(currentPage, totalPages);
   const spatialToolActive = activeTool === 'note' || activeTool === 'area' || activeTool === 'ink';
+  const scanActive = isScanEnhancementActive(scanSettings);
 
   const renderSpatialOverlays = () => {
     const inkAnns = pageAnnotations.filter((a) => a.kind === 'ink' && a.inkStrokes && a.inkStrokes.length > 0);
+    const rectHighlightAnns =
+      book.format === 'epub'
+        ? []
+        : pageAnnotations.filter(
+            (a) =>
+              (a.kind === 'highlight' || a.kind === 'underline' || !a.kind) &&
+              ((a.rects && a.rects.length > 0) || a.position),
+          );
+
     const liveStrokePath =
       drawingStroke && drawingStroke.length >= 2
         ? drawingStroke
@@ -703,19 +836,48 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
     return (
       <div
-        onMouseDown={handleStageMouseDown}
-        onMouseMove={handleStageMouseMove}
-        onMouseUp={handleStageMouseUp}
+        onPointerDown={handleStagePointerDown}
+        onPointerMove={handleStagePointerMove}
+        onPointerUp={finishSpatialStroke}
         className={`absolute inset-0 z-20 ${
           spatialToolActive
-            ? activeTool === 'note'
-              ? 'cursor-crosshair pointer-events-auto'
-              : activeTool === 'area'
-                ? 'cursor-crosshair pointer-events-auto'
-                : 'cursor-cell pointer-events-auto'
+            ? activeTool === 'ink'
+              ? 'cursor-cell pointer-events-auto touch-none'
+              : 'cursor-crosshair pointer-events-auto touch-none'
             : 'pointer-events-none'
         }`}
       >
+        {/* Saved In-Page PDF/DjVu Highlights & Underlines */}
+        {rectHighlightAnns.map((ann) => {
+          const kind = ann.kind || 'highlight';
+          const c = HIGHLIGHT_COLORS[ann.color] || HIGHLIGHT_COLORS.amber;
+          const rects = ann.rects && ann.rects.length > 0 ? ann.rects : ann.position ? [ann.position] : [];
+          const isFocused = focusedAnnotationId === ann.id;
+          return rects.map((r, rIdx) => (
+            <button
+              key={`${ann.id}-r-${rIdx}`}
+              type="button"
+              data-testid={kind === 'underline' ? 'pdf-underline-rect' : 'pdf-highlight-rect'}
+              aria-label={`Inspect ${kind} annotation on page ${ann.page}`}
+              onClick={(ev) => {
+                ev.stopPropagation();
+                setFocusedAnnotationId(ann.id);
+              }}
+              style={{
+                left: `${r.x * 100}%`,
+                top: `${r.y * 100}%`,
+                width: `${r.width * 100}%`,
+                height: `${r.height * 100}%`,
+                backgroundColor: kind === 'highlight' ? c.fillRgba : 'transparent',
+                borderBottom: kind === 'underline' ? `2.5px solid ${c.hex}` : undefined,
+              }}
+              className={`absolute pointer-events-auto rounded-[2px] transition-shadow ${
+                kind === 'highlight' && !theme.isDark ? 'mix-blend-multiply' : ''
+              } ${isFocused ? 'ring-2 ring-blue-700' : ''}`}
+            />
+          ));
+        })}
+
         {/* Saved Ink Strokes & Live Drawing SVG */}
         {(inkAnns.length > 0 || liveStrokePath) && (
           <svg
@@ -734,7 +896,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   strokeLinecap="round"
                   strokeLinejoin="round"
                   vectorEffect="non-scaling-stroke"
-                  opacity={0.85}
+                  opacity={0.88}
+                  style={{pointerEvents: 'stroke', cursor: 'pointer'}}
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    setFocusedAnnotationId(ann.id);
+                  }}
                 />
               )),
             )}
@@ -767,7 +934,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 onClick={(ev) => {
                   ev.stopPropagation();
                   setFocusedAnnotationId(ann.id);
-                  setLeftTab('annotations');
                 }}
                 style={{
                   left: `${pos.x * 100}%`,
@@ -802,11 +968,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               <button
                 key={ann.id}
                 type="button"
+                aria-label={`Sticky note on page ${ann.page}`}
                 title={ann.note || ann.quote}
                 onClick={(ev) => {
                   ev.stopPropagation();
                   setFocusedAnnotationId(ann.id);
-                  setLeftTab('annotations');
                 }}
                 style={{
                   left: `${pos.x * 100}%`,
@@ -841,7 +1007,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   };
 
   return (
-    <div className={`h-screen overflow-hidden flex flex-col ${theme.bg} ${theme.text} transition-colors duration-200`}>
+    <div
+      data-testid={scanActive ? 'scan-enhance-active' : undefined}
+      className={`h-screen overflow-hidden flex flex-col ${theme.bg} ${theme.text} transition-colors duration-200`}
+    >
       {/* Distraction-Free Floating Exit Control */}
       {distractionFree && (
         <div className="fixed top-4 right-5 z-40 flex items-center gap-2">
@@ -886,7 +1055,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               aria-pressed={leftTab === 'toc'}
               aria-label="Toggle table of contents"
               className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 whitespace-nowrap ${
-                leftTab === 'toc' ? 'bg-blue-800 text-white' : 'hover:bg-black/5 dark:hover:bg-white/10'
+                leftTab === 'toc' ? 'accent-btn' : 'hover:bg-black/5 dark:hover:bg-white/10'
               }`}
             >
               <ListTree className="w-3.5 h-3.5" aria-hidden="true" />
@@ -899,12 +1068,27 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               aria-pressed={leftTab === 'annotations'}
               aria-label="Toggle annotations panel"
               className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 whitespace-nowrap ${
-                leftTab === 'annotations' ? 'bg-blue-800 text-white' : 'hover:bg-black/5 dark:hover:bg-white/10'
+                leftTab === 'annotations' ? 'accent-btn' : 'hover:bg-black/5 dark:hover:bg-white/10'
               }`}
             >
               <Highlighter className="w-3.5 h-3.5" aria-hidden="true" />
               <span className="hidden sm:inline">Notes ({bookAnnotations.length})</span>
             </button>
+
+            {book.format !== 'epub' && (
+              <button
+                type="button"
+                onClick={() => setScanOpen((prev) => !prev)}
+                aria-pressed={scanOpen || scanActive}
+                aria-label="Scanned page enhancement"
+                className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 whitespace-nowrap ${
+                  scanOpen || scanActive ? 'accent-btn' : 'hover:bg-black/5 dark:hover:bg-white/10'
+                }`}
+              >
+                <ScanLine className="w-3.5 h-3.5" aria-hidden="true" />
+                <span className="hidden md:inline">Scan Enhance</span>
+              </button>
+            )}
 
             <button
               type="button"
@@ -912,7 +1096,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               aria-pressed={rightTab === 'translate'}
               aria-label="Toggle inline translation"
               className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 whitespace-nowrap ${
-                rightTab === 'translate' ? 'bg-blue-800 text-white' : 'hover:bg-black/5 dark:hover:bg-white/10'
+                rightTab === 'translate' ? 'accent-btn' : 'hover:bg-black/5 dark:hover:bg-white/10'
               }`}
             >
               <Languages className="w-3.5 h-3.5" aria-hidden="true" />
@@ -925,7 +1109,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               aria-pressed={rightTab === 'course'}
               aria-label="Toggle AI lecture course"
               className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 whitespace-nowrap ${
-                rightTab === 'course' ? 'bg-blue-800 text-white' : 'hover:bg-black/5 dark:hover:bg-white/10'
+                rightTab === 'course' ? 'accent-btn' : 'hover:bg-black/5 dark:hover:bg-white/10'
               }`}
             >
               <GraduationCap className="w-3.5 h-3.5" aria-hidden="true" />
@@ -938,7 +1122,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               aria-pressed={rightTab === 'typography'}
               aria-label="Toggle typography and theme settings"
               className={`px-2.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 whitespace-nowrap ${
-                rightTab === 'typography' ? 'bg-blue-800 text-white' : 'hover:bg-black/5 dark:hover:bg-white/10'
+                rightTab === 'typography' ? 'accent-btn' : 'hover:bg-black/5 dark:hover:bg-white/10'
               }`}
             >
               <SlidersHorizontal className="w-3.5 h-3.5" aria-hidden="true" />
@@ -951,6 +1135,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 setDistractionFree(true);
                 setLeftTab(null);
                 setRightTab(null);
+                setScanOpen(false);
               }}
               aria-label="Enter distraction-free focus mode"
               className="px-2.5 py-1.5 rounded-lg text-xs font-medium hover:bg-black/5 dark:hover:bg-white/10 flex items-center gap-1.5 whitespace-nowrap"
@@ -962,7 +1147,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         </header>
       )}
 
-      {/* Zotero-Style Annotation Toolbar */}
+      {/* Zotero-Style Annotation Toolbar + Format-Specific Quick Strip */}
       {!distractionFree && (
         <div
           role="toolbar"
@@ -988,9 +1173,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   aria-pressed={active}
                   onClick={() => setActiveTool(tool.id)}
                   className={`px-2.5 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 whitespace-nowrap transition-colors ${
-                    active
-                      ? 'bg-blue-800 text-white'
-                      : 'hover:bg-black/5 dark:hover:bg-white/10 opacity-85 hover:opacity-100'
+                    active ? 'accent-btn' : 'hover:bg-black/5 dark:hover:bg-white/10 opacity-85 hover:opacity-100'
                   }`}
                 >
                   {tool.icon}
@@ -1001,7 +1184,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
             <span className={`mx-2 h-4 w-px border-l ${theme.border}`} aria-hidden="true" />
 
-            {/* 5 Zotero Annotation Color Swatches */}
             <div className="flex items-center gap-1.5" aria-label="Annotation color">
               {COLOR_ORDER.map((c) => (
                 <button
@@ -1011,20 +1193,152 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   aria-pressed={selectedColor === c}
                   onClick={() => setSelectedColor(c)}
                   className={`w-4 h-4 rounded-full ${HIGHLIGHT_COLORS[c].swatch} transition-transform ${
-                    selectedColor === c ? 'ring-2 ring-offset-1 ring-blue-700 scale-110' : 'opacity-75 hover:opacity-100'
+                    selectedColor === c ? 'ring-2 ring-offset-1 ring-current scale-110' : 'opacity-75 hover:opacity-100'
                   }`}
                 />
               ))}
             </div>
           </div>
 
-          <div className={`text-[11px] ${theme.muted} whitespace-nowrap hidden md:block`}>
-            {activeTool === 'select' && 'Select text to quote, highlight, or translate'}
-            {activeTool === 'highlight' && 'Highlight tool active — drag across text to save'}
-            {activeTool === 'underline' && 'Underline tool active — drag across text to save'}
-            {activeTool === 'note' && 'Sticky Note tool active — click anywhere on page to pin'}
-            {activeTool === 'area' && 'Area Capture active — drag a box around any diagram or equation'}
-            {activeTool === 'ink' && 'Ink Draw active — draw freehand strokes on the page'}
+          {/* Dedicated EPUB Novel Reading Mode Quick Switcher */}
+          {book.format === 'epub' ? (
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span className={`text-[11px] ${theme.muted} hidden lg:inline mr-1`}>Novel Layout:</span>
+              {(
+                [
+                  {id: 'scroll', label: 'Scroll'},
+                  {id: 'paginated', label: 'Book Page'},
+                  {id: 'spread', label: '2-Page Spread'},
+                ] as const
+              ).map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  aria-pressed={epubViewMode === m.id}
+                  onClick={() =>
+                    onUpdatePreferences({
+                      ...preferences,
+                      epubViewMode: m.id,
+                      columnCount: m.id === 'spread' ? 2 : 1,
+                      updatedAtMs: Date.now(),
+                    })
+                  }
+                  className={`px-2 py-1 rounded text-[11px] font-medium whitespace-nowrap ${
+                    epubViewMode === m.id ? 'accent-btn' : 'hover:bg-black/5 dark:hover:bg-white/10 opacity-80'
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className={`text-[11px] ${theme.muted} whitespace-nowrap hidden md:block`}>
+              {scanActive
+                ? `Scan Enhance: ${scanSettings.preset} (${Math.round(scanSettings.contrast * 100)}% contrast)`
+                : activeTool === 'select'
+                  ? 'Select text to quote, highlight, or translate'
+                  : activeTool === 'highlight'
+                    ? 'Highlight active — drag across text to paint directly on page'
+                    : activeTool === 'underline'
+                      ? 'Underline active — drag across text to underline on page'
+                      : activeTool === 'note'
+                        ? 'Click anywhere on page to pin a sticky note'
+                        : activeTool === 'area'
+                          ? 'Drag a box around any figure or equation'
+                          : 'Draw freehand ink strokes directly on page'}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Scanned PDF & DjVu Enhancement Bar */}
+      {!distractionFree && scanOpen && book.format !== 'epub' && (
+        <div
+          aria-label="Scan enhancement controls"
+          className={`px-4 py-3 border-b ${theme.border} ${theme.surface} flex flex-wrap items-center justify-between gap-4 shrink-0`}
+        >
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-xs font-semibold mr-1">Scan Optimization:</span>
+            {(
+              [
+                {id: 'original', label: 'Original'},
+                {id: 'clean-scan', label: 'Clean Scan B&W'},
+                {id: 'high-contrast', label: 'High Contrast Ink'},
+                {id: 'bleed-reduce', label: 'Bleed-Through Clean'},
+              ] as {id: ScanPreset; label: string}[]
+            ).map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                aria-pressed={scanSettings.preset === preset.id}
+                onClick={() => setScanSettings(getScanPresetSettings(preset.id))}
+                className={`px-2.5 py-1 rounded-md text-xs font-medium border transition-colors ${
+                  scanSettings.preset === preset.id
+                    ? 'accent-btn border-transparent'
+                    : `${theme.border} hover:bg-black/5 dark:hover:bg-white/10`
+                }`}
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-4 flex-wrap text-xs">
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={scanSettings.cleanBackground}
+                onChange={(e) =>
+                  setScanSettings((s) => ({...s, cleanBackground: e.target.checked}))
+                }
+              />
+              <span>Whiten Paper</span>
+            </label>
+
+            <label className="flex items-center gap-2">
+              <span>Contrast {Math.round(scanSettings.contrast * 100)}%</span>
+              <input
+                type="range"
+                min={0.7}
+                max={2.4}
+                step={0.05}
+                value={scanSettings.contrast}
+                onChange={(e) =>
+                  setScanSettings((s) => ({...s, contrast: Number(e.target.value)}))
+                }
+                className="w-20"
+              />
+            </label>
+
+            <label className="flex items-center gap-2">
+              <span>Crispness {Math.round(scanSettings.sharpness * 100)}%</span>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={scanSettings.sharpness}
+                onChange={(e) =>
+                  setScanSettings((s) => ({...s, sharpness: Number(e.target.value)}))
+                }
+                className="w-20"
+              />
+            </label>
+
+            <label className="flex items-center gap-2">
+              <span>Bright {scanSettings.brightness > 0 ? `+${scanSettings.brightness}` : scanSettings.brightness}</span>
+              <input
+                type="range"
+                min={-40}
+                max={45}
+                step={5}
+                value={scanSettings.brightness}
+                onChange={(e) =>
+                  setScanSettings((s) => ({...s, brightness: Number(e.target.value)}))
+                }
+                className="w-20"
+              />
+            </label>
           </div>
         </div>
       )}
@@ -1073,9 +1387,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       type="button"
                       onClick={() => goToPage(ch.index)}
                       className={`w-full text-left px-3 py-2 rounded-lg text-xs transition-colors flex items-center justify-between gap-2 ${
-                        currentPage === ch.index
-                          ? 'bg-blue-800 text-white font-medium'
-                          : 'hover:bg-black/5 dark:hover:bg-white/10'
+                        currentPage === ch.index ? 'accent-btn font-medium' : 'hover:bg-black/5 dark:hover:bg-white/10'
                       }`}
                     >
                       <span className="truncate">{ch.title}</span>
@@ -1089,9 +1401,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       type="button"
                       onClick={() => goToPage(item.page)}
                       className={`w-full text-left px-3 py-2 rounded-lg text-xs transition-colors flex items-center justify-between gap-2 ${
-                        currentPage === item.page
-                          ? 'bg-blue-800 text-white font-medium'
-                          : 'hover:bg-black/5 dark:hover:bg-white/10'
+                        currentPage === item.page ? 'accent-btn font-medium' : 'hover:bg-black/5 dark:hover:bg-white/10'
                       }`}
                     >
                       <span className="truncate">{item.title}</span>
@@ -1105,9 +1415,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       type="button"
                       onClick={() => goToPage(p)}
                       className={`w-full text-left px-3 py-2 rounded-lg text-xs transition-colors ${
-                        currentPage === p
-                          ? 'bg-blue-800 text-white font-medium'
-                          : 'hover:bg-black/5 dark:hover:bg-white/10'
+                        currentPage === p ? 'accent-btn font-medium' : 'hover:bg-black/5 dark:hover:bg-white/10'
                       }`}
                     >
                       Page {p}
@@ -1117,7 +1425,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               </div>
             ) : (
               <div className="flex-1 flex flex-col min-h-0">
-                {/* Zotero Inspector Filter Controls */}
                 <div className={`p-3 border-b ${theme.border} space-y-2.5 shrink-0`}>
                   <button
                     type="button"
@@ -1126,7 +1433,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       setPendingPosition(undefined);
                       setComposerOpen(true);
                     }}
-                    className="w-full py-2 px-3 rounded-lg bg-blue-800 text-white text-xs font-medium hover:bg-blue-900 flex items-center justify-center gap-1.5"
+                    className="w-full py-2 px-3 rounded-lg accent-btn text-xs font-medium flex items-center justify-center gap-1.5"
                   >
                     <MessageSquarePlus className="w-3.5 h-3.5" aria-hidden="true" />
                     Annotate Current Passage
@@ -1161,7 +1468,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                         type="button"
                         onClick={() => setAnnColorFilter('all')}
                         className={`px-1.5 py-0.5 rounded text-[10px] border ${
-                          annColorFilter === 'all' ? 'border-blue-700 font-semibold' : theme.border
+                          annColorFilter === 'all' ? 'accent-border font-semibold' : theme.border
                         }`}
                       >
                         All
@@ -1173,7 +1480,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                           aria-label={`Filter ${HIGHLIGHT_COLORS[c].label}`}
                           onClick={() => setAnnColorFilter(annColorFilter === c ? 'all' : c)}
                           className={`w-3.5 h-3.5 rounded-full ${HIGHLIGHT_COLORS[c].swatch} ${
-                            annColorFilter === c ? 'ring-2 ring-offset-1 ring-blue-700' : 'opacity-65'
+                            annColorFilter === c ? 'ring-2 ring-offset-1 ring-current' : 'opacity-65'
                           }`}
                         />
                       ))}
@@ -1184,7 +1491,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 <div className="flex-1 overflow-y-auto p-3 space-y-3">
                   {filteredInspectorAnnotations.length === 0 ? (
                     <p className={`text-xs ${theme.muted} py-4 text-center`}>
-                      No matching annotations yet. Use the toolbar above to highlight, underline, pin a sticky note, capture an area, or draw ink.
+                      No matching annotations yet. Highlight, underline, pin a note, capture an area, or draw ink directly on any page.
                     </p>
                   ) : (
                     filteredInspectorAnnotations.map((ann) => {
@@ -1195,7 +1502,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                         <div
                           key={ann.id}
                           className={`rounded-lg border p-3 space-y-2 transition-colors ${
-                            isFocused ? 'border-blue-700 ring-1 ring-blue-700' : theme.border
+                            isFocused ? 'accent-border ring-1 ring-current' : theme.border
                           }`}
                         >
                           <div className="flex items-center justify-between gap-2">
@@ -1205,7 +1512,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                                 setFocusedAnnotationId(ann.id);
                                 goToPage(ann.page);
                               }}
-                              className="text-xs font-medium text-blue-700 dark:text-blue-400 hover:underline tabular-nums flex items-center gap-1.5"
+                              className="text-xs font-medium accent-text hover:underline tabular-nums flex items-center gap-1.5"
                             >
                               <span className={`w-2.5 h-2.5 rounded-xs ${c.swatch}`} />
                               <span>p.{ann.page}</span>
@@ -1238,9 +1545,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
                           <blockquote
                             style={
-                              kind === 'underline'
-                                ? {borderBottom: `2px solid ${c.hex}`}
-                                : undefined
+                              kind === 'underline' ? {borderBottom: `2px solid ${c.hex}`} : undefined
                             }
                             className={`text-xs italic leading-relaxed px-2 py-1.5 rounded ${
                               kind === 'underline' ? '' : c.bg
@@ -1249,7 +1554,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                             "{ann.quote}"
                           </blockquote>
 
-                          {/* Tags row */}
                           <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
                             {(ann.tags || []).map((tag) => (
                               <span
@@ -1293,9 +1597,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                                   autoFocus
                                   className={`w-20 px-1.5 py-0.5 rounded border ${theme.border} bg-transparent text-[11px]`}
                                 />
-                                <button type="submit" className="text-blue-700 dark:text-blue-400 font-medium">
-                                  Add
-                                </button>
+                                <button type="submit" className="accent-text font-medium">Add</button>
                               </form>
                             ) : (
                               <button
@@ -1327,7 +1629,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                                     onUpdateAnnotation(ann.id, {note: editingNoteText});
                                     setEditingNoteId(null);
                                   }}
-                                  className="px-2.5 py-1 rounded bg-blue-800 text-white text-xs"
+                                  className="px-2.5 py-1 rounded accent-btn text-xs"
                                 >
                                   Save
                                 </button>
@@ -1351,7 +1653,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                                   setEditingNoteId(ann.id);
                                   setEditingNoteText(ann.note);
                                 }}
-                                className="text-[11px] text-blue-700 dark:text-blue-400 hover:underline shrink-0"
+                                className="text-[11px] accent-text hover:underline shrink-0"
                               >
                                 Edit
                               </button>
@@ -1369,15 +1671,27 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
         {/* Center Reading Canvas */}
         <main
+          ref={readerViewportRef}
           onMouseUp={handleMouseUpSelection}
+          onClick={(ev) => {
+            // Inspect any inline EPUB highlight or underline <mark data-ann-id="...">
+            const target = ev.target as HTMLElement | null;
+            const mark = target?.closest('mark[data-ann-id]') as HTMLElement | null;
+            if (mark?.dataset.annId) {
+              ev.stopPropagation();
+              setFocusedAnnotationId(mark.dataset.annId);
+            } else if (focusedAnnotationId && !target?.closest('[data-testid="inline-annotation-popover"]')) {
+              setFocusedAnnotationId(null);
+            }
+          }}
           className={`flex-1 overflow-y-auto px-4 sm:px-8 py-8 flex flex-col items-center relative ${
             spatialToolActive ? 'select-none' : ''
           }`}
         >
-          {/* Quick Floating Selection Action Bar */}
+          {/* Quick Floating Selection Action Bar (when using Select cursor) */}
           {selectedText && !composerOpen && (
             <div className="sticky top-2 z-30 mb-4 px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-lg flex items-center gap-2 flex-wrap">
-              <span className="text-xs text-slate-500 max-w-[180px] truncate">"{selectedText}"</span>
+              <span className="text-xs opacity-65 max-w-[180px] truncate">"{selectedText}"</span>
               {COLOR_ORDER.map((c) => (
                 <button
                   key={c}
@@ -1393,9 +1707,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       note: '',
                       color: c,
                       tags: [],
+                      rects: selectedRects,
+                      position: selectedRects?.[0],
                     });
                     setSelectedText('');
-                    setLeftTab('annotations');
+                    setSelectedRects(undefined);
                   }}
                   className={`w-5 h-5 rounded-full ${HIGHLIGHT_COLORS[c].swatch} hover:scale-110 transition-transform`}
                 />
@@ -1412,9 +1728,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                     note: '',
                     color: selectedColor,
                     tags: [],
+                    rects: selectedRects,
+                    position: selectedRects?.[0],
                   });
                   setSelectedText('');
-                  setLeftTab('annotations');
+                  setSelectedRects(undefined);
                 }}
                 className="px-2.5 py-1 rounded-md text-xs font-medium bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 flex items-center gap-1"
               >
@@ -1434,15 +1752,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               <button
                 type="button"
                 onClick={() => void handleRunTranslation(selectedText)}
-                className="px-2.5 py-1 rounded-md text-xs font-medium bg-blue-800 text-white hover:bg-blue-900"
+                className="px-2.5 py-1 rounded-md text-xs font-medium accent-btn"
               >
                 Translate
               </button>
               <button
                 type="button"
-                onClick={() => setSelectedText('')}
+                onClick={() => {
+                  setSelectedText('');
+                  setSelectedRects(undefined);
+                }}
                 aria-label="Clear selection"
-                className="p-1 text-slate-400 hover:text-slate-700"
+                className="p-1 opacity-55 hover:opacity-100"
               >
                 <X className="w-3.5 h-3.5" />
               </button>
@@ -1453,7 +1774,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           {composerOpen && (
             <form
               onSubmit={handleCreateAnnotation}
-              className={`w-full max-w-xl mb-6 rounded-xl border ${theme.border} ${theme.surface} p-4 space-y-3 z-30`}
+              className={`w-full max-w-xl mb-6 rounded-xl border ${theme.border} ${theme.surface} p-4 space-y-3 z-30 shadow-md`}
             >
               <div className="flex items-center justify-between">
                 <h3 className="text-xs font-semibold uppercase tracking-wide">
@@ -1517,15 +1838,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       onClick={() => setSelectedColor(c)}
                       aria-label={`Select ${HIGHLIGHT_COLORS[c].label} highlight`}
                       className={`w-6 h-6 rounded-full ${HIGHLIGHT_COLORS[c].swatch} ${
-                        selectedColor === c ? 'ring-2 ring-offset-2 ring-blue-700' : 'opacity-70'
+                        selectedColor === c ? 'ring-2 ring-offset-2 ring-current' : 'opacity-70'
                       }`}
                     />
                   ))}
                 </div>
-                <button
-                  type="submit"
-                  className="px-4 py-1.5 rounded-lg bg-blue-800 text-white text-xs font-medium hover:bg-blue-900"
-                >
+                <button type="submit" className="px-4 py-1.5 rounded-lg accent-btn text-xs font-medium">
                   Save Annotation
                 </button>
               </div>
@@ -1540,39 +1858,117 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               <p className="mt-3 text-sm font-medium">{docError}</p>
             </div>
           ) : book.format === 'epub' && epubDoc ? (
-            /* EPUB Reflowable Reader + Spatial Zotero Overlay */
+            /* EPUB Reflowable & Literary Novel / Spread Reader */
             <article
               ref={pageStageRef}
+              data-epub-mode={epubViewMode}
               style={{
-                maxWidth: `${preferences.columnCount === 2 ? Math.max(preferences.maxWidth, 940) : preferences.maxWidth}px`,
+                maxWidth:
+                  epubViewMode === 'spread'
+                    ? `${Math.max(preferences.maxWidth, 1020)}px`
+                    : `${preferences.maxWidth}px`,
                 fontSize: `${preferences.fontSize}px`,
                 lineHeight: preferences.lineHeight,
               }}
-              className={`relative w-full ${fontClass} ${
-                preferences.columnCount === 2 ? 'md:columns-2 md:gap-12' : ''
-              } transition-all`}
+              className={`relative w-full ${fontClass} transition-all ${
+                epubViewMode !== 'scroll'
+                  ? `rounded-2xl border ${theme.border} ${theme.surface} shadow-md p-8 sm:p-12 ${
+                      epubViewMode === 'spread' ? 'epub-spread-surface' : ''
+                    }`
+                  : ''
+              }`}
             >
               {renderSpatialOverlays()}
-              <div className={`text-xs mb-6 pb-2 border-b ${theme.border} ${theme.muted} flex items-center justify-between`}>
-                <span>{currentChapterTitle}</span>
-                <span className="tabular-nums">
-                  Chapter {currentPage} of {totalPages}
+
+              <div className={`text-xs mb-6 pb-2.5 border-b ${theme.border} ${theme.muted} flex items-center justify-between gap-4`}>
+                <span className="truncate font-medium">{currentChapterTitle}</span>
+                <span className="tabular-nums whitespace-nowrap shrink-0">
+                  ~{estimatedChapterMinutes} min read · Ch. {currentPage}/{totalPages}
+                  {epubViewMode !== 'scroll' && epubSubPageCount > 1
+                    ? ` · Leaf ${epubSubPage + 1}/${epubSubPageCount}`
+                    : ''}
                 </span>
               </div>
-              <div
-                className="epub-prose"
-                dangerouslySetInnerHTML={{
-                  __html: epubDoc.chapters[currentPage - 1]?.html || '<p>Empty chapter.</p>',
-                }}
-              />
+
+              {epubViewMode === 'scroll' ? (
+                <div
+                  key="epub-scroll-view"
+                  ref={epubBodyRef}
+                  data-testid="epub-prose-container"
+                  className={`epub-prose ${novelIndent ? 'epub-novel-indent' : ''} ${
+                    novelJustify ? 'epub-novel-justify' : ''
+                  } ${novelDropCap ? 'epub-novel-dropcap' : ''} ${
+                    preferences.columnCount === 2 ? 'md:columns-2 md:gap-12' : ''
+                  }`}
+                />
+              ) : (
+                /* Paginated Book / Two-Page Open Spread */
+                <div key="epub-paginated-view" className="relative">
+                  <div ref={epubSpreadViewportRef} className="overflow-hidden" style={{height: '62vh'}}>
+                    <div
+                      key={`epub-cols-${epubViewMode}`}
+                      ref={epubBodyRef}
+                      data-testid="epub-prose-container"
+                      style={{
+                        height: '62vh',
+                        columnWidth: epubViewMode === 'spread' ? '360px' : '100%',
+                        columnCount: epubViewMode === 'spread' ? 2 : 1,
+                        columnGap: epubViewMode === 'spread' ? '4rem' : '2rem',
+                        columnFill: 'auto',
+                        transform: `translateX(calc(-${epubSubPage} * (100% + ${
+                          epubViewMode === 'spread' ? '4rem' : '2rem'
+                        })))`,
+                        transition: 'transform 220ms ease',
+                      }}
+                      className={`epub-prose ${novelIndent ? 'epub-novel-indent' : ''} ${
+                        novelJustify ? 'epub-novel-justify' : ''
+                      } ${novelDropCap ? 'epub-novel-dropcap' : ''}`}
+                    />
+                  </div>
+
+                  {/* Subtle Book Page Turn Controls */}
+                  <div className={`mt-6 pt-3 border-t ${theme.border} flex items-center justify-between text-xs`}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (epubSubPage > 0) setEpubSubPage((p) => p - 1);
+                        else if (currentPage > 1) goToPage(currentPage - 1);
+                      }}
+                      disabled={currentPage <= 1 && epubSubPage === 0}
+                      className="px-3 py-1 rounded-md hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-30 flex items-center gap-1"
+                    >
+                      <ChevronLeft className="w-3.5 h-3.5" />
+                      Turn Back
+                    </button>
+                    <span className={`tabular-nums ${theme.muted}`}>
+                      {epubViewMode === 'spread' ? 'Two-Page Book Spread' : 'Paginated Book'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (epubSubPage < epubSubPageCount - 1) setEpubSubPage((p) => p + 1);
+                        else if (currentPage < totalPages) goToPage(currentPage + 1);
+                      }}
+                      disabled={currentPage >= totalPages && epubSubPage >= epubSubPageCount - 1}
+                      className="px-3 py-1 rounded-md hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-30 flex items-center gap-1"
+                    >
+                      Turn Page
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              )}
             </article>
           ) : (
-            /* PDF & DjVu Canvas + Selectable Text Layer + Zotero Spatial Overlay */
+            /* PDF & DjVu Canvas + Selectable Text Layer + In-Page Zotero Overlays */
             <div className="flex flex-col items-center gap-4 w-full">
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setZoomScale((z) => Math.max(0.8, Number((z - 0.15).toFixed(2))))}
+                  onClick={() => {
+                    setFitWidthMode(false);
+                    setZoomScale((z) => Math.max(0.8, Number((z - 0.15).toFixed(2))));
+                  }}
                   aria-label="Zoom out"
                   className={`p-1.5 rounded-lg border ${theme.border} ${theme.surface}`}
                 >
@@ -1583,17 +1979,32 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 </span>
                 <button
                   type="button"
-                  onClick={() => setZoomScale((z) => Math.min(2.4, Number((z + 0.15).toFixed(2))))}
+                  onClick={() => {
+                    setFitWidthMode(false);
+                    setZoomScale((z) => Math.min(2.4, Number((z + 0.15).toFixed(2))));
+                  }}
                   aria-label="Zoom in"
                   className={`p-1.5 rounded-lg border ${theme.border} ${theme.surface}`}
                 >
                   <ZoomIn className="w-4 h-4" />
                 </button>
+                <button
+                  type="button"
+                  aria-pressed={fitWidthMode}
+                  onClick={() => setFitWidthMode((prev) => !prev)}
+                  className={`px-2.5 py-1 rounded-lg border text-xs font-medium ${
+                    fitWidthMode ? 'accent-btn border-transparent' : `${theme.border} ${theme.surface}`
+                  }`}
+                >
+                  Fit Width
+                </button>
               </div>
 
               <div
                 ref={pageStageRef}
-                className={`relative border ${theme.border} shadow-sm bg-white overflow-hidden`}
+                className={`relative border ${theme.border} shadow-sm ${
+                  !theme.isDark ? theme.surface : 'bg-white'
+                } overflow-hidden`}
                 style={
                   book.format === 'pdf'
                     ? {width: `${pdfCanvasSize.width}px`, height: `${pdfCanvasSize.height}px`}
@@ -1604,7 +2015,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   ref={canvasRef}
                   data-testid="document-canvas"
                   className={`block ${
-                    preferences.theme === 'night' || preferences.theme === 'dusk' ? 'invert-[0.88] hue-rotate-180' : ''
+                    theme.isDark
+                      ? 'invert-[0.88] hue-rotate-180'
+                      : preferences.theme !== 'paper'
+                        ? 'mix-blend-multiply'
+                        : ''
                   }`}
                 />
 
@@ -1630,17 +2045,17 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   </div>
                 )}
 
-                {/* DjVu Text Layer Overlay when bitmap is text-only or archival */}
+                {/* DjVu Text Layer Overlay */}
                 {book.format === 'djvu' && djvuPageText && (
                   <div
                     className={`${
                       djvuBlankBitmap
-                        ? 'absolute inset-0 p-10 overflow-y-auto text-slate-900 bg-[#FDFCF8] z-10'
-                        : 'p-4 border-t border-slate-200 bg-slate-50 text-slate-800'
+                        ? `absolute inset-0 p-10 overflow-y-auto ${theme.surface} ${theme.text} z-10`
+                        : `p-4 border-t ${theme.border} ${theme.surface} ${theme.text}`
                     }`}
                   >
                     {djvuBlankBitmap && (
-                      <div className="text-[11px] font-mono uppercase tracking-wider text-slate-400 mb-4">
+                      <div className={`text-[11px] font-mono uppercase tracking-wider ${theme.muted} mb-4`}>
                         DjVu Text Layer (TXTa) · {book.title}
                       </div>
                     )}
@@ -1650,11 +2065,20 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   </div>
                 )}
 
-                {/* Zotero Spatial Annotation Overlay (Notes, Areas, Ink) */}
                 {renderSpatialOverlays()}
               </div>
             </div>
           )}
+
+          {/* Quiet Floating Inline Annotation Editor Popover (Never pops open sidebar!) */}
+          <AnnotationPopover
+            annotation={focusedAnnotation}
+            copied={copiedId === focusedAnnotation?.id}
+            onUpdate={onUpdateAnnotation}
+            onDelete={onDeleteAnnotation}
+            onCopyCitation={(ann) => void handleCopyCitation(ann)}
+            onClose={() => setFocusedAnnotationId(null)}
+          />
         </main>
 
         {/* Right Drawer: Appearance / Translation / AI Course */}
@@ -1666,7 +2090,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             <div className={`px-4 py-3 border-b ${theme.border} flex items-center justify-between`}>
               <h2 className="text-xs font-semibold tracking-wide uppercase">
                 {rightTab === 'typography'
-                  ? 'Typography & Theme'
+                  ? 'Typography & Surface'
                   : rightTab === 'translate'
                     ? 'Inline Document Translation'
                     : 'AI Study Studio'}
@@ -1685,50 +2109,45 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               {rightTab === 'typography' && (
                 <>
                   <div className="space-y-2">
-                    <span className="text-xs font-medium">Reading Surface</span>
+                    <span className="text-xs font-medium">Reading Surface (8 Themes)</span>
                     <div className="grid grid-cols-2 gap-2">
-                      {(['paper', 'sepia', 'dusk', 'night'] as ReaderTheme[]).map((t) => (
+                      {(Object.keys(READER_THEMES) as ReaderTheme[]).map((t) => (
                         <button
                           key={t}
                           type="button"
                           onClick={() =>
                             onUpdatePreferences({...preferences, theme: t, updatedAtMs: Date.now()})
                           }
-                          className={`px-3 py-2 rounded-lg border text-xs font-medium capitalize transition-colors ${
-                            preferences.theme === t
-                              ? 'border-blue-700 ring-1 ring-blue-700'
-                              : theme.border
+                          className={`px-2.5 py-2 rounded-lg border text-xs font-medium flex items-center gap-2 transition-colors ${
+                            preferences.theme === t ? 'accent-border accent-soft' : theme.border
                           }`}
                         >
-                          {t}
+                          <span
+                            className="w-3.5 h-3.5 rounded-full border border-black/20 shrink-0"
+                            style={{backgroundColor: READER_THEMES[t].swatch}}
+                          />
+                          <span className="truncate">{READER_THEMES[t].label}</span>
                         </button>
                       ))}
                     </div>
                   </div>
 
                   <div className="space-y-2">
-                    <span className="text-xs font-medium">Typeface</span>
-                    <div className="grid grid-cols-3 gap-2">
-                      {(
-                        [
-                          {id: 'serif', label: 'Serif'},
-                          {id: 'sans', label: 'Sans'},
-                          {id: 'mono', label: 'Mono'},
-                        ] as const
-                      ).map((f) => (
+                    <span className="text-xs font-medium">Curated Typefaces</span>
+                    <div className="grid grid-cols-2 gap-2">
+                      {FONT_OPTIONS.map((f) => (
                         <button
                           key={f.id}
                           type="button"
                           onClick={() =>
                             onUpdatePreferences({...preferences, fontFamily: f.id, updatedAtMs: Date.now()})
                           }
-                          className={`px-3 py-2 rounded-lg border text-xs font-medium ${
-                            preferences.fontFamily === f.id
-                              ? 'bg-blue-800 text-white border-blue-800'
-                              : theme.border
+                          className={`px-2.5 py-2 rounded-lg border text-left text-xs ${
+                            preferences.fontFamily === f.id ? 'accent-btn border-transparent' : theme.border
                           }`}
                         >
-                          {f.label}
+                          <div className={`font-medium truncate ${f.cssClass}`}>{f.label}</div>
+                          <div className="text-[10px] opacity-70 truncate">{f.category}</div>
                         </button>
                       ))}
                     </div>
@@ -1788,7 +2207,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       id="measure-range"
                       type="range"
                       min={540}
-                      max={1020}
+                      max={1120}
                       step={20}
                       value={preferences.maxWidth}
                       onChange={(e) =>
@@ -1803,36 +2222,80 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   </div>
 
                   {book.format === 'epub' && (
-                    <div className="space-y-2">
-                      <span className="text-xs font-medium">Page Layout</span>
-                      <div className="grid grid-cols-2 gap-2">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            onUpdatePreferences({...preferences, columnCount: 1, updatedAtMs: Date.now()})
-                          }
-                          className={`px-3 py-2 rounded-lg border text-xs font-medium ${
-                            preferences.columnCount === 1
-                              ? 'bg-blue-800 text-white border-blue-800'
-                              : theme.border
-                          }`}
-                        >
-                          Single Column
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            onUpdatePreferences({...preferences, columnCount: 2, updatedAtMs: Date.now()})
-                          }
-                          className={`px-3 py-2 rounded-lg border text-xs font-medium flex items-center justify-center gap-1.5 ${
-                            preferences.columnCount === 2
-                              ? 'bg-blue-800 text-white border-blue-800'
-                              : theme.border
-                          }`}
-                        >
-                          <Columns2 className="w-3.5 h-3.5" />
-                          Two Columns
-                        </button>
+                    <div className={`pt-3 border-t ${theme.border} space-y-3`}>
+                      <span className="text-xs font-medium block">Novel &amp; Book Typography</span>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        {(
+                          [
+                            {id: 'scroll', label: 'Scroll'},
+                            {id: 'paginated', label: 'Book'},
+                            {id: 'spread', label: 'Spread'},
+                          ] as const
+                        ).map((mode) => (
+                          <button
+                            key={mode.id}
+                            type="button"
+                            onClick={() =>
+                              onUpdatePreferences({
+                                ...preferences,
+                                epubViewMode: mode.id,
+                                columnCount: mode.id === 'spread' ? 2 : 1,
+                                updatedAtMs: Date.now(),
+                              })
+                            }
+                            className={`py-1.5 rounded-lg border text-xs font-medium flex items-center justify-center gap-1 ${
+                              epubViewMode === mode.id ? 'accent-btn border-transparent' : theme.border
+                            }`}
+                          >
+                            {mode.id === 'spread' && <Columns2 className="w-3 h-3" />}
+                            {mode.label}
+                          </button>
+                        ))}
+                      </div>
+
+                      <div className="space-y-2 text-xs">
+                        <label className="flex items-center justify-between cursor-pointer">
+                          <span>Literary Paragraph Indent</span>
+                          <input
+                            type="checkbox"
+                            checked={novelIndent}
+                            onChange={(e) =>
+                              onUpdatePreferences({
+                                ...preferences,
+                                novelIndent: e.target.checked,
+                                updatedAtMs: Date.now(),
+                              })
+                            }
+                          />
+                        </label>
+                        <label className="flex items-center justify-between cursor-pointer">
+                          <span>Justified Text &amp; Hyphens</span>
+                          <input
+                            type="checkbox"
+                            checked={novelJustify}
+                            onChange={(e) =>
+                              onUpdatePreferences({
+                                ...preferences,
+                                novelJustify: e.target.checked,
+                                updatedAtMs: Date.now(),
+                              })
+                            }
+                          />
+                        </label>
+                        <label className="flex items-center justify-between cursor-pointer">
+                          <span>Chapter Drop Cap</span>
+                          <input
+                            type="checkbox"
+                            checked={novelDropCap}
+                            onChange={(e) =>
+                              onUpdatePreferences({
+                                ...preferences,
+                                novelDropCap: e.target.checked,
+                                updatedAtMs: Date.now(),
+                              })
+                            }
+                          />
+                        </label>
                       </div>
                     </div>
                   )}
@@ -1877,7 +2340,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       type="button"
                       disabled={translating}
                       onClick={() => void handleRunTranslation()}
-                      className="flex-1 py-2 px-3 rounded-lg bg-blue-800 text-white text-xs font-medium hover:bg-blue-900 disabled:opacity-50"
+                      className="flex-1 py-2 px-3 rounded-lg accent-btn text-xs font-medium disabled:opacity-50"
                     >
                       {translating ? 'Translating...' : `Translate to ${targetLang}`}
                     </button>
@@ -1929,7 +2392,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       type="button"
                       disabled={generatingCourse}
                       onClick={() => void handleTriggerCourse('course')}
-                      className="py-2 px-3 rounded-lg bg-blue-800 text-white text-xs font-medium hover:bg-blue-900 disabled:opacity-50"
+                      className="py-2 px-3 rounded-lg accent-btn text-xs font-medium disabled:opacity-50"
                     >
                       {generatingCourse ? 'Synthesizing...' : 'Build Lecture Course'}
                     </button>
@@ -1980,9 +2443,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                         {activeCourse.modules.map((mod) => (
                           <div key={mod.moduleNumber} className={`rounded-lg border ${theme.border} p-3 space-y-2`}>
                             <div className="flex items-center justify-between text-xs font-semibold">
-                              <span>
-                                {mod.moduleNumber}. {mod.title}
-                              </span>
+                              <span>{mod.moduleNumber}. {mod.title}</span>
                               <span className={`tabular-nums ${theme.muted}`}>{mod.durationMinutes} min</span>
                             </div>
                             <p className="text-xs leading-relaxed opacity-90">{mod.lectureNotes}</p>
@@ -1998,7 +2459,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                                   onClick={() =>
                                     setRevealedQuiz((prev) => ({...prev, [mod.moduleNumber]: true}))
                                   }
-                                  className="text-xs text-blue-700 dark:text-blue-400 hover:underline"
+                                  className="text-xs accent-text hover:underline"
                                 >
                                   Reveal Answer
                                 </button>
@@ -2037,8 +2498,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               min={1}
               max={totalPages}
               value={currentPage}
-              aria-label="Page scrubber"
               onChange={(e) => goToPage(Number(e.target.value))}
+              aria-label="Reading progress scrubber"
               className="flex-1"
             />
             <span className="text-xs font-mono tabular-nums whitespace-nowrap">
@@ -2056,13 +2517,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             <ChevronRight className="w-4 h-4" />
           </button>
         </footer>
-      )}
-
-      {distractionFree && simulatedOffline && (
-        <div className="fixed bottom-4 left-4 text-xs opacity-60 flex items-center gap-1.5">
-          <EyeOff className="w-3.5 h-3.5" />
-          Offline Focus Mode
-        </div>
       )}
     </div>
   );

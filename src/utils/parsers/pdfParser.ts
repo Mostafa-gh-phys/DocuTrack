@@ -160,3 +160,34 @@ export async function renderPdfPageToCanvas(
     textItems,
   };
 }
+
+export async function extractPdfCoverThumbnail(doc: pdfjsLib.PDFDocumentProxy): Promise<string | undefined> {
+  if (typeof document === 'undefined' || doc.numPages < 1) return undefined;
+  try {
+    const page = await doc.getPage(1);
+    const unscaled = page.getViewport({scale: 1});
+    const targetWidth = 260;
+    const scale = Math.max(0.2, Math.min(1.5, targetWidth / Math.max(1, unscaled.width)));
+    const viewport = page.getViewport({scale});
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.floor(viewport.width));
+    canvas.height = Math.max(1, Math.floor(viewport.height));
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return undefined;
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    await page.render({
+      canvasContext: ctx,
+      viewport,
+      canvas,
+    }).promise;
+
+    return canvas.toDataURL('image/jpeg', 0.82);
+  } catch {
+    return undefined;
+  }
+}
+

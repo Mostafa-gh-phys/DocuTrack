@@ -3,7 +3,6 @@ import type {
   Annotation,
   BackupArchive,
   BackupSnapshotRecord,
-  BookFormat,
   BookMetadata,
   DocumentTextChunk,
   ReaderPreferences,
@@ -17,13 +16,16 @@ import {
   sanitizeId,
 } from './libraryLogic';
 import {
+  extractDjvuCoverThumbnail,
   extractDjvuMetadataAndText,
   extractDjvuPageTextRange,
   openDjvuDocument,
 } from './parsers/djvuParser';
 import {extractEpubInfoFallback, parseEpubForIndex} from './parsers/epubIndexHelper';
+import {extractEpubCoverThumbnail} from './parsers/epubParser';
 import {
-  extractPdfMetadataAndText,
+  extractPdfCoverThumbnail,
+  extractPdfOutlineAndMeta,
   extractPdfPageTextRange,
   loadPdfDocument,
 } from './parsers/pdfParser';
@@ -37,6 +39,10 @@ interface FolioDB extends DBSchema {
   binaries: {
     key: string;
     value: ArrayBuffer;
+  };
+  covers: {
+    key: string;
+    value: string;
   };
   textChunks: {
     key: string;
@@ -69,11 +75,16 @@ interface FolioDB extends DBSchema {
 export const DEFAULT_PREFERENCES: ReaderPreferences = {
   theme: 'paper',
   uiTheme: 'light',
+  accentColor: 'cobalt',
   fontFamily: 'serif',
   fontSize: 18,
   lineHeight: 1.7,
   maxWidth: 740,
   columnCount: 1,
+  epubViewMode: 'scroll',
+  novelIndent: true,
+  novelJustify: true,
+  novelDropCap: true,
   backupFrequency: 'onChange',
   updatedAtMs: Date.now(),
 };
@@ -82,13 +93,16 @@ let dbPromise: Promise<IDBPDatabase<FolioDB>> | null = null;
 
 function getDb(): Promise<IDBPDatabase<FolioDB>> {
   if (!dbPromise) {
-    dbPromise = openDB<FolioDB>('folio-library-db', 2, {
+    dbPromise = openDB<FolioDB>('folio-library-db', 3, {
       upgrade(db) {
         if (!db.objectStoreNames.contains('books')) {
           db.createObjectStore('books', {keyPath: 'id'});
         }
         if (!db.objectStoreNames.contains('binaries')) {
           db.createObjectStore('binaries');
+        }
+        if (!db.objectStoreNames.contains('covers')) {
+          db.createObjectStore('covers');
         }
         if (!db.objectStoreNames.contains('textChunks')) {
           db.createObjectStore('textChunks');
@@ -124,12 +138,14 @@ export async function initializeLibraryStore(): Promise<{
   readingGoal: ReadingGoal;
   textChunks: DocumentTextChunk[];
   backups: BackupSnapshotRecord[];
+  covers: Record<string, string>;
 }> {
   const db = await getDb();
   let books = await db.getAll('books');
   let annotations = await db.getAll('annotations');
   const courses = await db.getAll('courses');
-  const preferences = (await db.get('preferences', 'reader')) || DEFAULT_PREFERENCES;
+  const rawPrefs = await db.get('preferences', 'reader');
+  const preferences: ReaderPreferences = rawPrefs ? {...DEFAULT_PREFERENCES, ...rawPrefs} : DEFAULT_PREFERENCES;
   let readingGoal = await db.get('goals', 'default');
 
   if (!readingGoal) {
@@ -157,14 +173,33 @@ export async function initializeLibraryStore(): Promise<{
     annotations = seed.annotations;
   }
 
-  const allChunkArrays = await db.getAll('textChunks');
+  const [allChunkArrays, backupRows, coverKeys] = await Promise.all([
+    db.getAll('textChunks'),
+    db.getAll('backups'),
+    db.getAllKeys('covers'),
+  ]);
   const textChunks = allChunkArrays.flat();
-  const backupRows = await db.getAll('backups');
   const backups = backupRows
     .map((r) => r.record)
     .sort((a, b) => b.createdAtMs - a.createdAtMs);
 
-  return {books, annotations, courses, preferences, readingGoal, textChunks, backups};
+  const covers: Record<string, string> = {};
+  if (coverKeys.length > 0) {
+    const coverVals = await Promise.all(coverKeys.map((k) => db.get('covers', String(k))));
+    coverKeys.forEach((k, idx) => {
+      const v = coverVals[idx];
+      if (typeof v === 'string' && v.length > 0) {
+        covers[String(k)] = v;
+      }
+    });
+  }
+
+  return {books, annotations, courses, preferences, readingGoal, textChunks, backups, covers};
+}
+
+export async function getBooksLocal(): Promise<BookMetadata[]> {
+  const db = await getDb();
+  return await db.getAll('books');
 }
 
 export async function getBookBinary(bookId: string): Promise<ArrayBuffer | undefined> {
@@ -177,11 +212,22 @@ export async function getBookTextChunks(bookId: string): Promise<DocumentTextChu
   return (await db.get('textChunks', bookId)) || [];
 }
 
-export async function saveBookLocal(book: BookMetadata, binary?: ArrayBuffer, chunks?: DocumentTextChunk[]): Promise<void> {
+export async function saveBookCover(bookId: string, dataUrl: string): Promise<void> {
   const db = await getDb();
-  const stores: Array<'books' | 'binaries' | 'textChunks'> = ['books'];
+  await db.put('covers', dataUrl, bookId);
+}
+
+export async function saveBookLocal(
+  book: BookMetadata,
+  binary?: ArrayBuffer,
+  chunks?: DocumentTextChunk[],
+  coverDataUrl?: string,
+): Promise<void> {
+  const db = await getDb();
+  const stores: Array<'books' | 'binaries' | 'textChunks' | 'covers'> = ['books'];
   if (binary) stores.push('binaries');
   if (chunks) stores.push('textChunks');
+  if (coverDataUrl) stores.push('covers');
   const tx = db.transaction(stores, 'readwrite');
   await tx.objectStore('books').put(book);
   if (binary) {
@@ -190,6 +236,9 @@ export async function saveBookLocal(book: BookMetadata, binary?: ArrayBuffer, ch
   if (chunks) {
     await tx.objectStore('textChunks').put(chunks, book.id);
   }
+  if (coverDataUrl) {
+    await tx.objectStore('covers').put(coverDataUrl, book.id);
+  }
   await tx.done;
 }
 
@@ -197,6 +246,7 @@ export async function deleteBookLocal(bookId: string): Promise<void> {
   const db = await getDb();
   await db.delete('books', bookId);
   await db.delete('binaries', bookId);
+  await db.delete('covers', bookId);
   await db.delete('textChunks', bookId);
   const anns = await db.getAllFromIndex('annotations', 'by-book', bookId);
   for (const ann of anns) await db.delete('annotations', ann.id);
@@ -279,7 +329,6 @@ export async function createLocalBackupSnapshot(
 
   await db.put('backups', {record, archive});
 
-  // Retain latest 15 automated snapshots to keep local storage clean
   const all = await db.getAll('backups');
   if (all.length > 15) {
     const sorted = all.sort((a, b) => b.record.createdAtMs - a.record.createdAtMs);
@@ -329,37 +378,72 @@ export async function restoreFromArchive(archive: BackupArchive): Promise<void> 
   await tx.done;
 }
 
+export async function extractCoverFromBuffer(
+  format: BookMetadata['format'],
+  buffer: ArrayBuffer,
+  title: string,
+  author: string,
+): Promise<string | undefined> {
+  try {
+    if (format === 'pdf') {
+      const doc = await loadPdfDocument(buffer);
+      return await extractPdfCoverThumbnail(doc);
+    }
+    if (format === 'epub') {
+      return await extractEpubCoverThumbnail(buffer, title, author);
+    }
+    if (format === 'djvu') {
+      const doc = await openDjvuDocument(buffer);
+      return extractDjvuCoverThumbnail(doc, title);
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 const INITIAL_INDEX_PAGE_LIMIT = 8;
 
-export async function ingestImportedFile(
-  file: File,
+export async function ingestImportedBuffer(
+  buffer: ArrayBuffer,
+  filename: string,
   ownerId: string,
-  explicitFolder?: string,
-): Promise<{book: BookMetadata; chunks: DocumentTextChunk[]; needsFullIndex: boolean} | null> {
-  const format = detectSupportedBookFormat(file.name);
+  folderPath = '/Local Drive',
+): Promise<{
+  book: BookMetadata;
+  chunks: DocumentTextChunk[];
+  coverDataUrl?: string;
+  needsFullIndex: boolean;
+} | null> {
+  const format = detectSupportedBookFormat(filename);
   if (!format) {
     return null;
   }
 
-  const buffer = await file.arrayBuffer();
-  const baseName = file.name.replace(/\.(pdf|epub|djvu)$/i, '');
+  const baseName = filename.replace(/\.(pdf|epub|djvu)$/i, '');
   const id = sanitizeId(`doc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_${baseName.slice(0, 20)}`);
-  const relPath = (file as File & {webkitRelativePath?: string}).webkitRelativePath;
-  const folderPath = explicitFolder || deriveFolderFromRelativePath(relPath, '/Local Drive');
 
   let title = baseName.replace(/[_-]+/g, ' ');
   let author = 'Imported Author';
   let pageCount = 1;
   let language = 'English';
   let chunks: DocumentTextChunk[] = [];
+  let coverDataUrl: string | undefined;
 
   try {
     if (format === 'pdf') {
-      const info = await extractPdfMetadataAndText(buffer, INITIAL_INDEX_PAGE_LIMIT);
-      if (info.title) title = info.title;
-      if (info.author) author = info.author;
-      pageCount = Math.max(1, info.pageCount);
-      chunks = info.pageTexts.map((p) => ({
+      const doc = await loadPdfDocument(buffer);
+      pageCount = Math.max(1, doc.numPages);
+      const sampleLimit = Math.min(pageCount, INITIAL_INDEX_PAGE_LIMIT);
+      const [metaInfo, pageTexts, coverThumb] = await Promise.all([
+        extractPdfOutlineAndMeta(doc),
+        extractPdfPageTextRange(doc, 1, sampleLimit),
+        extractPdfCoverThumbnail(doc),
+      ]);
+      if (metaInfo.title) title = metaInfo.title;
+      if (metaInfo.author) author = metaInfo.author;
+      coverDataUrl = coverThumb;
+      chunks = pageTexts.map((p) => ({
         bookId: id,
         bookTitle: title,
         page: p.page,
@@ -367,11 +451,15 @@ export async function ingestImportedFile(
         text: p.text,
       }));
     } else if (format === 'epub') {
-      const epub = await parseEpubForIndex(buffer, INITIAL_INDEX_PAGE_LIMIT);
+      const [epub, coverThumb] = await Promise.all([
+        parseEpubForIndex(buffer, INITIAL_INDEX_PAGE_LIMIT),
+        extractEpubCoverThumbnail(buffer, title, author),
+      ]);
       if (epub.title) title = epub.title;
       if (epub.author) author = epub.author;
       if (epub.language) language = epub.language;
       pageCount = Math.max(1, epub.chapterCount);
+      coverDataUrl = coverThumb;
       chunks = epub.chapters.map((ch) => ({
         bookId: id,
         bookTitle: title,
@@ -380,9 +468,12 @@ export async function ingestImportedFile(
         text: ch.plainText,
       }));
     } else if (format === 'djvu') {
-      const djvu = await extractDjvuMetadataAndText(buffer, INITIAL_INDEX_PAGE_LIMIT);
-      pageCount = Math.max(1, djvu.pageCount);
-      chunks = djvu.pageTexts.map((p) => ({
+      const doc = await openDjvuDocument(buffer);
+      pageCount = Math.max(1, doc.page_count());
+      const sampleLimit = Math.min(pageCount, INITIAL_INDEX_PAGE_LIMIT);
+      const pageTexts = extractDjvuPageTextRange(doc, 1, sampleLimit);
+      coverDataUrl = extractDjvuCoverThumbnail(doc, title);
+      chunks = pageTexts.map((p) => ({
         bookId: id,
         bookTitle: title,
         page: p.page,
@@ -391,7 +482,7 @@ export async function ingestImportedFile(
       }));
     }
   } catch (err) {
-    console.warn(`Metadata extraction partial for ${file.name}:`, err);
+    console.warn(`Metadata extraction partial for ${filename}:`, err);
     chunks = [
       {
         bookId: id,
@@ -427,9 +518,30 @@ export async function ingestImportedFile(
     updatedAtMs: now,
   };
 
-  await saveBookLocal(book, buffer, chunks);
+  await saveBookLocal(book, buffer, chunks, coverDataUrl);
   const needsFullIndex = pageCount > INITIAL_INDEX_PAGE_LIMIT;
-  return {book, chunks, needsFullIndex};
+  return {book, chunks, coverDataUrl, needsFullIndex};
+}
+
+export async function ingestImportedFile(
+  file: File,
+  ownerId: string,
+  explicitFolder?: string,
+): Promise<{
+  book: BookMetadata;
+  chunks: DocumentTextChunk[];
+  coverDataUrl?: string;
+  needsFullIndex: boolean;
+} | null> {
+  const format = detectSupportedBookFormat(file.name);
+  if (!format) {
+    return null;
+  }
+
+  const buffer = await file.arrayBuffer();
+  const relPath = (file as File & {webkitRelativePath?: string}).webkitRelativePath;
+  const folderPath = explicitFolder || deriveFolderFromRelativePath(relPath, '/Local Drive');
+  return await ingestImportedBuffer(buffer, file.name, ownerId, folderPath);
 }
 
 export async function indexRemainingBookChunks(

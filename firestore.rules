@@ -62,6 +62,12 @@ service cloud.firestore {
         && pos.height is number && pos.height >= 0 && pos.height <= 1;
     }
 
+    function isValidAnnotationRects(rects) {
+      return rects is list
+        && rects.size() <= 24
+        && (rects.size() == 0 || isValidAnnotationPosition(rects[0]));
+    }
+
     function isValidInkStrokes(strokes) {
       return strokes is list
         && strokes.size() <= 30
@@ -116,7 +122,7 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'id', 'ownerId', 'bookId', 'page', 'chapterTitle', 'kind', 'quote', 'note',
-          'color', 'tags', 'position', 'inkStrokes', 'createdAt', 'updatedAt'
+          'color', 'tags', 'position', 'rects', 'inkStrokes', 'createdAt', 'updatedAt'
         ])
         && data.id == annotationId
         && isValidId(data.id)
@@ -131,6 +137,7 @@ service cloud.firestore {
         && data.color in ['amber', 'sage', 'sky', 'rose', 'violet']
         && (!('tags' in data) || isValidTagList(data.tags))
         && (!('position' in data) || isValidAnnotationPosition(data.position))
+        && (!('rects' in data) || isValidAnnotationRects(data.rects))
         && (!('inkStrokes' in data) || isValidInkStrokes(data.inkStrokes))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
@@ -164,18 +171,24 @@ service cloud.firestore {
           'maxWidth', 'columnCount', 'backupFrequency', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'ownerId', 'theme', 'uiTheme', 'fontFamily', 'fontSize', 'lineHeight',
-          'maxWidth', 'columnCount', 'backupFrequency', 'updatedAt'
+          'ownerId', 'theme', 'uiTheme', 'accentColor', 'fontFamily', 'fontSize', 'lineHeight',
+          'maxWidth', 'columnCount', 'epubViewMode', 'novelIndent', 'novelJustify', 'novelDropCap',
+          'backupFrequency', 'updatedAt'
         ])
         && data.ownerId == userId
         && isValidId(data.ownerId)
-        && data.theme in ['paper', 'sepia', 'dusk', 'night']
-        && data.uiTheme in ['light', 'dark']
-        && data.fontFamily in ['serif', 'sans', 'mono']
+        && data.theme in ['paper', 'sepia', 'parchment', 'sage', 'dusk', 'nord', 'night', 'amoled']
+        && data.uiTheme in ['light', 'parchment', 'sage', 'dark', 'obsidian']
+        && (!('accentColor' in data) || (data.accentColor in ['cobalt', 'forest', 'burgundy', 'ochre', 'indigo', 'graphite']))
+        && data.fontFamily in ['serif', 'literary', 'garamond', 'merriweather', 'sans', 'humanist', 'accessible', 'mono']
         && data.fontSize is number && data.fontSize >= 12 && data.fontSize <= 32
         && data.lineHeight is number && data.lineHeight >= 1.1 && data.lineHeight <= 2.4
         && data.maxWidth is number && data.maxWidth >= 480 && data.maxWidth <= 1200
         && data.columnCount is int && data.columnCount >= 1 && data.columnCount <= 2
+        && (!('epubViewMode' in data) || (data.epubViewMode in ['scroll', 'paginated', 'spread']))
+        && (!('novelIndent' in data) || data.novelIndent is bool)
+        && (!('novelJustify' in data) || data.novelJustify is bool)
+        && (!('novelDropCap' in data) || data.novelDropCap is bool)
         && data.backupFrequency in ['manual', 'onChange', 'hourly', 'daily']
         && data.updatedAt is timestamp;
     }
@@ -308,8 +321,9 @@ service cloud.firestore {
           && incoming().ownerId == existing().ownerId
           && incoming().updatedAt == request.time
           && incoming().diff(existing()).affectedKeys().hasOnly([
-            'theme', 'uiTheme', 'fontFamily', 'fontSize', 'lineHeight',
-            'maxWidth', 'columnCount', 'backupFrequency', 'updatedAt'
+            'theme', 'uiTheme', 'accentColor', 'fontFamily', 'fontSize', 'lineHeight',
+            'maxWidth', 'columnCount', 'epubViewMode', 'novelIndent', 'novelJustify', 'novelDropCap',
+            'backupFrequency', 'updatedAt'
           ]);
         allow delete: if isValidId(userId) && isValidId(prefId) && isVerifiedOwner(userId);
       }

@@ -86,3 +86,45 @@ export function renderDjvuPageToCanvas(
     isBlankBitmap,
   };
 }
+
+export function extractDjvuCoverThumbnail(doc: WasmDocument, fallbackTitle?: string): string | undefined {
+  if (typeof document === 'undefined' || doc.page_count() < 1) return undefined;
+  try {
+    const srcCanvas = document.createElement('canvas');
+    const rendered = renderDjvuPageToCanvas(doc, 1, srcCanvas, 65);
+    const targetWidth = 240;
+    const scale = targetWidth / Math.max(1, rendered.width);
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width = targetWidth;
+    outCanvas.height = Math.max(160, Math.round(rendered.height * scale));
+    const ctx = outCanvas.getContext('2d');
+    if (!ctx) return undefined;
+
+    if (!rendered.isBlankBitmap) {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, outCanvas.width, outCanvas.height);
+      ctx.drawImage(srcCanvas, 0, 0, outCanvas.width, outCanvas.height);
+    } else {
+      ctx.fillStyle = '#F8F7F4';
+      ctx.fillRect(0, 0, outCanvas.width, outCanvas.height);
+      ctx.strokeStyle = '#CBD5E1';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(12, 12, outCanvas.width - 24, outCanvas.height - 24);
+      ctx.fillStyle = '#475569';
+      ctx.font = '600 10px monospace';
+      ctx.fillText('DJVU ARCHIVE', 24, 38);
+      ctx.fillStyle = '#0F172A';
+      ctx.font = 'bold 17px Georgia, serif';
+      ctx.fillText((fallbackTitle || 'DjVu Manuscript').slice(0, 22), 24, 80);
+      ctx.fillStyle = '#64748B';
+      ctx.font = '11px Georgia, serif';
+      const snippet = (rendered.text || '').slice(0, 120);
+      ctx.fillText(snippet.slice(0, 32), 24, 120);
+      ctx.fillText(snippet.slice(32, 64), 24, 138);
+    }
+    return outCanvas.toDataURL('image/jpeg', 0.82);
+  } catch {
+    return undefined;
+  }
+}
+

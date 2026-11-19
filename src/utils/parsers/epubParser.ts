@@ -267,3 +267,112 @@ export async function parseEpubQuickIndex(
     chapters: sampled,
   };
 }
+
+export async function extractEpubCoverThumbnail(
+  buffer: ArrayBuffer,
+  fallbackTitle?: string,
+  fallbackAuthor?: string,
+): Promise<string | undefined> {
+  if (typeof document === 'undefined') return undefined;
+  try {
+    const zip = await JSZip.loadAsync(buffer);
+    const parser = new DOMParser();
+
+    let opfPath = 'OEBPS/content.opf';
+    const containerFile = zip.file('META-INF/container.xml');
+    if (containerFile) {
+      const containerXml = await containerFile.async('text');
+      const containerDoc = parser.parseFromString(containerXml, 'application/xml');
+      const fullPath = containerDoc.querySelector('rootfile')?.getAttribute('full-path');
+      if (fullPath) opfPath = fullPath;
+    }
+
+    const opfFile = zip.file(opfPath);
+    if (opfFile) {
+      const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/')) : '';
+      const opfXml = await opfFile.async('text');
+      const opfDoc = parser.parseFromString(opfXml, 'application/xml');
+
+      const metaCoverId = opfDoc.querySelector('meta[name="cover"]')?.getAttribute('content');
+      const items = Array.from(opfDoc.querySelectorAll('manifest > item'));
+      const coverItem =
+        items.find((it) => (it.getAttribute('properties') || '').split(/\s+/).includes('cover-image')) ||
+        (metaCoverId ? items.find((it) => it.getAttribute('id') === metaCoverId) : undefined) ||
+        items.find((it) => {
+          const id = (it.getAttribute('id') || '').toLowerCase();
+          const href = (it.getAttribute('href') || '').toLowerCase();
+          const mt = (it.getAttribute('media-type') || '').toLowerCase();
+          return mt.startsWith('image/') && (id.includes('cover') || href.includes('cover'));
+        });
+
+      const coverHref = coverItem?.getAttribute('href');
+      if (coverHref) {
+        const resolved = resolvePath(opfDir, decodeURIComponent(coverHref));
+        const imgFile = zip.file(resolved);
+        if (imgFile) {
+          const blob = await imgFile.async('blob');
+          const objectUrl = URL.createObjectURL(blob);
+          try {
+            const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+              const el = new Image();
+              el.onload = () => resolve(el);
+              el.onerror = reject;
+              el.src = objectUrl;
+            });
+            const maxH = 360;
+            const scale = Math.min(1, maxH / Math.max(1, img.naturalHeight));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+            canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+              return canvas.toDataURL('image/jpeg', 0.84);
+            }
+          } finally {
+            URL.revokeObjectURL(objectUrl);
+          }
+        }
+      }
+    }
+
+    // Typographic editorial book cover fallback when EPUB archive has no embedded cover graphic
+    const canvas = document.createElement('canvas');
+    canvas.width = 240;
+    canvas.height = 340;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return undefined;
+    ctx.fillStyle = '#F5F0E6';
+    ctx.fillRect(0, 0, 240, 340);
+    ctx.strokeStyle = '#C9BDA6';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(14, 14, 212, 312);
+    ctx.fillStyle = '#7C6A53';
+    ctx.font = '600 11px monospace';
+    ctx.fillText('EPUB EDITION', 28, 44);
+    ctx.fillStyle = '#1E293B';
+    ctx.font = 'bold 20px Georgia, serif';
+    const words = (fallbackTitle || 'Untitled Book').split(/\s+/);
+    let line = '';
+    let y = 104;
+    for (const w of words) {
+      const next = line ? `${line} ${w}` : w;
+      if (ctx.measureText(next).width > 180) {
+        ctx.fillText(line, 28, y);
+        line = w;
+        y += 26;
+        if (y > 230) break;
+      } else {
+        line = next;
+      }
+    }
+    if (line && y <= 240) ctx.fillText(line, 28, y);
+    ctx.fillStyle = '#64748B';
+    ctx.font = 'italic 13px Georgia, serif';
+    ctx.fillText((fallbackAuthor || 'Unknown Author').slice(0, 28), 28, 294);
+    return canvas.toDataURL('image/jpeg', 0.84);
+  } catch {
+    return undefined;
+  }
+}
+

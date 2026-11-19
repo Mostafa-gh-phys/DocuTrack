@@ -282,6 +282,16 @@ export function subscribeToCloudLibrary(
                   height: Number((data.position as Record<string, unknown>).height || 0),
                 }
               : undefined,
+          rects: Array.isArray(data.rects)
+            ? data.rects
+                .filter((r): r is Record<string, unknown> => Boolean(r && typeof r === 'object'))
+                .map((r) => ({
+                  x: Number(r.x || 0),
+                  y: Number(r.y || 0),
+                  width: Number(r.width || 0),
+                  height: Number(r.height || 0),
+                }))
+            : undefined,
           inkStrokes: Array.isArray(data.inkStrokes) ? data.inkStrokes.map(String) : undefined,
           createdAtMs: Date.now(),
           updatedAtMs: Date.now(),

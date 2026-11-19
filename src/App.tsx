@@ -1,8 +1,11 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {onAuthStateChanged, type User} from 'firebase/auth';
-import {FolderUp, Moon, Sun, WifiOff} from 'lucide-react';
+import {FolderUp, Moon, Palette, Sun, WifiOff} from 'lucide-react';
+import {AppearanceDialog} from './components/AppearanceDialog';
+import {ConverterView} from './components/ConverterView';
 import {CoursesHubView} from './components/CoursesHubView';
 import {DocuTrackLogo} from './components/DocuTrackLogo';
+import {ImportModal} from './components/ImportModal';
 import {LibrarySidebar} from './components/LibrarySidebar';
 import {LibraryView} from './components/LibraryView';
 import {ReaderView} from './components/ReaderView';
@@ -56,19 +59,24 @@ import {
   deleteAnnotationLocal,
   deleteBookLocal,
   estimateOfflineStorageBytes,
+  extractCoverFromBuffer,
   getBackupArchiveById,
+  getBookBinary,
   indexRemainingBookChunks,
+  ingestImportedBuffer,
   ingestImportedFile,
   initializeLibraryStore,
   restoreFromArchive,
   saveAnnotationLocal,
+  saveBookCover,
   saveBookLocal,
   saveCourseLocal,
   savePreferencesLocal,
   saveReadingGoalLocal,
 } from './utils/offlineStorage';
+import {isDarkUiTheme} from './utils/themeTokens';
 
-type WorkspaceTab = 'library' | 'goals' | 'courses' | 'sync';
+type WorkspaceTab = 'library' | 'goals' | 'courses' | 'convert' | 'sync';
 
 interface DirectoryHandleLike {
   name: string;
@@ -95,6 +103,7 @@ export default function App() {
   const [readerInitialRightTab, setReaderInitialRightTab] = useState<'typography' | 'translate' | 'course' | null>(null);
 
   const [books, setBooks] = useState<BookMetadata[]>([]);
+  const [bookCovers, setBookCovers] = useState<Record<string, string>>({});
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [courses, setCourses] = useState<StudyCourse[]>([]);
   const [textChunks, setTextChunks] = useState<DocumentTextChunk[]>([]);
@@ -102,6 +111,12 @@ export default function App() {
   const [readingGoal, setReadingGoal] = useState<ReadingGoal>(() => createDefaultReadingGoal('local'));
   const [backups, setBackups] = useState<BackupSnapshotRecord[]>([]);
   const [offlineBytes, setOfflineBytes] = useState(0);
+
+  // Unified modals & converter selection
+  const [importModalOpen, setImportModalOpen] = useState(false);
+  const [appearanceOpen, setAppearanceOpen] = useState(false);
+  const [converterBookId, setConverterBookId] = useState<string | null>(null);
+  const pendingUploadFolderRef = useRef<string | undefined>(undefined);
 
   // Library filters & sort state
   const [activeCollection, setActiveCollection] = useState<LibraryCollection>('all');
@@ -129,21 +144,26 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Sync Tailwind dark class on <html>
+  // Sync UI theme, accent color, and Tailwind dark class on <html>
   useEffect(() => {
     const root = document.documentElement;
-    if (preferences.uiTheme === 'dark') {
+    root.dataset.uiTheme = preferences.uiTheme || 'light';
+    root.dataset.accent = preferences.accentColor || 'cobalt';
+    if (isDarkUiTheme(preferences.uiTheme)) {
       root.classList.add('dark');
     } else {
       root.classList.remove('dark');
     }
-  }, [preferences.uiTheme]);
+  }, [preferences.uiTheme, preferences.accentColor]);
 
-  // Initial IndexedDB Hydration
+  // Initial IndexedDB Hydration + lazy cover thumbnail backfill
   useEffect(() => {
+    let cancelled = false;
     async function boot() {
       const store = await initializeLibraryStore();
+      if (cancelled) return;
       setBooks(store.books);
+      setBookCovers(store.covers);
       setAnnotations(store.annotations);
       setCourses(store.courses);
       setPreferences(store.preferences);
@@ -152,8 +172,30 @@ export default function App() {
       setBackups(store.backups);
       setOfflineBytes(await estimateOfflineStorageBytes());
       setInitialized(true);
+
+      // Generate cover thumbnails locally for any books missing cached covers
+      const missingCovers = store.books.filter((b) => !store.covers[b.id] && !b.coverUrl);
+      if (missingCovers.length > 0) {
+        for (const book of missingCovers) {
+          if (cancelled) break;
+          try {
+            const bin = await getBookBinary(book.id);
+            if (!bin) continue;
+            const thumb = await extractCoverFromBuffer(book.format, bin, book.title, book.author);
+            if (thumb && !cancelled) {
+              await saveBookCover(book.id, thumb);
+              setBookCovers((prev) => ({...prev, [book.id]: thumb}));
+            }
+          } catch {
+            // Keep clean typographic cover fallback if extraction fails
+          }
+        }
+      }
     }
     void boot();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Firebase Auth Listener & Cross-Device Cloud Subscription
@@ -299,7 +341,7 @@ export default function App() {
     [books, openBookId],
   );
 
-  const handleImportFileList = async (files: FileList | File[]) => {
+  const handleImportFileList = async (files: FileList | File[], fallbackFolder?: string) => {
     const supportedFiles = Array.from(files).filter((f) => detectSupportedBookFormat(f.name) !== null);
     if (supportedFiles.length === 0) {
       setImportNotice('No supported PDF, EPUB, or DjVu files were found in the selection.');
@@ -313,7 +355,9 @@ export default function App() {
     );
 
     const results = await runWithConcurrency(supportedFiles, 3, async (file) => {
-      const res = await ingestImportedFile(file, ownerId);
+      const rel = (file as File & {webkitRelativePath?: string}).webkitRelativePath;
+      const explicitFolder = rel && rel.includes('/') ? undefined : fallbackFolder;
+      const res = await ingestImportedFile(file, ownerId, explicitFolder);
       if (res && user?.emailVerified && isOnline && !simulatedOffline) {
         void syncBookToCloud(user.uid, res.book);
       }
@@ -327,7 +371,15 @@ export default function App() {
     if (successful.length > 0) {
       const newBooks = successful.map((r) => r.book);
       const newChunks = successful.flatMap((r) => r.chunks);
+      const newCovers: Record<string, string> = {};
+      for (const r of successful) {
+        if (r.coverDataUrl) newCovers[r.book.id] = r.coverDataUrl;
+      }
+
       setBooks((prev) => [...newBooks, ...prev]);
+      if (Object.keys(newCovers).length > 0) {
+        setBookCovers((prev) => ({...prev, ...newCovers}));
+      }
       setTextChunks((prev) => [...newChunks, ...prev]);
       setOfflineBytes(await estimateOfflineStorageBytes());
       setImportNotice(
@@ -390,6 +442,30 @@ export default function App() {
       }
     }
     folderInputRef.current?.click();
+  };
+
+  const handleAddConvertedToLibrary = async (
+    buffer: ArrayBuffer,
+    filename: string,
+    targetFolder: string,
+  ): Promise<BookMetadata | null> => {
+    const ownerId = user?.uid || 'local';
+    const res = await ingestImportedBuffer(buffer, filename, ownerId, targetFolder);
+    if (!res) return null;
+
+    setBooks((prev) => [res.book, ...prev]);
+    if (res.coverDataUrl) {
+      setBookCovers((prev) => ({...prev, [res.book.id]: res.coverDataUrl!}));
+    }
+    setTextChunks((prev) => [...res.chunks, ...prev]);
+    setOfflineBytes(await estimateOfflineStorageBytes());
+    if (user?.emailVerified && isOnline && !simulatedOffline) {
+      void syncBookToCloud(user.uid, res.book);
+    }
+    scheduleAutoBackup();
+    setImportNotice(`Added converted "${res.book.title}" to your library.`);
+    window.setTimeout(() => setImportNotice(null), 4000);
+    return res.book;
   };
 
   const handleOpenBook = (
@@ -459,6 +535,11 @@ export default function App() {
 
   const handleDeleteBook = async (book: BookMetadata) => {
     setBooks((prev) => prev.filter((b) => b.id !== book.id));
+    setBookCovers((prev) => {
+      const next = {...prev};
+      delete next[book.id];
+      return next;
+    });
     setAnnotations((prev) => prev.filter((a) => a.bookId !== book.id));
     setCourses((prev) => prev.filter((c) => c.bookId !== book.id));
     setTextChunks((prev) => prev.filter((t) => t.bookId !== book.id));
@@ -713,7 +794,7 @@ export default function App() {
 
   if (!initialized) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-[#F8F9FA] dark:bg-slate-950 text-slate-600 dark:text-slate-400 text-sm">
+      <div className="min-h-screen flex items-center justify-center app-shell-bg text-sm opacity-75">
         Opening DocuTrack Library...
       </div>
     );
@@ -743,9 +824,10 @@ export default function App() {
   }
 
   const effectiveOffline = !isOnline || simulatedOffline;
+  const darkActive = isDarkUiTheme(preferences.uiTheme);
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#F8F9FA] dark:bg-slate-950 text-slate-900 dark:text-slate-100">
+    <div className="min-h-screen flex flex-col app-shell-bg">
       {/* Hidden File & Directory Inputs */}
       <input
         ref={fileInputRef}
@@ -753,7 +835,11 @@ export default function App() {
         accept=".pdf,.epub,.djvu"
         multiple
         onChange={(e) => {
-          if (e.target.files) void handleImportFileList(e.target.files);
+          if (e.target.files) {
+            const folder = pendingUploadFolderRef.current;
+            pendingUploadFolderRef.current = undefined;
+            void handleImportFileList(e.target.files, folder);
+          }
           e.target.value = '';
         }}
         className="hidden"
@@ -771,8 +857,29 @@ export default function App() {
         className="hidden"
       />
 
+      {/* Unified Import & Appearance Modals */}
+      <ImportModal
+        open={importModalOpen}
+        onClose={() => setImportModalOpen(false)}
+        onPickFiles={(targetFolder) => {
+          pendingUploadFolderRef.current = targetFolder;
+          fileInputRef.current?.click();
+        }}
+        onPickFolder={() => void handleImportDirectory()}
+        onDropFiles={async (files, fallbackFolder) => {
+          await handleImportFileList(files, fallbackFolder);
+        }}
+      />
+
+      <AppearanceDialog
+        open={appearanceOpen}
+        preferences={preferences}
+        onUpdatePreferences={handleUpdatePreferences}
+        onClose={() => setAppearanceOpen(false)}
+      />
+
       {/* Strict 3-Zone Top Bar Contract */}
-      <header className="h-16 px-6 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-8 shrink-0">
+      <header className="h-16 px-6 app-surface border-b app-border flex items-center justify-between gap-8 shrink-0">
         {/* Zone 1: Single-element Brand Wordmark */}
         <a
           href="/"
@@ -788,122 +895,73 @@ export default function App() {
 
         {/* Zone 2: Clean Single-Line Navigation Links */}
         <nav aria-label="Primary workspace" className="hidden md:flex items-center gap-6 text-sm font-medium">
-          <button
-            type="button"
-            onClick={() => setActiveTab('library')}
-            className={`whitespace-nowrap shrink-0 py-1 border-b-2 transition-colors ${
-              activeTab === 'library'
-                ? 'border-blue-800 text-slate-900 dark:border-blue-400 dark:text-slate-100'
-                : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
-            }`}
-          >
-            Library
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('goals')}
-            className={`whitespace-nowrap shrink-0 py-1 border-b-2 transition-colors ${
-              activeTab === 'goals'
-                ? 'border-blue-800 text-slate-900 dark:border-blue-400 dark:text-slate-100'
-                : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
-            }`}
-          >
-            Goals
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('courses')}
-            className={`whitespace-nowrap shrink-0 py-1 border-b-2 transition-colors ${
-              activeTab === 'courses'
-                ? 'border-blue-800 text-slate-900 dark:border-blue-400 dark:text-slate-100'
-                : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
-            }`}
-          >
-            Study Courses
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('sync')}
-            className={`whitespace-nowrap shrink-0 py-1 border-b-2 transition-colors ${
-              activeTab === 'sync'
-                ? 'border-blue-800 text-slate-900 dark:border-blue-400 dark:text-slate-100'
-                : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
-            }`}
-          >
-            Sync &amp; Backups
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleImportDirectory()}
-            className="whitespace-nowrap shrink-0 py-1 border-b-2 border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-colors"
-          >
-            Scan Folder
-          </button>
+          {(
+            [
+              {id: 'library', label: 'Library'},
+              {id: 'goals', label: 'Goals'},
+              {id: 'courses', label: 'Study Courses'},
+              {id: 'convert', label: 'Convert'},
+              {id: 'sync', label: 'Sync & Backups'},
+            ] as const
+          ).map((item) => {
+            const active = activeTab === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setActiveTab(item.id)}
+                className={`whitespace-nowrap shrink-0 py-1 border-b-2 transition-colors ${
+                  active
+                    ? 'accent-border font-semibold'
+                    : 'border-transparent opacity-65 hover:opacity-100'
+                }`}
+              >
+                {item.label}
+              </button>
+            );
+          })}
         </nav>
 
-        {/* Zone 3: Single Primary Action */}
+        {/* Zone 3: Single Primary Import Action */}
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="px-4 py-2 rounded-lg bg-blue-800 text-white text-xs font-medium hover:bg-blue-900 transition-colors flex items-center gap-2 whitespace-nowrap shrink-0"
+            onClick={() => setImportModalOpen(true)}
+            className="px-4 py-2 rounded-lg accent-btn text-xs font-medium transition-colors flex items-center gap-2 whitespace-nowrap shrink-0"
           >
             <FolderUp className="w-3.5 h-3.5" aria-hidden="true" />
-            Import Files
+            Import
           </button>
         </div>
       </header>
 
       {/* Mobile Secondary Navigation Strip */}
-      <div className="md:hidden flex items-center justify-between gap-1 px-3 py-2 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 overflow-x-auto">
-        <button
-          type="button"
-          onClick={() => setActiveTab('library')}
-          className={`px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap ${
-            activeTab === 'library' ? 'bg-blue-50 text-blue-900 dark:bg-blue-950 dark:text-blue-200' : 'text-slate-600 dark:text-slate-400'
-          }`}
-        >
-          Library
-        </button>
-        <button
-          type="button"
-          onClick={() => setActiveTab('goals')}
-          className={`px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap ${
-            activeTab === 'goals' ? 'bg-blue-50 text-blue-900 dark:bg-blue-950 dark:text-blue-200' : 'text-slate-600 dark:text-slate-400'
-          }`}
-        >
-          Goals
-        </button>
-        <button
-          type="button"
-          onClick={() => setActiveTab('courses')}
-          className={`px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap ${
-            activeTab === 'courses' ? 'bg-blue-50 text-blue-900 dark:bg-blue-950 dark:text-blue-200' : 'text-slate-600 dark:text-slate-400'
-          }`}
-        >
-          Courses
-        </button>
-        <button
-          type="button"
-          onClick={() => setActiveTab('sync')}
-          className={`px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap ${
-            activeTab === 'sync' ? 'bg-blue-50 text-blue-900 dark:bg-blue-950 dark:text-blue-200' : 'text-slate-600 dark:text-slate-400'
-          }`}
-        >
-          Sync
-        </button>
-        <button
-          type="button"
-          onClick={() => void handleImportDirectory()}
-          className="px-2.5 py-1.5 rounded-md text-xs font-medium text-slate-600 dark:text-slate-400 whitespace-nowrap"
-        >
-          Folder
-        </button>
+      <div className="md:hidden flex items-center justify-between gap-1 px-3 py-2 app-surface border-b app-border overflow-x-auto">
+        {(
+          [
+            {id: 'library', label: 'Library'},
+            {id: 'goals', label: 'Goals'},
+            {id: 'courses', label: 'Courses'},
+            {id: 'convert', label: 'Convert'},
+            {id: 'sync', label: 'Sync'},
+          ] as const
+        ).map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => setActiveTab(item.id)}
+            className={`px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap ${
+              activeTab === item.id ? 'accent-soft font-semibold' : 'opacity-65'
+            }`}
+          >
+            {item.label}
+          </button>
+        ))}
       </div>
 
       {/* Offline Status or Import Feedback Bar */}
       {(effectiveOffline || importNotice) && (
-        <div className="px-6 py-2 border-b border-slate-200 dark:border-slate-800 bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 text-xs flex items-center justify-between gap-4">
+        <div className="px-6 py-2 border-b app-border bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 text-xs flex items-center justify-between gap-4">
           <div className="flex items-center gap-2">
             {effectiveOffline && <WifiOff className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />}
             <span>
@@ -948,6 +1006,7 @@ export default function App() {
               <LibraryView
                 books={visibleBooks}
                 totalBooksCount={books.length}
+                bookCovers={bookCovers}
                 annotations={annotations}
                 courses={courses}
                 activeFolder={activeFolder}
@@ -978,7 +1037,14 @@ export default function App() {
                 onOpenCourseModal={(b) => {
                   handleOpenBook(b, undefined, 'course');
                 }}
-                onTriggerImportFiles={() => fileInputRef.current?.click()}
+                onConvertBook={(b) => {
+                  setConverterBookId(b.id);
+                  setActiveTab('convert');
+                }}
+                onTriggerImport={() => setImportModalOpen(true)}
+                onDropFiles={async (files) => {
+                  await handleImportFileList(files);
+                }}
               />
             </div>
           </>
@@ -1002,6 +1068,15 @@ export default function App() {
             simulatedOffline={simulatedOffline}
             onOpenBook={(b) => handleOpenBook(b)}
             onGenerateCourse={handleGenerateCourse}
+          />
+        )}
+
+        {activeTab === 'convert' && (
+          <ConverterView
+            books={books}
+            initialBookId={converterBookId}
+            onAddConvertedToLibrary={handleAddConvertedToLibrary}
+            onOpenBook={(b) => handleOpenBook(b)}
           />
         )}
 
@@ -1035,32 +1110,43 @@ export default function App() {
         )}
       </div>
 
-      {/* Quiet Workspace Footer with UI Light/Dark Toggle */}
-      <footer className="px-6 py-3 border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+      {/* Quiet Workspace Footer with Themes, Accent Colors & Fonts */}
+      <footer className="px-6 py-3 border-t app-border app-surface flex flex-wrap items-center justify-between gap-3 text-xs opacity-85">
         <span>DocuTrack — Local-first PDF, EPUB &amp; DjVu Library</span>
-        <button
-          type="button"
-          onClick={() =>
-            handleUpdatePreferences({
-              ...preferences,
-              uiTheme: preferences.uiTheme === 'dark' ? 'light' : 'dark',
-              updatedAtMs: Date.now(),
-            })
-          }
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300"
-        >
-          {preferences.uiTheme === 'dark' ? (
-            <>
-              <Sun className="w-3.5 h-3.5" aria-hidden="true" />
-              Light Interface
-            </>
-          ) : (
-            <>
-              <Moon className="w-3.5 h-3.5" aria-hidden="true" />
-              Dark Interface
-            </>
-          )}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setAppearanceOpen(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md border app-border hover:bg-black/5 dark:hover:bg-white/10 transition-colors"
+          >
+            <Palette className="w-3.5 h-3.5 accent-text" aria-hidden="true" />
+            <span>Themes &amp; Fonts</span>
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              handleUpdatePreferences({
+                ...preferences,
+                uiTheme: darkActive ? 'light' : 'dark',
+                updatedAtMs: Date.now(),
+              })
+            }
+            aria-label={darkActive ? 'Switch to Light theme' : 'Switch to Dark theme'}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md border app-border hover:bg-black/5 dark:hover:bg-white/10 transition-colors"
+          >
+            {darkActive ? (
+              <>
+                <Sun className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Light</span>
+              </>
+            ) : (
+              <>
+                <Moon className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Dark</span>
+              </>
+            )}
+          </button>
+        </div>
       </footer>
     </div>
   );

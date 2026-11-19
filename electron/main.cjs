@@ -58,12 +58,25 @@ function startDesktopServer() {
       }
     });
 
-    server.on('error', reject);
-    server.listen(0, '127.0.0.1', () => {
+    const PREFERRED_PORT = 34819;
+    let triedFallback = false;
+
+    server.on('error', (err) => {
+      if (!triedFallback && err && err.code === 'EADDRINUSE') {
+        triedFallback = true;
+        server.listen(0, '127.0.0.1');
+        return;
+      }
+      reject(err);
+    });
+
+    server.once('listening', () => {
       const addr = server.address();
       serverInstance = server;
       resolve(addr.port);
     });
+
+    server.listen(PREFERRED_PORT, '127.0.0.1');
   });
 }
 

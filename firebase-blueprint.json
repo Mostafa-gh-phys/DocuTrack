@@ -185,6 +185,10 @@
           "type": "object",
           "description": "Normalized page coordinate box (x, y, width, height in 0..1)"
         },
+        "rects": {
+          "type": "array",
+          "description": "Up to 24 normalized text selection line rectangles (x, y, width, height in 0..1)"
+        },
         "inkStrokes": {
           "type": "array",
           "description": "Up to 30 normalized freehand SVG point strings"
@@ -248,7 +252,7 @@
     },
     "ReaderPreferences": {
       "title": "ReaderPreferences",
-      "description": "Synchronized typography, theme, and automated backup cadence preferences.",
+      "description": "Synchronized typography, theme, accent color, EPUB novel layout, and automated backup cadence preferences.",
       "type": "object",
       "properties": {
         "ownerId": {
@@ -258,15 +262,19 @@
         },
         "theme": {
           "type": "string",
-          "enum": ["paper", "sepia", "dusk", "night"]
+          "enum": ["paper", "sepia", "parchment", "sage", "dusk", "nord", "night", "amoled"]
         },
         "uiTheme": {
           "type": "string",
-          "enum": ["light", "dark"]
+          "enum": ["light", "parchment", "sage", "dark", "obsidian"]
+        },
+        "accentColor": {
+          "type": "string",
+          "enum": ["cobalt", "forest", "burgundy", "ochre", "indigo", "graphite"]
         },
         "fontFamily": {
           "type": "string",
-          "enum": ["serif", "sans", "mono"]
+          "enum": ["serif", "literary", "garamond", "merriweather", "sans", "humanist", "accessible", "mono"]
         },
         "fontSize": {
           "type": "number"
@@ -279,6 +287,19 @@
         },
         "columnCount": {
           "type": "integer"
+        },
+        "epubViewMode": {
+          "type": "string",
+          "enum": ["scroll", "paginated", "spread"]
+        },
+        "novelIndent": {
+          "type": "boolean"
+        },
+        "novelJustify": {
+          "type": "boolean"
+        },
+        "novelDropCap": {
+          "type": "boolean"
         },
         "backupFrequency": {
           "type": "string",
