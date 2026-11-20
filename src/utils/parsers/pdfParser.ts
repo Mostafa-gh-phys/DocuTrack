@@ -16,6 +16,20 @@ export async function loadPdfDocument(buffer: ArrayBuffer): Promise<pdfjsLib.PDF
   return await loadingTask.promise;
 }
 
+export async function closePdfDocument(doc: pdfjsLib.PDFDocumentProxy | null | undefined): Promise<void> {
+  if (!doc) return;
+  try {
+    await doc.cleanup?.();
+  } catch {
+    // Ignore cleanup errors on already-closed workers
+  }
+  try {
+    await (doc as unknown as {destroy?: () => Promise<void>}).destroy?.();
+  } catch {
+    // Ignore destroy errors if already destroyed
+  }
+}
+
 export async function extractPdfOutlineAndMeta(doc: pdfjsLib.PDFDocumentProxy): Promise<{
   title?: string;
   author?: string;
@@ -114,13 +128,59 @@ export async function extractPdfMetadataAndText(
   };
 }
 
+export interface PdfRenderTextItem {
+  str: string;
+  x: number;
+  y: number;
+  width: number;
+  fontSize: number;
+  scaleX: number;
+  fontFamily: string;
+}
+
+let measureCtx: CanvasRenderingContext2D | null = null;
+function getMeasureCtx(): CanvasRenderingContext2D | null {
+  if (typeof document === 'undefined') return null;
+  if (!measureCtx) {
+    const c = document.createElement('canvas');
+    measureCtx = c.getContext('2d');
+  }
+  return measureCtx;
+}
+
+const activeCanvasRenderTasks = new WeakMap<HTMLCanvasElement, pdfjsLib.RenderTask>();
+const canvasRenderSeq = new WeakMap<HTMLCanvasElement, number>();
+
 export async function renderPdfPageToCanvas(
   doc: pdfjsLib.PDFDocumentProxy,
   pageNumber: number,
   canvas: HTMLCanvasElement,
   scale = 1.45,
-): Promise<{width: number; height: number; textItems: {str: string; x: number; y: number; fontSize: number}[]}> {
+): Promise<{width: number; height: number; textItems: PdfRenderTextItem[]}> {
+  const seq = (canvasRenderSeq.get(canvas) || 0) + 1;
+  canvasRenderSeq.set(canvas, seq);
+
+  const prevTask = activeCanvasRenderTasks.get(canvas);
+  if (prevTask) {
+    try {
+      prevTask.cancel();
+    } catch {
+      // Ignore already settled task
+    }
+    try {
+      await prevTask.promise;
+    } catch {
+      // Expected RenderingCancelledException
+    }
+  }
+
   const page = await doc.getPage(pageNumber);
+  if (canvasRenderSeq.get(canvas) !== seq) {
+    const cancelledErr = new Error('Rendering cancelled');
+    cancelledErr.name = 'RenderingCancelledException';
+    throw cancelledErr;
+  }
+
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const viewport = page.getViewport({scale});
 
@@ -133,26 +193,61 @@ export async function renderPdfPageToCanvas(
   if (!ctx) throw new Error('Canvas 2D context unavailable');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  await page.render({
+  const renderTask = page.render({
     canvasContext: ctx,
     viewport,
     canvas,
-  }).promise;
+  });
+  activeCanvasRenderTasks.set(canvas, renderTask);
+
+  try {
+    await renderTask.promise;
+  } finally {
+    if (activeCanvasRenderTasks.get(canvas) === renderTask) {
+      activeCanvasRenderTasks.delete(canvas);
+    }
+  }
 
   const textContent = await page.getTextContent();
-  const textItems: {str: string; x: number; y: number; fontSize: number}[] = [];
+  const styles = (textContent.styles || {}) as Record<string, {fontFamily?: string}>;
+  const mCtx = getMeasureCtx();
+  const textItems: PdfRenderTextItem[] = [];
+
   for (const item of textContent.items) {
     if ('str' in item && item.str.trim()) {
       const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
       const fontSize = Math.hypot(tx[2], tx[3]) || 12;
+      const styleDef = item.fontName ? styles[item.fontName] : undefined;
+      const rawFamily = (styleDef?.fontFamily || '').toLowerCase();
+      const fontFamily = rawFamily.includes('mono') || rawFamily.includes('courier')
+        ? 'ui-monospace, monospace'
+        : rawFamily.includes('serif') || rawFamily.includes('times')
+          ? 'Georgia, "Times New Roman", serif'
+          : 'system-ui, -apple-system, sans-serif';
+
+      const targetWidth = Math.max(1, Math.abs((item.width || 0) * scale));
+      let scaleX = 1;
+      if (mCtx && targetWidth > 2) {
+        mCtx.font = `${fontSize}px ${fontFamily}`;
+        const measured = mCtx.measureText(item.str).width;
+        if (measured > 1) {
+          scaleX = Math.max(0.45, Math.min(2.2, Number((targetWidth / measured).toFixed(4))));
+        }
+      }
+
       textItems.push({
         str: item.str,
         x: tx[4],
-        y: tx[5] - fontSize,
+        y: tx[5] - fontSize * 0.88,
+        width: targetWidth,
         fontSize,
+        scaleX,
+        fontFamily,
       });
     }
   }
+
+  page.cleanup?.();
 
   return {
     width: Math.floor(viewport.width),
@@ -166,8 +261,8 @@ export async function extractPdfCoverThumbnail(doc: pdfjsLib.PDFDocumentProxy): 
   try {
     const page = await doc.getPage(1);
     const unscaled = page.getViewport({scale: 1});
-    const targetWidth = 260;
-    const scale = Math.max(0.2, Math.min(1.5, targetWidth / Math.max(1, unscaled.width)));
+    const targetWidth = 220;
+    const scale = Math.max(0.2, Math.min(1.4, targetWidth / Math.max(1, unscaled.width)));
     const viewport = page.getViewport({scale});
 
     const canvas = document.createElement('canvas');
@@ -185,7 +280,8 @@ export async function extractPdfCoverThumbnail(doc: pdfjsLib.PDFDocumentProxy): 
       canvas,
     }).promise;
 
-    return canvas.toDataURL('image/jpeg', 0.82);
+    page.cleanup?.();
+    return canvas.toDataURL('image/jpeg', 0.76);
   } catch {
     return undefined;
   }

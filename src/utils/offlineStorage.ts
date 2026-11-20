@@ -10,20 +10,22 @@ import type {
   StudyCourse,
 } from '../types/library';
 import {
+  computeBufferSha256,
   createDefaultReadingGoal,
   deriveFolderFromRelativePath,
   detectSupportedBookFormat,
   sanitizeId,
 } from './libraryLogic';
 import {
+  closeDjvuDocument,
   extractDjvuCoverThumbnail,
-  extractDjvuMetadataAndText,
   extractDjvuPageTextRange,
   openDjvuDocument,
 } from './parsers/djvuParser';
 import {extractEpubInfoFallback, parseEpubForIndex} from './parsers/epubIndexHelper';
 import {extractEpubCoverThumbnail} from './parsers/epubParser';
 import {
+  closePdfDocument,
   extractPdfCoverThumbnail,
   extractPdfOutlineAndMeta,
   extractPdfPageTextRange,
@@ -82,6 +84,8 @@ export const DEFAULT_PREFERENCES: ReaderPreferences = {
   maxWidth: 740,
   columnCount: 1,
   epubViewMode: 'scroll',
+  pageLayoutMode: 'single',
+  readingDirection: 'ltr',
   novelIndent: true,
   novelJustify: true,
   novelDropCap: true,
@@ -264,6 +268,31 @@ export async function deleteAnnotationLocal(annotationId: string): Promise<void>
   await db.delete('annotations', annotationId);
 }
 
+export async function scanAndBackfillBookHashes(books: BookMetadata[]): Promise<BookMetadata[]> {
+  const db = await getDb();
+  const updated: BookMetadata[] = [];
+  for (const book of books) {
+    if (book.contentHash) {
+      updated.push(book);
+      continue;
+    }
+    const bin = await db.get('binaries', book.id);
+    if (!bin) {
+      updated.push(book);
+      continue;
+    }
+    try {
+      const contentHash = await computeBufferSha256(bin);
+      const next = {...book, contentHash};
+      await db.put('books', next);
+      updated.push(next);
+    } catch {
+      updated.push(book);
+    }
+  }
+  return updated;
+}
+
 export async function saveCourseLocal(course: StudyCourse): Promise<void> {
   const db = await getDb();
   await db.put('courses', course);
@@ -386,15 +415,25 @@ export async function extractCoverFromBuffer(
 ): Promise<string | undefined> {
   try {
     if (format === 'pdf') {
-      const doc = await loadPdfDocument(buffer);
-      return await extractPdfCoverThumbnail(doc);
+      let doc: Awaited<ReturnType<typeof loadPdfDocument>> | null = null;
+      try {
+        doc = await loadPdfDocument(buffer);
+        return await extractPdfCoverThumbnail(doc);
+      } finally {
+        await closePdfDocument(doc);
+      }
     }
     if (format === 'epub') {
       return await extractEpubCoverThumbnail(buffer, title, author);
     }
     if (format === 'djvu') {
-      const doc = await openDjvuDocument(buffer);
-      return extractDjvuCoverThumbnail(doc, title);
+      let doc: Awaited<ReturnType<typeof openDjvuDocument>> | null = null;
+      try {
+        doc = await openDjvuDocument(buffer);
+        return extractDjvuCoverThumbnail(doc, title);
+      } finally {
+        closeDjvuDocument(doc);
+      }
     }
   } catch {
     return undefined;
@@ -402,13 +441,19 @@ export async function extractCoverFromBuffer(
   return undefined;
 }
 
-const INITIAL_INDEX_PAGE_LIMIT = 8;
+const INITIAL_INDEX_PAGE_LIMIT = 6;
+const MAX_CHUNK_TEXT_LENGTH = 10000;
+
+export interface IngestOptions {
+  samplePageLimit?: number;
+}
 
 export async function ingestImportedBuffer(
   buffer: ArrayBuffer,
   filename: string,
   ownerId: string,
   folderPath = '/Local Drive',
+  options?: IngestOptions,
 ): Promise<{
   book: BookMetadata;
   chunks: DocumentTextChunk[];
@@ -422,6 +467,7 @@ export async function ingestImportedBuffer(
 
   const baseName = filename.replace(/\.(pdf|epub|djvu)$/i, '');
   const id = sanitizeId(`doc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}_${baseName.slice(0, 20)}`);
+  const targetSampleLimit = Math.max(1, options?.samplePageLimit ?? INITIAL_INDEX_PAGE_LIMIT);
 
   let title = baseName.replace(/[_-]+/g, ' ');
   let author = 'Imported Author';
@@ -432,54 +478,58 @@ export async function ingestImportedBuffer(
 
   try {
     if (format === 'pdf') {
-      const doc = await loadPdfDocument(buffer);
-      pageCount = Math.max(1, doc.numPages);
-      const sampleLimit = Math.min(pageCount, INITIAL_INDEX_PAGE_LIMIT);
-      const [metaInfo, pageTexts, coverThumb] = await Promise.all([
-        extractPdfOutlineAndMeta(doc),
-        extractPdfPageTextRange(doc, 1, sampleLimit),
-        extractPdfCoverThumbnail(doc),
-      ]);
-      if (metaInfo.title) title = metaInfo.title;
-      if (metaInfo.author) author = metaInfo.author;
-      coverDataUrl = coverThumb;
-      chunks = pageTexts.map((p) => ({
-        bookId: id,
-        bookTitle: title,
-        page: p.page,
-        chapterTitle: `Page ${p.page}`,
-        text: p.text,
-      }));
+      let doc: Awaited<ReturnType<typeof loadPdfDocument>> | null = null;
+      try {
+        doc = await loadPdfDocument(buffer);
+        pageCount = Math.max(1, doc.numPages);
+        const sampleLimit = Math.min(pageCount, targetSampleLimit);
+        const metaInfo = await extractPdfOutlineAndMeta(doc);
+        const pageTexts = await extractPdfPageTextRange(doc, 1, sampleLimit);
+        coverDataUrl = await extractPdfCoverThumbnail(doc);
+        if (metaInfo.title) title = metaInfo.title;
+        if (metaInfo.author) author = metaInfo.author;
+        chunks = pageTexts.map((p) => ({
+          bookId: id,
+          bookTitle: title,
+          page: p.page,
+          chapterTitle: `Page ${p.page}`,
+          text: p.text.slice(0, MAX_CHUNK_TEXT_LENGTH),
+        }));
+      } finally {
+        await closePdfDocument(doc);
+      }
     } else if (format === 'epub') {
-      const [epub, coverThumb] = await Promise.all([
-        parseEpubForIndex(buffer, INITIAL_INDEX_PAGE_LIMIT),
-        extractEpubCoverThumbnail(buffer, title, author),
-      ]);
+      const epub = await parseEpubForIndex(buffer, targetSampleLimit, true);
       if (epub.title) title = epub.title;
       if (epub.author) author = epub.author;
       if (epub.language) language = epub.language;
       pageCount = Math.max(1, epub.chapterCount);
-      coverDataUrl = coverThumb;
+      coverDataUrl = epub.coverDataUrl;
       chunks = epub.chapters.map((ch) => ({
         bookId: id,
         bookTitle: title,
         page: ch.index,
         chapterTitle: ch.title,
-        text: ch.plainText,
+        text: ch.plainText.slice(0, MAX_CHUNK_TEXT_LENGTH),
       }));
     } else if (format === 'djvu') {
-      const doc = await openDjvuDocument(buffer);
-      pageCount = Math.max(1, doc.page_count());
-      const sampleLimit = Math.min(pageCount, INITIAL_INDEX_PAGE_LIMIT);
-      const pageTexts = extractDjvuPageTextRange(doc, 1, sampleLimit);
-      coverDataUrl = extractDjvuCoverThumbnail(doc, title);
-      chunks = pageTexts.map((p) => ({
-        bookId: id,
-        bookTitle: title,
-        page: p.page,
-        chapterTitle: `Page ${p.page}`,
-        text: p.text || extractEpubInfoFallback(title, p.page),
-      }));
+      let doc: Awaited<ReturnType<typeof openDjvuDocument>> | null = null;
+      try {
+        doc = await openDjvuDocument(buffer);
+        pageCount = Math.max(1, doc.page_count());
+        const sampleLimit = Math.min(pageCount, targetSampleLimit);
+        const pageTexts = extractDjvuPageTextRange(doc, 1, sampleLimit);
+        coverDataUrl = extractDjvuCoverThumbnail(doc, title);
+        chunks = pageTexts.map((p) => ({
+          bookId: id,
+          bookTitle: title,
+          page: p.page,
+          chapterTitle: `Page ${p.page}`,
+          text: (p.text || extractEpubInfoFallback(title, p.page)).slice(0, MAX_CHUNK_TEXT_LENGTH),
+        }));
+      } finally {
+        closeDjvuDocument(doc);
+      }
     }
   } catch (err) {
     console.warn(`Metadata extraction partial for ${filename}:`, err);
@@ -496,6 +546,7 @@ export async function ingestImportedBuffer(
 
   const now = Date.now();
   const excerpt = chunks.find((c) => c.text.trim().length > 0)?.text.slice(0, 260) || '';
+  const contentHash = await computeBufferSha256(buffer).catch(() => undefined);
 
   const book: BookMetadata = {
     id,
@@ -513,13 +564,14 @@ export async function ingestImportedBuffer(
     tags: [format],
     excerpt,
     language,
+    contentHash,
     addedAt: now,
     lastOpenedAt: now,
     updatedAtMs: now,
   };
 
   await saveBookLocal(book, buffer, chunks, coverDataUrl);
-  const needsFullIndex = pageCount > INITIAL_INDEX_PAGE_LIMIT;
+  const needsFullIndex = pageCount > targetSampleLimit;
   return {book, chunks, coverDataUrl, needsFullIndex};
 }
 
@@ -527,6 +579,7 @@ export async function ingestImportedFile(
   file: File,
   ownerId: string,
   explicitFolder?: string,
+  options?: IngestOptions,
 ): Promise<{
   book: BookMetadata;
   chunks: DocumentTextChunk[];
@@ -541,27 +594,61 @@ export async function ingestImportedFile(
   const buffer = await file.arrayBuffer();
   const relPath = (file as File & {webkitRelativePath?: string}).webkitRelativePath;
   const folderPath = explicitFolder || deriveFolderFromRelativePath(relPath, '/Local Drive');
-  return await ingestImportedBuffer(buffer, file.name, ownerId, folderPath);
+  return await ingestImportedBuffer(buffer, file.name, ownerId, folderPath, options);
 }
 
 export async function indexRemainingBookChunks(
   book: BookMetadata,
   initialChunks: DocumentTextChunk[],
 ): Promise<DocumentTextChunk[]> {
-  if (book.pageCount <= INITIAL_INDEX_PAGE_LIMIT) return initialChunks;
+  if (book.pageCount <= initialChunks.length) return initialChunks;
   const buffer = await getBookBinary(book.id);
   if (!buffer) return initialChunks;
 
   let fullChunks: DocumentTextChunk[] = [...initialChunks];
   const indexedPages = new Set(initialChunks.map((c) => c.page));
+  const startFrom = Math.max(1, initialChunks.length + 1);
 
   try {
     if (book.format === 'pdf') {
-      const doc = await loadPdfDocument(buffer);
-      const batchSize = 16;
-      for (let start = INITIAL_INDEX_PAGE_LIMIT + 1; start <= doc.numPages; start += batchSize) {
-        const end = Math.min(doc.numPages, start + batchSize - 1);
-        const batch = await extractPdfPageTextRange(doc, start, end);
+      let doc: Awaited<ReturnType<typeof loadPdfDocument>> | null = null;
+      try {
+        doc = await loadPdfDocument(buffer);
+        const batchSize = 16;
+        for (let start = startFrom; start <= doc.numPages; start += batchSize) {
+          const end = Math.min(doc.numPages, start + batchSize - 1);
+          const batch = await extractPdfPageTextRange(doc, start, end);
+          for (const p of batch) {
+            if (!indexedPages.has(p.page)) {
+              indexedPages.add(p.page);
+              fullChunks.push({
+                bookId: book.id,
+                bookTitle: book.title,
+                page: p.page,
+                chapterTitle: `Page ${p.page}`,
+                text: p.text.slice(0, MAX_CHUNK_TEXT_LENGTH),
+              });
+            }
+          }
+          await new Promise((r) => window.setTimeout(r, 25));
+        }
+      } finally {
+        await closePdfDocument(doc);
+      }
+    } else if (book.format === 'epub') {
+      const epub = await parseEpubForIndex(buffer, 0, false);
+      fullChunks = epub.chapters.map((ch) => ({
+        bookId: book.id,
+        bookTitle: book.title,
+        page: ch.index,
+        chapterTitle: ch.title,
+        text: ch.plainText.slice(0, MAX_CHUNK_TEXT_LENGTH),
+      }));
+    } else if (book.format === 'djvu') {
+      let doc: Awaited<ReturnType<typeof openDjvuDocument>> | null = null;
+      try {
+        doc = await openDjvuDocument(buffer);
+        const batch = extractDjvuPageTextRange(doc, startFrom, doc.page_count());
         for (const p of batch) {
           if (!indexedPages.has(p.page)) {
             indexedPages.add(p.page);
@@ -570,35 +657,12 @@ export async function indexRemainingBookChunks(
               bookTitle: book.title,
               page: p.page,
               chapterTitle: `Page ${p.page}`,
-              text: p.text,
+              text: (p.text || extractEpubInfoFallback(book.title, p.page)).slice(0, MAX_CHUNK_TEXT_LENGTH),
             });
           }
         }
-        await new Promise((r) => window.setTimeout(r, 20));
-      }
-    } else if (book.format === 'epub') {
-      const epub = await parseEpubForIndex(buffer, 0);
-      fullChunks = epub.chapters.map((ch) => ({
-        bookId: book.id,
-        bookTitle: book.title,
-        page: ch.index,
-        chapterTitle: ch.title,
-        text: ch.plainText,
-      }));
-    } else if (book.format === 'djvu') {
-      const doc = await openDjvuDocument(buffer);
-      const batch = extractDjvuPageTextRange(doc, INITIAL_INDEX_PAGE_LIMIT + 1, doc.page_count());
-      for (const p of batch) {
-        if (!indexedPages.has(p.page)) {
-          indexedPages.add(p.page);
-          fullChunks.push({
-            bookId: book.id,
-            bookTitle: book.title,
-            page: p.page,
-            chapterTitle: `Page ${p.page}`,
-            text: p.text || extractEpubInfoFallback(book.title, p.page),
-          });
-        }
+      } finally {
+        closeDjvuDocument(doc);
       }
     }
 

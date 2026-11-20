@@ -1,7 +1,11 @@
-import React, {useState} from 'react';
+import React, {useMemo, useState} from 'react';
 import {
   ArrowDownUp,
+  ArrowLeft,
   BookOpen,
+  ChevronRight,
+  CopyCheck,
+  Folder,
   FolderTree,
   GraduationCap,
   HardDriveDownload,
@@ -16,17 +20,21 @@ import {
 import type {
   Annotation,
   BookMetadata,
+  FolderNode,
+  LibraryCollection,
   SemanticSearchResult,
   SortDirection,
   SortField,
   StudyCourse,
 } from '../types/library';
 import {extractFilesFromDataTransfer} from '../utils/folderWalk';
-import {formatBytes} from '../utils/libraryLogic';
+import {formatBytes, getFolderViewContents} from '../utils/libraryLogic';
 
 interface LibraryViewProps {
   books: BookMetadata[];
   totalBooksCount: number;
+  folderTree: FolderNode[];
+  activeCollection: LibraryCollection;
   bookCovers: Record<string, string>;
   annotations: Annotation[];
   courses: StudyCourse[];
@@ -39,6 +47,7 @@ interface LibraryViewProps {
   sortBy: SortField;
   sortDirection: SortDirection;
   viewMode: 'grid' | 'list';
+  onSelectFolder: (path: string | null) => void;
   onSearchChange: (q: string) => void;
   onToggleSemanticMode: () => void;
   onRunSemanticSearch: (query: string) => void;
@@ -53,11 +62,15 @@ interface LibraryViewProps {
   onConvertBook: (book: BookMetadata) => void;
   onTriggerImport: () => void;
   onDropFiles: (files: File[]) => Promise<void>;
+  onOpenDuplicatesModal: () => void;
+  duplicateCount?: number;
 }
 
 export const LibraryView: React.FC<LibraryViewProps> = ({
   books,
   totalBooksCount,
+  folderTree,
+  activeCollection,
   bookCovers,
   annotations,
   courses,
@@ -70,6 +83,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   sortBy,
   sortDirection,
   viewMode,
+  onSelectFolder,
   onSearchChange,
   onToggleSemanticMode,
   onRunSemanticSearch,
@@ -84,9 +98,21 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onConvertBook,
   onTriggerImport,
   onDropFiles,
+  onOpenDuplicatesModal,
+  duplicateCount = 0,
 }) => {
   const [failedCovers, setFailedCovers] = useState<Record<string, boolean>>({});
   const [draggingOver, setDraggingOver] = useState(false);
+
+  const folderContents = useMemo(
+    () => getFolderViewContents(folderTree, activeFolder),
+    [folderTree, activeFolder],
+  );
+  const showFolderBrowser =
+    activeCollection === 'all' &&
+    !searchQuery.trim() &&
+    !semanticMode &&
+    (folderContents.childFolders.length > 0 || activeFolder !== null);
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -221,21 +247,113 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               <List className="w-3.5 h-3.5" />
             </button>
           </div>
+
+          <button
+            type="button"
+            onClick={onOpenDuplicatesModal}
+            aria-label="Find and clean duplicate files"
+            className="px-2.5 py-1.5 rounded-lg border app-border app-surface hover:opacity-85 text-xs font-medium flex items-center gap-1.5 whitespace-nowrap"
+          >
+            <CopyCheck className="w-3.5 h-3.5 accent-text" aria-hidden="true" />
+            <span>Duplicates{duplicateCount > 0 ? ` (${duplicateCount})` : ''}</span>
+          </button>
         </div>
       </div>
 
       {/* Main Content Area */}
       <div className="p-6 space-y-6 flex-1 overflow-y-auto">
-        <div className="flex flex-wrap items-baseline justify-between gap-4">
-          <div>
-            <h1 className="text-xl font-semibold tracking-tight">
-              {activeFolder ? activeFolder : 'Personal Library'}
-            </h1>
-            <p className="mt-1 text-xs opacity-65 tabular-nums">
-              Showing {books.length} of {totalBooksCount} documents · {annotations.length} annotations · {courses.length} AI courses
-            </p>
+        <div className="space-y-2.5">
+          {activeFolder && (
+            <nav aria-label="Folder breadcrumbs" className="flex items-center flex-wrap gap-1 text-xs">
+              <button
+                type="button"
+                onClick={() => onSelectFolder(null)}
+                className="px-2 py-1 rounded-md opacity-75 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/5 font-medium flex items-center gap-1.5"
+              >
+                <FolderTree className="w-3.5 h-3.5" aria-hidden="true" />
+                All Folders
+              </button>
+              {folderContents.breadcrumbs.map((crumb, idx) => {
+                const isLast = idx === folderContents.breadcrumbs.length - 1;
+                return (
+                  <React.Fragment key={crumb.path}>
+                    <ChevronRight className="w-3.5 h-3.5 opacity-40" aria-hidden="true" />
+                    <button
+                      type="button"
+                      onClick={() => onSelectFolder(crumb.path)}
+                      aria-current={isLast ? 'page' : undefined}
+                      className={`px-2 py-1 rounded-md transition-colors ${
+                        isLast
+                          ? 'accent-soft font-semibold'
+                          : 'opacity-75 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/5'
+                      }`}
+                    >
+                      {crumb.name}
+                    </button>
+                  </React.Fragment>
+                );
+              })}
+            </nav>
+          )}
+
+          <div className="flex flex-wrap items-baseline justify-between gap-4">
+            <div>
+              <h1 className="text-xl font-semibold tracking-tight">
+                {activeFolder ? activeFolder : 'Personal Library'}
+              </h1>
+              <p className="mt-1 text-xs opacity-65 tabular-nums">
+                Showing {books.length} of {totalBooksCount} documents · {annotations.length} annotations · {courses.length} AI courses
+              </p>
+            </div>
+            {activeFolder && (
+              <button
+                type="button"
+                onClick={() => onSelectFolder(folderContents.parentPath)}
+                className="px-3 py-1.5 rounded-lg border app-border app-surface text-xs font-medium hover:opacity-85 flex items-center gap-1.5"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" aria-hidden="true" />
+                {folderContents.parentPath ? 'Up Folder' : 'All Folders'}
+              </button>
+            )}
           </div>
         </div>
+
+        {/* Folder Structure Browser (Mirrors Sidebar Drive Tree in Main Library) */}
+        {showFolderBrowser && folderContents.childFolders.length > 0 && (
+          <section aria-label="Folder structure" className="space-y-2.5">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xs font-semibold uppercase tracking-wide opacity-60">
+                {activeFolder ? 'Subfolders' : 'Folders'}
+              </h2>
+              <span className="text-xs tabular-nums opacity-55">
+                {folderContents.childFolders.length}{' '}
+                {folderContents.childFolders.length === 1 ? 'folder' : 'folders'}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3">
+              {folderContents.childFolders.map((folder) => (
+                <button
+                  key={folder.path}
+                  type="button"
+                  data-testid="main-folder-card"
+                  onClick={() => onSelectFolder(folder.path)}
+                  className="group text-left rounded-xl border app-border app-surface px-3.5 py-3 hover:border-current transition-colors flex items-center gap-3 min-w-0"
+                >
+                  <div className="w-8 h-8 rounded-lg accent-soft flex items-center justify-center shrink-0">
+                    <Folder className="w-4 h-4 accent-text" aria-hidden="true" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium truncate group-hover:underline">{folder.name}</p>
+                    <p className="text-xs opacity-60 tabular-nums truncate">
+                      {folder.count} {folder.count === 1 ? 'book' : 'books'}
+                      {folder.children.length > 0 ? ` · ${folder.children.length} sub` : ''}
+                    </p>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
 
         {/* Semantic Search Results */}
         {semanticMode && (semanticLoading || semanticResults.length > 0 || semanticSourceLabel) && (

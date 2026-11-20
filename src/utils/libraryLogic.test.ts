@@ -8,13 +8,17 @@ import {
   clampBookPayload,
   clampPreferencesPayload,
   clampReadingGoalPayload,
+  computeBufferSha256,
   createDefaultReadingGoal,
   deriveFolderFromRelativePath,
   detectSupportedBookFormat,
   exportAnnotationsToMarkdown,
+  findDuplicateBookGroups,
   formatZoteroCitation,
+  getFolderViewContents,
   getReadingGoalStats,
   normalizeFolderPath,
+  pickRecommendedKeepBookId,
   recordReadingActivity,
   runWithConcurrency,
   searchLocalSemanticChunks,
@@ -97,6 +101,28 @@ test('buildFolderTree builds nested folders with accurate descendant counts', ()
   assert.equal(cs.count, 1);
   assert.equal(cs.children[0].path, '/Computer Science/Systems');
   assert.equal(cs.children[0].count, 1);
+});
+
+test('getFolderViewContents resolves root folders, nested subfolders, breadcrumbs, and parentPath', () => {
+  const tree = buildFolderTree(sampleBooks);
+  const root = getFolderViewContents(tree, null);
+  assert.equal(root.breadcrumbs.length, 0);
+  assert.equal(root.parentPath, null);
+  assert.equal(root.childFolders.length, 3);
+
+  const cs = getFolderViewContents(tree, '/Computer Science');
+  assert.deepEqual(cs.breadcrumbs, [{name: 'Computer Science', path: '/Computer Science'}]);
+  assert.equal(cs.parentPath, null);
+  assert.equal(cs.childFolders.length, 1);
+  assert.equal(cs.childFolders[0].path, '/Computer Science/Systems');
+
+  const leaf = getFolderViewContents(tree, '/Computer Science/Systems');
+  assert.deepEqual(leaf.breadcrumbs, [
+    {name: 'Computer Science', path: '/Computer Science'},
+    {name: 'Systems', path: '/Computer Science/Systems'},
+  ]);
+  assert.equal(leaf.parentPath, '/Computer Science');
+  assert.equal(leaf.childFolders.length, 0);
 });
 
 test('sortAndFilterBooks filters by folder hierarchy, format, collection, and sorts accurately', () => {
@@ -328,4 +354,51 @@ test('runWithConcurrency preserves order while bounding parallel workers', async
   });
   assert.deepEqual(out, [20, 40, 60, 80, 100, 120]);
   assert.ok(maxActive <= 2);
+});
+
+test('computeBufferSha256 and findDuplicateBookGroups detect exact hash and metadata duplicates and protect annotated copy', async () => {
+  const bytesA = new TextEncoder().encode('identical-pdf-binary-stream');
+  const bytesB = new TextEncoder().encode('different-binary-stream');
+  const hashA1 = await computeBufferSha256(bytesA.buffer);
+  const hashA2 = await computeBufferSha256(bytesA.slice().buffer);
+  const hashB = await computeBufferSha256(bytesB.buffer);
+  assert.equal(hashA1, hashA2);
+  assert.notEqual(hashA1, hashB);
+
+  const booksWithDups: BookMetadata[] = [
+    {...sampleBooks[0], id: 'orig-1', contentHash: hashA1, addedAt: 1000, progress: 10},
+    {
+      ...sampleBooks[0],
+      id: 'dup-1',
+      title: 'Copy of Designing Reliable Distributed Systems',
+      folderPath: '/Downloads',
+      contentHash: hashA2,
+      addedAt: 2000,
+      progress: 80,
+    },
+    {...sampleBooks[1], id: 'meta-orig', contentHash: hashB, addedAt: 1500},
+    {...sampleBooks[1], id: 'meta-dup', folderPath: '/Desktop', addedAt: 2500},
+  ];
+
+  const anns = [
+    {
+      id: 'a-keep',
+      ownerId: 'local',
+      bookId: 'dup-1',
+      page: 2,
+      quote: 'Important quote',
+      note: 'Keep this annotated copy',
+      color: 'amber' as const,
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    },
+  ];
+
+  assert.equal(pickRecommendedKeepBookId([booksWithDups[0], booksWithDups[1]], anns), 'dup-1');
+
+  const groups = findDuplicateBookGroups(booksWithDups, anns);
+  assert.equal(groups.length, 2);
+  assert.equal(groups[0].matchType, 'exact-hash');
+  assert.equal(groups[0].recommendedKeepId, 'dup-1');
+  assert.equal(groups[1].matchType, 'metadata-match');
 });

@@ -279,6 +279,22 @@ mark[data-ann-id]:hover {
   filter: brightness(0.95);
 }
 
+/* PDF selectable text overlay: keep glyphs transparent on selection to prevent doubled ghost text */
+.pdf-text-layer {
+  user-select: text;
+  -webkit-user-select: text;
+}
+.pdf-text-layer::selection,
+.pdf-text-layer span::selection {
+  color: transparent !important;
+  background: rgba(37, 99, 235, 0.26);
+}
+.dark .pdf-text-layer::selection,
+.dark .pdf-text-layer span::selection {
+  color: transparent !important;
+  background: rgba(96, 165, 250, 0.32);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

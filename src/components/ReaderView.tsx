@@ -3,6 +3,7 @@ import type {PDFDocumentProxy} from 'pdfjs-dist';
 import type {WasmDocument} from 'djvu-rs';
 import {
   ArrowLeft,
+  ArrowRightLeft,
   BookOpen,
   Check,
   ChevronLeft,
@@ -10,6 +11,7 @@ import {
   Columns2,
   Copy,
   Download,
+  FileText,
   GraduationCap,
   Highlighter,
   Languages,
@@ -18,6 +20,8 @@ import {
   MessageSquarePlus,
   Minimize2,
   MousePointer,
+  MoveHorizontal,
+  MoveVertical,
   PenTool,
   ScanLine,
   SlidersHorizontal,
@@ -38,8 +42,10 @@ import type {
   DocumentTextChunk,
   EpubViewMode,
   HighlightColor,
+  PageLayoutMode,
   ReaderPreferences,
   ReaderTheme,
+  ReadingDirection,
   ScanEnhanceSettings,
   ScanPreset,
   StudyCourse,
@@ -51,17 +57,21 @@ import {
   formatZoteroCitation,
 } from '../utils/libraryLogic';
 import {getBookBinary, getBookTextChunks} from '../utils/offlineStorage';
-import {openDjvuDocument, renderDjvuPageToCanvas} from '../utils/parsers/djvuParser';
+import {closeDjvuDocument, openDjvuDocument} from '../utils/parsers/djvuParser';
 import {parseEpubDocument, type ParsedEpubDocument} from '../utils/parsers/epubParser';
-import {extractPdfOutlineAndMeta, loadPdfDocument, renderPdfPageToCanvas} from '../utils/parsers/pdfParser';
 import {
-  applyScanEnhancementToCanvas,
+  closePdfDocument,
+  extractPdfOutlineAndMeta,
+  loadPdfDocument,
+} from '../utils/parsers/pdfParser';
+import {
   DEFAULT_SCAN_SETTINGS,
   getScanPresetSettings,
   isScanEnhancementActive,
 } from '../utils/scanEnhance';
 import {FONT_OPTIONS, getReaderFontClass, READER_THEMES} from '../utils/themeTokens';
 import {AnnotationPopover} from './AnnotationPopover';
+import {DocumentPageSheet} from './DocumentPageSheet';
 
 export type ZoteroTool = 'select' | 'highlight' | 'underline' | 'note' | 'area' | 'ink';
 
@@ -170,11 +180,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const [epubDoc, setEpubDoc] = useState<ParsedEpubDocument | null>(null);
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
   const [pdfOutline, setPdfOutline] = useState<{title: string; page: number}[]>([]);
-  const [pdfTextItems, setPdfTextItems] = useState<{str: string; x: number; y: number; fontSize: number}[]>([]);
-  const [pdfCanvasSize, setPdfCanvasSize] = useState<{width: number; height: number}>({width: 680, height: 880});
   const [djvuDoc, setDjvuDoc] = useState<WasmDocument | null>(null);
-  const [djvuBlankBitmap, setDjvuBlankBitmap] = useState(false);
-  const [djvuPageText, setDjvuPageText] = useState('');
+  const [renderedPageTexts, setRenderedPageTexts] = useState<Record<number, string>>({});
   const [zoomScale, setZoomScale] = useState(1.35);
   const [fitWidthMode, setFitWidthMode] = useState(false);
   const [textChunks, setTextChunks] = useState<DocumentTextChunk[]>([]);
@@ -183,20 +190,37 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const [scanOpen, setScanOpen] = useState(false);
   const [scanSettings, setScanSettings] = useState<ScanEnhanceSettings>(DEFAULT_SCAN_SETTINGS);
 
-  // EPUB Novel Paginated / Spread Sub-Page State
-  const epubViewMode: EpubViewMode = preferences.epubViewMode || 'scroll';
+  // Unified Paper/Book Layout Mode & Reading Direction (PDF, DjVu & EPUB)
+  const pageLayoutMode: PageLayoutMode =
+    preferences.pageLayoutMode ||
+    (book.format === 'epub'
+      ? preferences.epubViewMode === 'spread'
+        ? 'double'
+        : preferences.epubViewMode === 'paginated'
+          ? 'horizontal'
+          : 'vertical'
+      : 'single');
+  const readingDirection: ReadingDirection = preferences.readingDirection || 'ltr';
+
+  // EPUB Novel Paginated / Spread Sub-Page State (derived smoothly from pageLayoutMode)
+  const epubViewMode: EpubViewMode =
+    pageLayoutMode === 'double'
+      ? 'spread'
+      : pageLayoutMode === 'single' || pageLayoutMode === 'horizontal'
+        ? 'paginated'
+        : 'scroll';
   const novelIndent = preferences.novelIndent ?? true;
   const novelJustify = preferences.novelJustify ?? true;
   const novelDropCap = preferences.novelDropCap ?? true;
   const [epubSubPage, setEpubSubPage] = useState(0);
   const [epubSubPageCount, setEpubSubPageCount] = useState(1);
 
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const pageStageRef = useRef<HTMLDivElement | null>(null);
   const readerViewportRef = useRef<HTMLElement | null>(null);
   const epubBodyRef = useRef<HTMLDivElement | null>(null);
   const epubSpreadViewportRef = useRef<HTMLDivElement | null>(null);
   const visitedPagesRef = useRef<Set<number>>(new Set([book.currentPage || 1]));
+  const suppressAutoScrollRef = useRef(false);
 
   // Zotero Tooling & Selection Composer state
   const [activeTool, setActiveTool] = useState<ZoteroTool>('select');
@@ -206,6 +230,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const [noteDraft, setNoteDraft] = useState('');
   const [tagsDraft, setTagsDraft] = useState('');
   const [pendingPosition, setPendingPosition] = useState<AnnotationPosition | undefined>(undefined);
+  const [pendingPage, setPendingPage] = useState<number | null>(null);
   const [pendingKind, setPendingKind] = useState<AnnotationKind>('highlight');
   const [composerOpen, setComposerOpen] = useState(false);
 
@@ -286,12 +311,16 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   // Load document binary from IndexedDB
   useEffect(() => {
     let cancelled = false;
+    let loadedPdfDoc: PDFDocumentProxy | null = null;
+    let loadedDjvuDoc: WasmDocument | null = null;
+
     async function loadDocument() {
       setLoadingDoc(true);
       setDocError(null);
       setPdfDoc(null);
       setEpubDoc(null);
       setDjvuDoc(null);
+      setRenderedPageTexts({});
 
       try {
         const [buffer, storedChunks] = await Promise.all([
@@ -314,6 +343,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           setTotalPages(parsed.chapters.length);
         } else if (book.format === 'pdf') {
           const doc = await loadPdfDocument(buffer);
+          if (cancelled) {
+            await closePdfDocument(doc);
+            return;
+          }
+          loadedPdfDoc = doc;
           const info = await extractPdfOutlineAndMeta(doc);
           if (cancelled) return;
           setPdfDoc(doc);
@@ -321,7 +355,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           setTotalPages(doc.numPages);
         } else if (book.format === 'djvu') {
           const doc = await openDjvuDocument(buffer);
-          if (cancelled) return;
+          if (cancelled) {
+            closeDjvuDocument(doc);
+            return;
+          }
+          loadedDjvuDoc = doc;
           setDjvuDoc(doc);
           setTotalPages(Math.max(1, doc.page_count()));
         }
@@ -336,10 +374,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     void loadDocument();
     return () => {
       cancelled = true;
+      void closePdfDocument(loadedPdfDoc);
+      closeDjvuDocument(loadedDjvuDoc);
     };
   }, [book.id, book.format, book.title]);
 
-  // Fit-width zoom auto-calculation for PDF
+  // Fit-width zoom auto-calculation for PDF (adapts to double spread vs single/scroll)
   useEffect(() => {
     if (!fitWidthMode || book.format !== 'pdf' || !pdfDoc || !readerViewportRef.current) return;
     let cancelled = false;
@@ -348,8 +388,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         const page = await pdfDoc.getPage(Math.max(1, Math.min(currentPage, pdfDoc.numPages)));
         if (cancelled || !readerViewportRef.current) return;
         const baseViewport = page.getViewport({scale: 1});
-        const availWidth = Math.max(360, readerViewportRef.current.clientWidth - 72);
-        const computed = Number(Math.min(2.4, Math.max(0.75, availWidth / baseViewport.width)).toFixed(2));
+        const containerW = Math.max(360, readerViewportRef.current.clientWidth - 72);
+        const availWidth = pageLayoutMode === 'double' ? Math.max(260, (containerW - 24) / 2) : containerW;
+        const computed = Number(Math.min(2.4, Math.max(0.65, availWidth / baseViewport.width)).toFixed(2));
         setZoomScale(computed);
       } catch {
         // Ignore fit calc error
@@ -358,47 +399,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [fitWidthMode, book.format, pdfDoc, currentPage]);
-
-  // Render PDF or DjVu page onto canvas + apply low-quality scan optimization
-  useEffect(() => {
-    let cancelled = false;
-    async function renderCanvasPage() {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-
-      if (book.format === 'pdf' && pdfDoc) {
-        try {
-          const clampedPage = Math.max(1, Math.min(currentPage, pdfDoc.numPages));
-          const res = await renderPdfPageToCanvas(pdfDoc, clampedPage, canvas, zoomScale);
-          if (cancelled) return;
-          applyScanEnhancementToCanvas(canvas, scanSettings);
-          setPdfCanvasSize({width: res.width, height: res.height});
-          setPdfTextItems(res.textItems);
-        } catch (err) {
-          console.error('PDF page render error:', err);
-        }
-      } else if (book.format === 'djvu' && djvuDoc) {
-        try {
-          const dpi = Math.round((isScanEnhancementActive(scanSettings) ? 145 : 120) * zoomScale);
-          const res = renderDjvuPageToCanvas(djvuDoc, currentPage, canvas, dpi);
-          if (cancelled) return;
-          if (!res.isBlankBitmap) {
-            applyScanEnhancementToCanvas(canvas, scanSettings);
-          }
-          setDjvuBlankBitmap(res.isBlankBitmap);
-          const fallbackChunk = textChunks.find((c) => c.page === currentPage)?.text || '';
-          setDjvuPageText(res.text || fallbackChunk);
-        } catch (err) {
-          console.error('DjVu page render error:', err);
-        }
-      }
-    }
-    void renderCanvasPage();
-    return () => {
-      cancelled = true;
-    };
-  }, [book.format, pdfDoc, djvuDoc, currentPage, zoomScale, textChunks, scanSettings]);
+  }, [fitWidthMode, book.format, pdfDoc, currentPage, pageLayoutMode]);
 
   // Populate EPUB chapter DOM + wrap in-page <mark data-ann-id> highlights & underlines cleanly
   useEffect(() => {
@@ -431,6 +432,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     pageAnnotations,
     focusedAnnotationId,
     epubViewMode,
+    pageLayoutMode,
+    readingDirection,
     preferences.fontSize,
     preferences.lineHeight,
     preferences.maxWidth,
@@ -441,7 +444,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   ]);
 
   const goToPage = useCallback(
-    (nextPage: number) => {
+    (nextPage: number, fromContinuousScroll = false) => {
       const clamped = Math.max(1, Math.min(nextPage, totalPages));
       setCurrentPage(clamped);
       setEpubSubPage(0);
@@ -451,11 +454,68 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         visitedPagesRef.current.add(clamped);
         onRecordReadingSession?.(1, 0);
       }
+
+      if (!fromContinuousScroll && book.format !== 'epub' && (pageLayoutMode === 'vertical' || pageLayoutMode === 'horizontal')) {
+        suppressAutoScrollRef.current = true;
+        const pageEl = readerViewportRef.current?.querySelector(`[data-page-number="${clamped}"]`) as HTMLElement | null;
+        pageEl?.scrollIntoView({behavior: 'smooth', block: 'center', inline: 'center'});
+        window.setTimeout(() => {
+          suppressAutoScrollRef.current = false;
+        }, 420);
+      }
     },
-    [book.id, onRecordReadingSession, onUpdateProgress, totalPages],
+    [book.format, book.id, onRecordReadingSession, onUpdateProgress, pageLayoutMode, totalPages],
   );
 
-  // Keyboard navigation (Esc, ArrowLeft, ArrowRight)
+  const stepPage = useCallback(
+    (directionSign: 1 | -1) => {
+      if (pageLayoutMode === 'double' && totalPages > 1) {
+        const pairBase = currentPage % 2 === 1 ? currentPage : Math.max(1, currentPage - 1);
+        const nextTarget = directionSign > 0 ? Math.min(totalPages, pairBase + 2) : Math.max(1, pairBase - 2);
+        goToPage(nextTarget);
+      } else {
+        goToPage(currentPage + directionSign);
+      }
+    },
+    [currentPage, goToPage, pageLayoutMode, totalPages],
+  );
+
+  const handleChangePageLayout = useCallback(
+    (mode: PageLayoutMode) => {
+      suppressAutoScrollRef.current = true;
+      window.setTimeout(() => {
+        suppressAutoScrollRef.current = false;
+      }, 650);
+
+      if (mode === 'double' && book.format === 'pdf') {
+        setFitWidthMode(true);
+      } else if (fitWidthMode) {
+        setFitWidthMode(false);
+        setZoomScale(mode === 'horizontal' ? 1.05 : 1.25);
+      }
+
+      onUpdatePreferences({
+        ...preferences,
+        pageLayoutMode: mode,
+        epubViewMode:
+          mode === 'double' ? 'spread' : mode === 'single' || mode === 'horizontal' ? 'paginated' : 'scroll',
+        columnCount: mode === 'double' ? 2 : 1,
+        updatedAtMs: Date.now(),
+      });
+    },
+    [book.format, fitWidthMode, onUpdatePreferences, preferences],
+  );
+
+  const handleToggleReadingDirection = useCallback(() => {
+    const nextDir: ReadingDirection = readingDirection === 'ltr' ? 'rtl' : 'ltr';
+    onUpdatePreferences({
+      ...preferences,
+      readingDirection: nextDir,
+      updatedAtMs: Date.now(),
+    });
+  }, [onUpdatePreferences, preferences, readingDirection]);
+
+  // Keyboard navigation (Esc, ArrowLeft, ArrowRight respecting readingDirection & double spreads)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -473,17 +533,20 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
       if (isEditingText) return;
 
-      if (e.key === 'ArrowRight') {
+      const forwardKey = readingDirection === 'rtl' ? 'ArrowLeft' : 'ArrowRight';
+      const backKey = readingDirection === 'rtl' ? 'ArrowRight' : 'ArrowLeft';
+
+      if (e.key === forwardKey) {
         if (book.format === 'epub' && epubViewMode !== 'scroll' && epubSubPage < epubSubPageCount - 1) {
           setEpubSubPage((p) => p + 1);
         } else if (currentPage < totalPages) {
-          goToPage(currentPage + 1);
+          stepPage(1);
         }
-      } else if (e.key === 'ArrowLeft') {
+      } else if (e.key === backKey) {
         if (book.format === 'epub' && epubViewMode !== 'scroll' && epubSubPage > 0) {
           setEpubSubPage((p) => p - 1);
         } else if (currentPage > 1) {
-          goToPage(currentPage - 1);
+          stepPage(-1);
         }
       }
     };
@@ -499,23 +562,20 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     epubSubPageCount,
     currentPage,
     totalPages,
-    goToPage,
+    readingDirection,
+    stepPage,
   ]);
 
   const currentPagePlainText = useMemo(() => {
     if (book.format === 'epub' && epubDoc) {
       return epubDoc.chapters[currentPage - 1]?.plainText || '';
     }
-    if (book.format === 'djvu' && djvuPageText) {
-      return djvuPageText;
-    }
+    const rendered = renderedPageTexts[currentPage];
+    if (rendered) return rendered;
     const chunkText = textChunks.find((c) => c.page === currentPage)?.text;
     if (chunkText) return chunkText;
-    if (book.format === 'pdf' && pdfTextItems.length > 0) {
-      return pdfTextItems.map((item) => item.str).join(' ').replace(/\s+/g, ' ').trim();
-    }
     return book.excerpt || '';
-  }, [book.format, book.excerpt, epubDoc, currentPage, djvuPageText, textChunks, pdfTextItems]);
+  }, [book.format, book.excerpt, epubDoc, currentPage, renderedPageTexts, textChunks]);
 
   const currentChapterTitle = useMemo(() => {
     if (book.format === 'epub' && epubDoc) {
@@ -539,62 +599,79 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       .filter(Boolean)
       .slice(0, 10);
 
-  // Compute normalized ClientRects relative to pageStageRef for crisp PDF/DjVu overlays
-  const captureSelectionRects = (): AnnotationPosition[] | undefined => {
-    const sel = window.getSelection();
-    if (!sel || sel.rangeCount === 0 || !pageStageRef.current) return undefined;
-    const stageRect = pageStageRef.current.getBoundingClientRect();
-    if (stageRect.width < 10 || stageRect.height < 10) return undefined;
-
-    const rawRects = Array.from(sel.getRangeAt(0).getClientRects());
-    const normalized: AnnotationPosition[] = [];
-    for (const r of rawRects) {
-      if (r.width < 2 || r.height < 2) continue;
-      const x = Math.max(0, Math.min(1, Number(((r.left - stageRect.left) / stageRect.width).toFixed(4))));
-      const y = Math.max(0, Math.min(1, Number(((r.top - stageRect.top) / stageRect.height).toFixed(4))));
-      const width = Math.max(0, Math.min(1 - x, Number((r.width / stageRect.width).toFixed(4))));
-      const height = Math.max(0, Math.min(1 - y, Number((r.height / stageRect.height).toFixed(4))));
-      if (width > 0.002 && height > 0.002) {
-        normalized.push({x, y, width, height});
+  const handleTextSelectionFromSheet = useCallback(
+    (pageNum: number, quote: string, rects: AnnotationPosition[] | undefined) => {
+      const selObj = window.getSelection();
+      if (activeTool === 'highlight' || activeTool === 'underline') {
+        onAddAnnotation({
+          bookId: book.id,
+          page: pageNum,
+          chapterTitle: book.format === 'epub' ? currentChapterTitle : `Page ${pageNum}`,
+          kind: activeTool,
+          quote,
+          note: '',
+          color: selectedColor,
+          tags: [],
+          rects,
+          position: rects?.[0],
+        });
+        selObj?.removeAllRanges();
+        setSelectedText('');
+        setSelectedRects(undefined);
+        setPendingPage(null);
+        return;
       }
-      if (normalized.length >= 24) break;
-    }
-    return normalized.length > 0 ? normalized : undefined;
-  };
+
+      setPendingPage(pageNum);
+      setSelectedText(quote);
+      setSelectedRects(rects);
+    },
+    [activeTool, book.format, book.id, currentChapterTitle, onAddAnnotation, selectedColor],
+  );
+
+  const handlePinNoteFromSheet = useCallback((pageNum: number, pos: AnnotationPosition) => {
+    setPendingPage(pageNum);
+    setPendingKind('note');
+    setPendingPosition(pos);
+    setSelectedText(`Pinned note on Page ${pageNum} at (${Math.round(pos.x * 100)}%, ${Math.round(pos.y * 100)}%)`);
+    setComposerOpen(true);
+  }, []);
+
+  const handleCreateSpatialFromSheet = useCallback(
+    (
+      pageNum: number,
+      kind: Extract<AnnotationKind, 'area' | 'ink'>,
+      quote: string,
+      tags: string[],
+      position: AnnotationPosition,
+      inkStrokes?: string[],
+    ) => {
+      onAddAnnotation({
+        bookId: book.id,
+        page: pageNum,
+        chapterTitle: book.format === 'epub' ? currentChapterTitle : `Page ${pageNum}`,
+        kind,
+        quote,
+        note: '',
+        color: selectedColor,
+        tags,
+        position,
+        inkStrokes,
+      });
+    },
+    [book.format, book.id, currentChapterTitle, onAddAnnotation, selectedColor],
+  );
 
   const handleMouseUpSelection = () => {
+    if (book.format !== 'epub') return;
     if (activeTool === 'note' || activeTool === 'area' || activeTool === 'ink') return;
     const selObj = window.getSelection();
     const sel = selObj?.toString().trim() || '';
     if (sel.length < 3) return;
-    const clipped = sel.slice(0, 1800);
-    const rects = book.format === 'epub' ? undefined : captureSelectionRects();
-
-    // Instant in-page highlight or underline when those tools are active — NO sidebar popout!
-    if (activeTool === 'highlight' || activeTool === 'underline') {
-      onAddAnnotation({
-        bookId: book.id,
-        page: currentPage,
-        chapterTitle: currentChapterTitle,
-        kind: activeTool,
-        quote: clipped,
-        note: '',
-        color: selectedColor,
-        tags: [],
-        rects,
-        position: rects?.[0],
-      });
-      selObj?.removeAllRanges();
-      setSelectedText('');
-      setSelectedRects(undefined);
-      return;
-    }
-
-    setSelectedText(clipped);
-    setSelectedRects(rects);
+    handleTextSelectionFromSheet(currentPage, sel.slice(0, 1800), undefined);
   };
 
-  // Pointer-event normalized coordinate helper (0..1)
+  // Pointer-event normalized coordinate helper (0..1) for EPUB stage
   const getNormalizedPointerCoords = (e: React.PointerEvent<HTMLDivElement>) => {
     const rect = pageStageRef.current?.getBoundingClientRect();
     if (!rect || rect.width === 0 || rect.height === 0) return {x: 0.5, y: 0.5};
@@ -607,6 +684,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const handleStagePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (activeTool === 'note') {
       const pt = getNormalizedPointerCoords(e);
+      setPendingPage(currentPage);
       setPendingKind('note');
       setPendingPosition({x: pt.x, y: pt.y, width: 0.04, height: 0.04});
       setSelectedText(`Pinned note at (${Math.round(pt.x * 100)}%, ${Math.round(pt.y * 100)}%)`);
@@ -700,12 +778,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
   const handleCreateAnnotation = (e: React.FormEvent) => {
     e.preventDefault();
-    const quote = (selectedText || currentPagePlainText.slice(0, 220)).trim();
+    const targetPage = pendingPage || currentPage;
+    const quote = (selectedText || renderedPageTexts[targetPage]?.slice(0, 220) || currentPagePlainText.slice(0, 220)).trim();
     if (!quote) return;
     onAddAnnotation({
       bookId: book.id,
-      page: currentPage,
-      chapterTitle: currentChapterTitle,
+      page: targetPage,
+      chapterTitle: book.format === 'epub' ? currentChapterTitle : `Page ${targetPage}`,
       kind: pendingKind,
       quote,
       note: noteDraft.trim(),
@@ -719,6 +798,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     setSelectedText('');
     setSelectedRects(undefined);
     setPendingPosition(undefined);
+    setPendingPage(null);
     setPendingKind('highlight');
     setComposerOpen(false);
   };
@@ -1200,54 +1280,47 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             </div>
           </div>
 
-          {/* Dedicated EPUB Novel Reading Mode Quick Switcher */}
-          {book.format === 'epub' ? (
-            <div className="flex items-center gap-1.5 shrink-0">
-              <span className={`text-[11px] ${theme.muted} hidden lg:inline mr-1`}>Novel Layout:</span>
+          {/* Paper & Book Scroll / Page Layout Modes + Reading Direction (All Formats) */}
+          <div className="flex items-center gap-1.5 shrink-0" aria-label="Paper reading layout">
+            <div className="flex items-center gap-0.5 rounded-lg border border-black/10 dark:border-white/15 p-0.5">
               {(
                 [
-                  {id: 'scroll', label: 'Scroll'},
-                  {id: 'paginated', label: 'Book Page'},
-                  {id: 'spread', label: '2-Page Spread'},
+                  {id: 'single', label: 'Single', icon: <FileText className="w-3 h-3" />},
+                  {id: 'vertical', label: 'Vertical', icon: <MoveVertical className="w-3 h-3" />},
+                  {id: 'horizontal', label: 'Horizontal', icon: <MoveHorizontal className="w-3 h-3" />},
+                  {id: 'double', label: 'Double Page', icon: <Columns2 className="w-3 h-3" />},
                 ] as const
               ).map((m) => (
                 <button
                   key={m.id}
                   type="button"
-                  aria-pressed={epubViewMode === m.id}
-                  onClick={() =>
-                    onUpdatePreferences({
-                      ...preferences,
-                      epubViewMode: m.id,
-                      columnCount: m.id === 'spread' ? 2 : 1,
-                      updatedAtMs: Date.now(),
-                    })
-                  }
-                  className={`px-2 py-1 rounded text-[11px] font-medium whitespace-nowrap ${
-                    epubViewMode === m.id ? 'accent-btn' : 'hover:bg-black/5 dark:hover:bg-white/10 opacity-80'
+                  aria-pressed={pageLayoutMode === m.id}
+                  onClick={() => handleChangePageLayout(m.id)}
+                  className={`px-2 py-1 rounded text-[11px] font-medium flex items-center gap-1 whitespace-nowrap transition-colors ${
+                    pageLayoutMode === m.id
+                      ? 'accent-btn'
+                      : 'hover:bg-black/5 dark:hover:bg-white/10 opacity-80'
                   }`}
                 >
-                  {m.label}
+                  {m.icon}
+                  <span>{m.label}</span>
                 </button>
               ))}
             </div>
-          ) : (
-            <div className={`text-[11px] ${theme.muted} whitespace-nowrap hidden md:block`}>
-              {scanActive
-                ? `Scan Enhance: ${scanSettings.preset} (${Math.round(scanSettings.contrast * 100)}% contrast)`
-                : activeTool === 'select'
-                  ? 'Select text to quote, highlight, or translate'
-                  : activeTool === 'highlight'
-                    ? 'Highlight active — drag across text to paint directly on page'
-                    : activeTool === 'underline'
-                      ? 'Underline active — drag across text to underline on page'
-                      : activeTool === 'note'
-                        ? 'Click anywhere on page to pin a sticky note'
-                        : activeTool === 'area'
-                          ? 'Drag a box around any figure or equation'
-                          : 'Draw freehand ink strokes directly on page'}
-            </div>
-          )}
+
+            <button
+              type="button"
+              onClick={handleToggleReadingDirection}
+              aria-label={`Reading direction: ${readingDirection === 'ltr' ? 'Left to Right' : 'Right to Left'}`}
+              title="Toggle reading direction (L → R or R → L)"
+              className={`px-2 py-1 rounded-lg border text-[11px] font-mono font-medium flex items-center gap-1 whitespace-nowrap transition-colors ${
+                readingDirection === 'rtl' ? 'accent-btn border-transparent' : `${theme.border} hover:bg-black/5 dark:hover:bg-white/10`
+              }`}
+            >
+              <ArrowRightLeft className="w-3 h-3" aria-hidden="true" />
+              <span>{readingDirection === 'ltr' ? 'L → R' : 'R → L'}</span>
+            </button>
+          </div>
         </div>
       )}
 
@@ -1672,7 +1745,19 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         {/* Center Reading Canvas */}
         <main
           ref={readerViewportRef}
+          dir={book.format !== 'epub' && pageLayoutMode === 'horizontal' ? readingDirection : undefined}
+          data-layout-mode={pageLayoutMode}
+          data-reading-dir={readingDirection}
           onMouseUp={handleMouseUpSelection}
+          onWheel={(e) => {
+            if (book.format !== 'epub' && pageLayoutMode === 'horizontal' && readerViewportRef.current) {
+              const el = readerViewportRef.current;
+              if (el.scrollWidth > el.clientWidth && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+                e.preventDefault();
+                el.scrollLeft += readingDirection === 'rtl' ? -e.deltaY : e.deltaY;
+              }
+            }
+          }}
           onClick={(ev) => {
             // Inspect any inline EPUB highlight or underline <mark data-ann-id="...">
             const target = ev.target as HTMLElement | null;
@@ -1684,7 +1769,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               setFocusedAnnotationId(null);
             }
           }}
-          className={`flex-1 overflow-y-auto px-4 sm:px-8 py-8 flex flex-col items-center relative ${
+          className={`flex-1 min-w-0 overflow-x-auto overflow-y-auto px-4 sm:px-8 py-8 flex flex-col relative ${
             spatialToolActive ? 'select-none' : ''
           }`}
         >
@@ -1698,10 +1783,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   type="button"
                   aria-label={`Highlight in ${HIGHLIGHT_COLORS[c].label}`}
                   onClick={() => {
+                    const targetPage = pendingPage || currentPage;
                     onAddAnnotation({
                       bookId: book.id,
-                      page: currentPage,
-                      chapterTitle: currentChapterTitle,
+                      page: targetPage,
+                      chapterTitle: book.format === 'epub' ? currentChapterTitle : `Page ${targetPage}`,
                       kind: 'highlight',
                       quote: selectedText,
                       note: '',
@@ -1712,6 +1798,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                     });
                     setSelectedText('');
                     setSelectedRects(undefined);
+                    setPendingPage(null);
                   }}
                   className={`w-5 h-5 rounded-full ${HIGHLIGHT_COLORS[c].swatch} hover:scale-110 transition-transform`}
                 />
@@ -1719,10 +1806,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               <button
                 type="button"
                 onClick={() => {
+                  const targetPage = pendingPage || currentPage;
                   onAddAnnotation({
                     bookId: book.id,
-                    page: currentPage,
-                    chapterTitle: currentChapterTitle,
+                    page: targetPage,
+                    chapterTitle: book.format === 'epub' ? currentChapterTitle : `Page ${targetPage}`,
                     kind: 'underline',
                     quote: selectedText,
                     note: '',
@@ -1733,6 +1821,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   });
                   setSelectedText('');
                   setSelectedRects(undefined);
+                  setPendingPage(null);
                 }}
                 className="px-2.5 py-1 rounded-md text-xs font-medium bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 flex items-center gap-1"
               >
@@ -1858,9 +1947,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               <p className="mt-3 text-sm font-medium">{docError}</p>
             </div>
           ) : book.format === 'epub' && epubDoc ? (
-            /* EPUB Reflowable & Literary Novel / Spread Reader */
+            /* EPUB Reflowable & Literary Novel / Spread Reader (respects L->R and R->L) */
             <article
               ref={pageStageRef}
+              dir={readingDirection}
               data-epub-mode={epubViewMode}
               style={{
                 maxWidth:
@@ -1902,11 +1992,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   }`}
                 />
               ) : (
-                /* Paginated Book / Two-Page Open Spread */
+                /* Paginated Book / Horizontal Leaf / Two-Page Open Spread */
                 <div key="epub-paginated-view" className="relative">
                   <div ref={epubSpreadViewportRef} className="overflow-hidden" style={{height: '62vh'}}>
                     <div
-                      key={`epub-cols-${epubViewMode}`}
+                      key={`epub-cols-${epubViewMode}-${readingDirection}`}
                       ref={epubBodyRef}
                       data-testid="epub-prose-container"
                       style={{
@@ -1915,7 +2005,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                         columnCount: epubViewMode === 'spread' ? 2 : 1,
                         columnGap: epubViewMode === 'spread' ? '4rem' : '2rem',
                         columnFill: 'auto',
-                        transform: `translateX(calc(-${epubSubPage} * (100% + ${
+                        transform: `translateX(calc(${readingDirection === 'rtl' ? '' : '-'}${epubSubPage} * (100% + ${
                           epubViewMode === 'spread' ? '4rem' : '2rem'
                         })))`,
                         transition: 'transform 220ms ease',
@@ -1941,7 +2031,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       Turn Back
                     </button>
                     <span className={`tabular-nums ${theme.muted}`}>
-                      {epubViewMode === 'spread' ? 'Two-Page Book Spread' : 'Paginated Book'}
+                      {epubViewMode === 'spread'
+                        ? `Two-Page Book Spread (${readingDirection.toUpperCase()})`
+                        : `Horizontal Book Pages (${readingDirection.toUpperCase()})`}
                     </span>
                     <button
                       type="button"
@@ -1960,14 +2052,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               )}
             </article>
           ) : (
-            /* PDF & DjVu Canvas + Selectable Text Layer + In-Page Zotero Overlays */
-            <div className="flex flex-col items-center gap-4 w-full">
-              <div className="flex items-center gap-2">
+            /* PDF & DjVu Multi-Mode Sheets (Single, Vertical Continuous, Horizontal L->R / R->L, Double Book Spread) */
+            <div
+              className={`flex flex-col gap-4 ${
+                pageLayoutMode === 'horizontal' ? 'w-max min-w-full items-start' : 'w-fit min-w-full items-center'
+              }`}
+            >
+              <div dir="ltr" className="sticky left-0 self-center z-20 flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => {
                     setFitWidthMode(false);
-                    setZoomScale((z) => Math.max(0.8, Number((z - 0.15).toFixed(2))));
+                    setZoomScale((z) => Math.max(0.6, Number((z - 0.15).toFixed(2))));
                   }}
                   aria-label="Zoom out"
                   className={`p-1.5 rounded-lg border ${theme.border} ${theme.surface}`}
@@ -2000,73 +2096,78 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 </button>
               </div>
 
-              <div
-                ref={pageStageRef}
-                className={`relative border ${theme.border} shadow-sm ${
-                  !theme.isDark ? theme.surface : 'bg-white'
-                } overflow-hidden`}
-                style={
-                  book.format === 'pdf'
-                    ? {width: `${pdfCanvasSize.width}px`, height: `${pdfCanvasSize.height}px`}
-                    : undefined
-                }
-              >
-                <canvas
-                  ref={canvasRef}
-                  data-testid="document-canvas"
-                  className={`block ${
-                    theme.isDark
-                      ? 'invert-[0.88] hue-rotate-180'
-                      : preferences.theme !== 'paper'
-                        ? 'mix-blend-multiply'
-                        : ''
-                  }`}
-                />
+              {(() => {
+                const pagesToRender: number[] =
+                  pageLayoutMode === 'single'
+                    ? [currentPage]
+                    : pageLayoutMode === 'double'
+                      ? (() => {
+                          if (totalPages <= 1) return [currentPage];
+                          const leftStart = currentPage % 2 === 1 ? currentPage : Math.max(1, currentPage - 1);
+                          const pair = leftStart + 1 <= totalPages ? [leftStart, leftStart + 1] : [leftStart];
+                          return readingDirection === 'rtl' ? [...pair].reverse() : pair;
+                        })()
+                      : Array.from({length: totalPages}, (_, idx) => idx + 1);
 
-                {/* PDF Selectable Text Overlay */}
-                {book.format === 'pdf' && pdfTextItems.length > 0 && (
-                  <div className="absolute inset-0 select-text overflow-hidden pointer-events-auto z-10">
-                    {pdfTextItems.map((item, idx) => (
-                      <span
-                        key={idx}
-                        style={{
-                          position: 'absolute',
-                          left: `${item.x}px`,
-                          top: `${item.y}px`,
-                          fontSize: `${item.fontSize}px`,
-                          lineHeight: 1,
-                          color: 'transparent',
-                          whiteSpace: 'pre',
+                const stageLayoutClass =
+                  pageLayoutMode === 'horizontal'
+                    ? 'flex flex-row items-start gap-6 w-max px-4 pb-4'
+                    : pageLayoutMode === 'double'
+                      ? 'flex flex-row flex-nowrap items-start justify-center gap-2 p-2 rounded-xl bg-black/5 dark:bg-white/5 shadow-inner'
+                      : pageLayoutMode === 'vertical'
+                        ? 'flex flex-col items-center gap-6'
+                        : 'flex flex-col items-center';
+
+                return (
+                  <div
+                    dir={pageLayoutMode === 'horizontal' ? readingDirection : undefined}
+                    data-testid="paper-layout-stage"
+                    className={stageLayoutClass}
+                  >
+                    {pagesToRender.map((pageNum) => (
+                      <DocumentPageSheet
+                        key={pageNum}
+                        format={book.format === 'djvu' ? 'djvu' : 'pdf'}
+                        bookTitle={book.title}
+                        pageNumber={pageNum}
+                        pdfDoc={pdfDoc}
+                        djvuDoc={djvuDoc}
+                        fallbackText={textChunks.find((c) => c.page === pageNum)?.text || ''}
+                        zoomScale={zoomScale}
+                        scanSettings={scanSettings}
+                        themeBgSurface={theme.surface}
+                        themeBorder={theme.border}
+                        themeText={theme.text}
+                        themeMuted={theme.muted}
+                        isDarkTheme={theme.isDark}
+                        themeId={preferences.theme}
+                        fontClass={fontClass}
+                        activeTool={activeTool}
+                        selectedColor={selectedColor}
+                        pageAnnotations={bookAnnotations.filter((a) => a.page === pageNum)}
+                        focusedAnnotationId={focusedAnnotationId}
+                        lazy={pageLayoutMode === 'vertical' || pageLayoutMode === 'horizontal'}
+                        pageBadgeLabel={pageLayoutMode !== 'single' ? `p.${pageNum}` : undefined}
+                        onFocusAnnotation={setFocusedAnnotationId}
+                        onTextSelection={handleTextSelectionFromSheet}
+                        onPinNoteAt={handlePinNoteFromSheet}
+                        onCreateSpatialAnnotation={handleCreateSpatialFromSheet}
+                        onVisible={(visiblePage) => {
+                          if (!suppressAutoScrollRef.current && (pageLayoutMode === 'vertical' || pageLayoutMode === 'horizontal')) {
+                            setCurrentPage(visiblePage);
+                            onUpdateProgress(book.id, visiblePage, totalPages);
+                          }
                         }}
-                      >
-                        {item.str}
-                      </span>
+                        onRenderedText={(pNum, plainText) => {
+                          setRenderedPageTexts((prev) =>
+                            prev[pNum] === plainText ? prev : {...prev, [pNum]: plainText},
+                          );
+                        }}
+                      />
                     ))}
                   </div>
-                )}
-
-                {/* DjVu Text Layer Overlay */}
-                {book.format === 'djvu' && djvuPageText && (
-                  <div
-                    className={`${
-                      djvuBlankBitmap
-                        ? `absolute inset-0 p-10 overflow-y-auto ${theme.surface} ${theme.text} z-10`
-                        : `p-4 border-t ${theme.border} ${theme.surface} ${theme.text}`
-                    }`}
-                  >
-                    {djvuBlankBitmap && (
-                      <div className={`text-[11px] font-mono uppercase tracking-wider ${theme.muted} mb-4`}>
-                        DjVu Text Layer (TXTa) · {book.title}
-                      </div>
-                    )}
-                    <div className={`${fontClass} text-base leading-relaxed whitespace-pre-wrap select-text`}>
-                      {djvuPageText}
-                    </div>
-                  </div>
-                )}
-
-                {renderSpatialOverlays()}
-              </div>
+                );
+              })()}
             </div>
           )}
 
@@ -2221,39 +2322,67 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                     />
                   </div>
 
-                  {book.format === 'epub' && (
-                    <div className={`pt-3 border-t ${theme.border} space-y-3`}>
-                      <span className="text-xs font-medium block">Novel &amp; Book Typography</span>
-                      <div className="grid grid-cols-3 gap-1.5">
-                        {(
-                          [
-                            {id: 'scroll', label: 'Scroll'},
-                            {id: 'paginated', label: 'Book'},
-                            {id: 'spread', label: 'Spread'},
-                          ] as const
-                        ).map((mode) => (
-                          <button
-                            key={mode.id}
-                            type="button"
-                            onClick={() =>
-                              onUpdatePreferences({
-                                ...preferences,
-                                epubViewMode: mode.id,
-                                columnCount: mode.id === 'spread' ? 2 : 1,
-                                updatedAtMs: Date.now(),
-                              })
-                            }
-                            className={`py-1.5 rounded-lg border text-xs font-medium flex items-center justify-center gap-1 ${
-                              epubViewMode === mode.id ? 'accent-btn border-transparent' : theme.border
-                            }`}
-                          >
-                            {mode.id === 'spread' && <Columns2 className="w-3 h-3" />}
-                            {mode.label}
-                          </button>
-                        ))}
-                      </div>
+                  <div className={`pt-3 border-t ${theme.border} space-y-3`}>
+                    <span className="text-xs font-medium block">Paper &amp; Book Page Layout</span>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {(
+                        [
+                          {id: 'single', label: 'Single Page', icon: <FileText className="w-3 h-3" />},
+                          {id: 'vertical', label: 'Vertical Scroll', icon: <MoveVertical className="w-3 h-3" />},
+                          {id: 'horizontal', label: 'Horizontal Scroll', icon: <MoveHorizontal className="w-3 h-3" />},
+                          {id: 'double', label: 'Double Spread', icon: <Columns2 className="w-3 h-3" />},
+                        ] as const
+                      ).map((mode) => (
+                        <button
+                          key={mode.id}
+                          type="button"
+                          onClick={() => handleChangePageLayout(mode.id)}
+                          className={`py-1.5 px-2 rounded-lg border text-xs font-medium flex items-center justify-center gap-1 ${
+                            pageLayoutMode === mode.id ? 'accent-btn border-transparent' : theme.border
+                          }`}
+                        >
+                          {mode.icon}
+                          {mode.label}
+                        </button>
+                      ))}
+                    </div>
 
-                      <div className="space-y-2 text-xs">
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onUpdatePreferences({
+                            ...preferences,
+                            readingDirection: 'ltr',
+                            updatedAtMs: Date.now(),
+                          })
+                        }
+                        className={`py-1.5 px-2 rounded-lg border text-xs font-medium ${
+                          readingDirection === 'ltr' ? 'accent-btn border-transparent' : theme.border
+                        }`}
+                      >
+                        Left → Right (LTR)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onUpdatePreferences({
+                            ...preferences,
+                            readingDirection: 'rtl',
+                            updatedAtMs: Date.now(),
+                          })
+                        }
+                        className={`py-1.5 px-2 rounded-lg border text-xs font-medium ${
+                          readingDirection === 'rtl' ? 'accent-btn border-transparent' : theme.border
+                        }`}
+                      >
+                        Right → Left (RTL)
+                      </button>
+                    </div>
+
+                    {book.format === 'epub' && (
+                      <div className="pt-2 space-y-2 text-xs">
+                        <span className="font-medium block">Novel Typography</span>
                         <label className="flex items-center justify-between cursor-pointer">
                           <span>Literary Paragraph Indent</span>
                           <input
@@ -2297,8 +2426,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                           />
                         </label>
                       </div>
-                    </div>
-                  )}
+                    )}
+                  </div>
                 </>
               )}
 
@@ -2485,7 +2614,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           <button
             type="button"
             disabled={currentPage <= 1}
-            onClick={() => goToPage(currentPage - 1)}
+            onClick={() => stepPage(-1)}
             className="px-2.5 py-1 rounded-md text-xs font-medium disabled:opacity-30 hover:bg-black/5 dark:hover:bg-white/10 flex items-center gap-1"
           >
             <ChevronLeft className="w-4 h-4" />
@@ -2510,7 +2639,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           <button
             type="button"
             disabled={currentPage >= totalPages}
-            onClick={() => goToPage(currentPage + 1)}
+            onClick={() => stepPage(1)}
             className="px-2.5 py-1 rounded-md text-xs font-medium disabled:opacity-30 hover:bg-black/5 dark:hover:bg-white/10 flex items-center gap-1"
           >
             Next

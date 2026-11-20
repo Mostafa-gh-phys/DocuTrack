@@ -8,9 +8,12 @@ import {
   FileText,
   Folder,
   FolderOpen,
+  FolderTree,
   HardDriveDownload,
   Heart,
   Library,
+  PanelLeftClose,
+  PanelLeftOpen,
   Target,
   WifiOff,
 } from 'lucide-react';
@@ -28,6 +31,8 @@ interface LibrarySidebarProps {
   isOnline: boolean;
   userEmail: string | null;
   readingGoal?: ReadingGoal;
+  collapsed: boolean;
+  onToggleCollapse: () => void;
   onSelectCollection: (c: LibraryCollection) => void;
   onSelectFolder: (path: string | null) => void;
   onSelectFormat: (f: BookFormat | 'all') => void;
@@ -108,6 +113,8 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
   isOnline,
   userEmail,
   readingGoal,
+  collapsed,
+  onToggleCollapse,
   onSelectCollection,
   onSelectFolder,
   onSelectFormat,
@@ -140,7 +147,10 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
   return (
     <aside
       aria-label="Library navigation"
-      className="w-full lg:w-[260px] shrink-0 border-b lg:border-b-0 lg:border-r app-border app-surface flex flex-col justify-between"
+      data-collapsed={collapsed ? 'true' : 'false'}
+      className={`w-full ${
+        collapsed ? 'lg:w-[58px]' : 'lg:w-[260px]'
+      } shrink-0 border-b lg:border-b-0 lg:border-r app-border app-surface flex flex-col justify-between transition-[width] duration-150`}
     >
       <div className="lg:hidden px-4 py-2.5 flex items-center justify-between border-b app-border">
         <button
@@ -155,9 +165,117 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
         <span className="text-xs tabular-nums opacity-60">{books.length} docs</span>
       </div>
 
-      <div className={`${mobileOpen ? 'block' : 'hidden'} lg:block p-4 space-y-6 overflow-y-auto`}>
+      {/* Collapsed Desktop Rail */}
+      {collapsed && (
+        <div className="hidden lg:flex flex-col items-center justify-between flex-1 py-3 gap-4">
+          <div className="flex flex-col items-center gap-2">
+            <button
+              type="button"
+              onClick={onToggleCollapse}
+              aria-label="Expand sidebar"
+              title="Expand sidebar"
+              className="p-2 rounded-lg opacity-75 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+            >
+              <PanelLeftOpen className="w-4 h-4" aria-hidden="true" />
+            </button>
+
+            <div className="w-6 border-t app-border my-1" aria-hidden="true" />
+
+            {collections.map((item) => {
+              const active = activeCollection === item.id && activeFolder === null;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => {
+                    onSelectCollection(item.id);
+                    onSelectFolder(null);
+                  }}
+                  aria-label={item.label}
+                  title={`${item.label} (${item.count})`}
+                  className={`p-2 rounded-lg transition-colors ${
+                    active
+                      ? 'accent-soft accent-text'
+                      : 'opacity-70 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/5'
+                  }`}
+                >
+                  {item.icon}
+                </button>
+              );
+            })}
+
+            <button
+              type="button"
+              onClick={onToggleCollapse}
+              aria-label="Browse folder tree"
+              title="Open sidebar folder tree"
+              className={`p-2 rounded-lg transition-colors ${
+                activeFolder
+                  ? 'accent-soft accent-text'
+                  : 'opacity-70 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/5'
+              }`}
+            >
+              <FolderTree className="w-4 h-4" aria-hidden="true" />
+            </button>
+          </div>
+
+          <div className="flex flex-col items-center gap-2 pt-2 border-t app-border">
+            {readingGoal && onOpenGoals && (
+              <button
+                type="button"
+                onClick={onOpenGoals}
+                aria-label="Daily reading goal"
+                title="Daily Reading Goal"
+                className="p-2 rounded-lg opacity-70 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/5"
+              >
+                <Target className="w-4 h-4 accent-text" aria-hidden="true" />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onToggleSimulatedOffline}
+              aria-pressed={effectiveOffline}
+              aria-label="Offline reading mode"
+              title={effectiveOffline ? 'Offline Reading Mode: Active' : 'Offline Reading Mode: Off'}
+              className={`p-2 rounded-lg transition-colors ${
+                effectiveOffline
+                  ? 'bg-amber-100 text-amber-900 dark:bg-amber-950/50 dark:text-amber-200'
+                  : 'opacity-70 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/5'
+              }`}
+            >
+              <WifiOff className="w-4 h-4" aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              onClick={onOpenSyncBackup}
+              aria-label="Cloud sync and backups"
+              title={userEmail || 'Connect Cloud Sync'}
+              className="p-2 rounded-lg opacity-70 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/5"
+            >
+              {userEmail ? (
+                <Cloud className="w-4 h-4 text-emerald-600" aria-hidden="true" />
+              ) : (
+                <CloudOff className="w-4 h-4" aria-hidden="true" />
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className={`${mobileOpen ? 'block' : 'hidden'} ${collapsed ? 'lg:hidden' : 'lg:block'} p-4 space-y-6 overflow-y-auto`}>
         <div>
-          <h2 className="px-2 text-xs font-semibold opacity-60 tracking-wide">Collections</h2>
+          <div className="px-2 flex items-center justify-between">
+            <h2 className="text-xs font-semibold opacity-60 tracking-wide">Collections</h2>
+            <button
+              type="button"
+              onClick={onToggleCollapse}
+              aria-label="Collapse sidebar"
+              title="Collapse sidebar"
+              className="hidden lg:inline-flex p-1 rounded-md opacity-55 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+            >
+              <PanelLeftClose className="w-4 h-4" aria-hidden="true" />
+            </button>
+          </div>
           <nav className="mt-2 space-y-1">
             {collections.map((item) => {
               const active = activeCollection === item.id && activeFolder === null;
@@ -246,7 +364,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
         </div>
       </div>
 
-      <div className={`${mobileOpen ? 'block' : 'hidden'} lg:block p-4 border-t app-border app-surface-muted space-y-2.5`}>
+      <div className={`${mobileOpen ? 'block' : 'hidden'} ${collapsed ? 'lg:hidden' : 'lg:block'} p-4 border-t app-border app-surface-muted space-y-2.5`}>
         {readingGoal && goalStats && onOpenGoals && (
           <button
             type="button"

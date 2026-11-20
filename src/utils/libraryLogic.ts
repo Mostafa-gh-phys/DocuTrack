@@ -106,6 +106,50 @@ export function buildFolderTree(books: BookMetadata[]): FolderNode[] {
   return sortChildren(roots);
 }
 
+export interface FolderViewContents {
+  breadcrumbs: {name: string; path: string}[];
+  childFolders: FolderNode[];
+  parentPath: string | null;
+}
+
+export function getFolderViewContents(
+  folderTree: FolderNode[],
+  currentFolderPath: string | null,
+): FolderViewContents {
+  if (!currentFolderPath) {
+    return {
+      breadcrumbs: [],
+      childFolders: folderTree,
+      parentPath: null,
+    };
+  }
+
+  const normalized = normalizeFolderPath(currentFolderPath);
+  const parts = normalized.split('/').filter(Boolean);
+  const breadcrumbs = parts.map((name, idx) => ({
+    name,
+    path: `/${parts.slice(0, idx + 1).join('/')}`,
+  }));
+  const parentPath = parts.length > 1 ? `/${parts.slice(0, -1).join('/')}` : null;
+
+  let currentNodes = folderTree;
+  let matched: FolderNode | undefined;
+  for (let i = 0; i < breadcrumbs.length; i++) {
+    matched = currentNodes.find((n) => n.path === breadcrumbs[i].path);
+    if (!matched) {
+      currentNodes = [];
+      break;
+    }
+    currentNodes = matched.children;
+  }
+
+  return {
+    breadcrumbs,
+    childFolders: matched ? matched.children : [],
+    parentPath,
+  };
+}
+
 export interface LibraryFilterOptions {
   collection: LibraryCollection;
   folderPath: string | null;
@@ -635,4 +679,117 @@ export async function runWithConcurrency<T, R>(
 
   await Promise.all(Array.from({length: limit}, () => runWorker()));
   return results;
+}
+
+export type DuplicateMatchType = 'exact-hash' | 'metadata-match';
+
+export interface DuplicateBookGroup {
+  id: string;
+  matchType: DuplicateMatchType;
+  reason: string;
+  recommendedKeepId: string;
+  books: BookMetadata[];
+}
+
+export async function computeBufferSha256(buffer: ArrayBuffer): Promise<string> {
+  const cryptoApi = globalThis.crypto;
+  if (!cryptoApi?.subtle) {
+    // Deterministic FNV-1a fallback if WebCrypto subtle is unavailable
+    const view = new Uint8Array(buffer);
+    let hash = 2166136261;
+    for (let i = 0; i < view.length; i++) {
+      hash ^= view[i];
+      hash = Math.imul(hash, 16777619);
+    }
+    return `fnv_${view.length}_${(hash >>> 0).toString(16)}`;
+  }
+  const digest = await cryptoApi.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+export function pickRecommendedKeepBookId(
+  groupBooks: BookMetadata[],
+  annotations: Annotation[],
+): string {
+  const annCounts = new Map<string, number>();
+  for (const ann of annotations) {
+    annCounts.set(ann.bookId, (annCounts.get(ann.bookId) || 0) + 1);
+  }
+
+  const scored = [...groupBooks].sort((a, b) => {
+    const scoreA =
+      (annCounts.get(a.id) || 0) * 100 +
+      (a.progress || 0) +
+      (a.offlinePinned ? 20 : 0) +
+      (a.isFavorite ? 15 : 0);
+    const scoreB =
+      (annCounts.get(b.id) || 0) * 100 +
+      (b.progress || 0) +
+      (b.offlinePinned ? 20 : 0) +
+      (b.isFavorite ? 15 : 0);
+    if (scoreB !== scoreA) return scoreB - scoreA;
+    return a.addedAt - b.addedAt;
+  });
+
+  return scored[0]?.id || groupBooks[0].id;
+}
+
+export function findDuplicateBookGroups(
+  books: BookMetadata[],
+  annotations: Annotation[] = [],
+): DuplicateBookGroup[] {
+  const groups: DuplicateBookGroup[] = [];
+  const claimedIds = new Set<string>();
+
+  // 1. Exact binary SHA-256 hash duplicates
+  const byHash = new Map<string, BookMetadata[]>();
+  for (const book of books) {
+    if (!book.contentHash) continue;
+    const list = byHash.get(book.contentHash) || [];
+    list.push(book);
+    byHash.set(book.contentHash, list);
+  }
+
+  for (const [hash, list] of byHash.entries()) {
+    if (list.length < 2) continue;
+    for (const b of list) claimedIds.add(b.id);
+    groups.push({
+      id: `dup_hash_${hash.slice(0, 12)}`,
+      matchType: 'exact-hash',
+      reason: 'Identical file bytes (SHA-256 match)',
+      recommendedKeepId: pickRecommendedKeepBookId(list, annotations),
+      books: [...list].sort((a, b) => a.addedAt - b.addedAt),
+    });
+  }
+
+  // 2. Normalized metadata + format + (same fileSize or same author & pageCount) fallback
+  const byMeta = new Map<string, BookMetadata[]>();
+  for (const book of books) {
+    if (claimedIds.has(book.id)) continue;
+    const normTitle = book.title.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    if (!normTitle) continue;
+    const normAuthor = (book.author || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    const key =
+      book.fileSize > 0
+        ? `${book.format}|size:${book.fileSize}|${normTitle}`
+        : `${book.format}|meta:${normTitle}|${normAuthor}|${book.pageCount}`;
+    const list = byMeta.get(key) || [];
+    list.push(book);
+    byMeta.set(key, list);
+  }
+
+  for (const [key, list] of byMeta.entries()) {
+    if (list.length < 2) continue;
+    groups.push({
+      id: `dup_meta_${sanitizeId(key).slice(0, 24)}`,
+      matchType: 'metadata-match',
+      reason: 'Matching title, format, and file size',
+      recommendedKeepId: pickRecommendedKeepBookId(list, annotations),
+      books: [...list].sort((a, b) => a.addedAt - b.addedAt),
+    });
+  }
+
+  return groups;
 }

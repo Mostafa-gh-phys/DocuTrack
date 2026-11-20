@@ -163,15 +163,109 @@ function fastStripHtmlToText(rawHtml: string): string {
     .trim();
 }
 
+async function extractCoverFromLoadedZip(
+  zip: JSZip,
+  opfDoc: Document | null,
+  opfDir: string,
+  fallbackTitle?: string,
+  fallbackAuthor?: string,
+): Promise<string | undefined> {
+  if (typeof document === 'undefined') return undefined;
+  try {
+    if (opfDoc) {
+      const metaCoverId = opfDoc.querySelector('meta[name="cover"]')?.getAttribute('content');
+      const items = Array.from(opfDoc.querySelectorAll('manifest > item'));
+      const coverItem =
+        items.find((it) => (it.getAttribute('properties') || '').split(/\s+/).includes('cover-image')) ||
+        (metaCoverId ? items.find((it) => it.getAttribute('id') === metaCoverId) : undefined) ||
+        items.find((it) => {
+          const id = (it.getAttribute('id') || '').toLowerCase();
+          const href = (it.getAttribute('href') || '').toLowerCase();
+          const mt = (it.getAttribute('media-type') || '').toLowerCase();
+          return mt.startsWith('image/') && (id.includes('cover') || href.includes('cover'));
+        });
+
+      const coverHref = coverItem?.getAttribute('href');
+      if (coverHref) {
+        const resolved = resolvePath(opfDir, decodeURIComponent(coverHref));
+        const imgFile = zip.file(resolved);
+        if (imgFile) {
+          const blob = await imgFile.async('blob');
+          const objectUrl = URL.createObjectURL(blob);
+          try {
+            const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+              const el = new Image();
+              el.onload = () => resolve(el);
+              el.onerror = reject;
+              el.src = objectUrl;
+            });
+            const maxH = 300;
+            const scale = Math.min(1, maxH / Math.max(1, img.naturalHeight));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+            canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+              return canvas.toDataURL('image/jpeg', 0.78);
+            }
+          } finally {
+            URL.revokeObjectURL(objectUrl);
+          }
+        }
+      }
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = 220;
+    canvas.height = 310;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return undefined;
+    ctx.fillStyle = '#F5F0E6';
+    ctx.fillRect(0, 0, 220, 310);
+    ctx.strokeStyle = '#C9BDA6';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(12, 12, 196, 286);
+    ctx.fillStyle = '#7C6A53';
+    ctx.font = '600 10px monospace';
+    ctx.fillText('EPUB EDITION', 24, 40);
+    ctx.fillStyle = '#1E293B';
+    ctx.font = 'bold 18px Georgia, serif';
+    const words = (fallbackTitle || 'Untitled Book').split(/\s+/);
+    let line = '';
+    let y = 94;
+    for (const w of words) {
+      const next = line ? `${line} ${w}` : w;
+      if (ctx.measureText(next).width > 168) {
+        ctx.fillText(line, 24, y);
+        line = w;
+        y += 24;
+        if (y > 210) break;
+      } else {
+        line = next;
+      }
+    }
+    if (line && y <= 220) ctx.fillText(line, 24, y);
+    ctx.fillStyle = '#64748B';
+    ctx.font = 'italic 12px Georgia, serif';
+    ctx.fillText((fallbackAuthor || 'Unknown Author').slice(0, 26), 24, 268);
+    return canvas.toDataURL('image/jpeg', 0.78);
+  } catch {
+    return undefined;
+  }
+}
+
 export async function parseEpubQuickIndex(
   buffer: ArrayBuffer,
   maxSampleChapters = 10,
+  includeCover = true,
 ): Promise<{
   title?: string;
   author?: string;
   language?: string;
   chapterCount: number;
   chapters: {index: number; title: string; plainText: string}[];
+  coverDataUrl?: string;
 }> {
   const zip = await JSZip.loadAsync(buffer);
   const parser = new DOMParser();
@@ -245,19 +339,22 @@ export async function parseEpubQuickIndex(
   const sampleLimit = maxSampleChapters > 0 ? Math.min(spineHrefs.length, maxSampleChapters) : spineHrefs.length;
   const sampleHrefs = spineHrefs.slice(0, sampleLimit);
 
-  const sampled = await Promise.all(
-    sampleHrefs.map(async (href, i) => {
-      const chapterFile = zip.file(href);
-      const rawHtml = chapterFile ? await chapterFile.async('text') : '';
-      const plainText = fastStripHtmlToText(rawHtml);
-      const chTitle = tocTitleByHref.get(href) || `Chapter ${i + 1}`;
-      return {
-        index: i + 1,
-        title: chTitle,
-        plainText,
-      };
-    }),
-  );
+  const [sampled, coverDataUrl] = await Promise.all([
+    Promise.all(
+      sampleHrefs.map(async (href, i) => {
+        const chapterFile = zip.file(href);
+        const rawHtml = chapterFile ? await chapterFile.async('text') : '';
+        const plainText = fastStripHtmlToText(rawHtml);
+        const chTitle = tocTitleByHref.get(href) || `Chapter ${i + 1}`;
+        return {
+          index: i + 1,
+          title: chTitle,
+          plainText,
+        };
+      }),
+    ),
+    includeCover ? extractCoverFromLoadedZip(zip, opfDoc, opfDir, title, author) : Promise.resolve(undefined),
+  ]);
 
   return {
     title,
@@ -265,6 +362,7 @@ export async function parseEpubQuickIndex(
     language,
     chapterCount: spineHrefs.length,
     chapters: sampled,
+    coverDataUrl,
   };
 }
 
@@ -288,89 +386,9 @@ export async function extractEpubCoverThumbnail(
     }
 
     const opfFile = zip.file(opfPath);
-    if (opfFile) {
-      const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/')) : '';
-      const opfXml = await opfFile.async('text');
-      const opfDoc = parser.parseFromString(opfXml, 'application/xml');
-
-      const metaCoverId = opfDoc.querySelector('meta[name="cover"]')?.getAttribute('content');
-      const items = Array.from(opfDoc.querySelectorAll('manifest > item'));
-      const coverItem =
-        items.find((it) => (it.getAttribute('properties') || '').split(/\s+/).includes('cover-image')) ||
-        (metaCoverId ? items.find((it) => it.getAttribute('id') === metaCoverId) : undefined) ||
-        items.find((it) => {
-          const id = (it.getAttribute('id') || '').toLowerCase();
-          const href = (it.getAttribute('href') || '').toLowerCase();
-          const mt = (it.getAttribute('media-type') || '').toLowerCase();
-          return mt.startsWith('image/') && (id.includes('cover') || href.includes('cover'));
-        });
-
-      const coverHref = coverItem?.getAttribute('href');
-      if (coverHref) {
-        const resolved = resolvePath(opfDir, decodeURIComponent(coverHref));
-        const imgFile = zip.file(resolved);
-        if (imgFile) {
-          const blob = await imgFile.async('blob');
-          const objectUrl = URL.createObjectURL(blob);
-          try {
-            const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-              const el = new Image();
-              el.onload = () => resolve(el);
-              el.onerror = reject;
-              el.src = objectUrl;
-            });
-            const maxH = 360;
-            const scale = Math.min(1, maxH / Math.max(1, img.naturalHeight));
-            const canvas = document.createElement('canvas');
-            canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
-            canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
-            const ctx = canvas.getContext('2d');
-            if (ctx) {
-              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-              return canvas.toDataURL('image/jpeg', 0.84);
-            }
-          } finally {
-            URL.revokeObjectURL(objectUrl);
-          }
-        }
-      }
-    }
-
-    // Typographic editorial book cover fallback when EPUB archive has no embedded cover graphic
-    const canvas = document.createElement('canvas');
-    canvas.width = 240;
-    canvas.height = 340;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return undefined;
-    ctx.fillStyle = '#F5F0E6';
-    ctx.fillRect(0, 0, 240, 340);
-    ctx.strokeStyle = '#C9BDA6';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(14, 14, 212, 312);
-    ctx.fillStyle = '#7C6A53';
-    ctx.font = '600 11px monospace';
-    ctx.fillText('EPUB EDITION', 28, 44);
-    ctx.fillStyle = '#1E293B';
-    ctx.font = 'bold 20px Georgia, serif';
-    const words = (fallbackTitle || 'Untitled Book').split(/\s+/);
-    let line = '';
-    let y = 104;
-    for (const w of words) {
-      const next = line ? `${line} ${w}` : w;
-      if (ctx.measureText(next).width > 180) {
-        ctx.fillText(line, 28, y);
-        line = w;
-        y += 26;
-        if (y > 230) break;
-      } else {
-        line = next;
-      }
-    }
-    if (line && y <= 240) ctx.fillText(line, 28, y);
-    ctx.fillStyle = '#64748B';
-    ctx.font = 'italic 13px Georgia, serif';
-    ctx.fillText((fallbackAuthor || 'Unknown Author').slice(0, 28), 28, 294);
-    return canvas.toDataURL('image/jpeg', 0.84);
+    const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/')) : '';
+    const opfDoc = opfFile ? parser.parseFromString(await opfFile.async('text'), 'application/xml') : null;
+    return await extractCoverFromLoadedZip(zip, opfDoc, opfDir, fallbackTitle, fallbackAuthor);
   } catch {
     return undefined;
   }

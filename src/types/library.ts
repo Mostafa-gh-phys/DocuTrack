@@ -36,6 +36,8 @@ export type ReaderFontFamily =
   | 'mono';
 
 export type EpubViewMode = 'scroll' | 'paginated' | 'spread';
+export type PageLayoutMode = 'single' | 'vertical' | 'horizontal' | 'double';
+export type ReadingDirection = 'ltr' | 'rtl';
 
 export type ScanPreset = 'original' | 'clean-scan' | 'high-contrast' | 'bleed-reduce';
 
@@ -80,6 +82,7 @@ export interface BookMetadata {
   coverUrl?: string;
   excerpt?: string;
   language?: string;
+  contentHash?: string;
   addedAt: number;
   lastOpenedAt?: number;
   updatedAtMs: number;
@@ -142,6 +145,8 @@ export interface ReaderPreferences {
   maxWidth: number;
   columnCount: 1 | 2;
   epubViewMode?: EpubViewMode;
+  pageLayoutMode?: PageLayoutMode;
+  readingDirection?: ReadingDirection;
   novelIndent?: boolean;
   novelJustify?: boolean;
   novelDropCap?: boolean;

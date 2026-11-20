@@ -5,6 +5,7 @@ import {AppearanceDialog} from './components/AppearanceDialog';
 import {ConverterView} from './components/ConverterView';
 import {CoursesHubView} from './components/CoursesHubView';
 import {DocuTrackLogo} from './components/DocuTrackLogo';
+import {DuplicatesModal} from './components/DuplicatesModal';
 import {ImportModal} from './components/ImportModal';
 import {LibrarySidebar} from './components/LibrarySidebar';
 import {LibraryView} from './components/LibraryView';
@@ -46,8 +47,8 @@ import {
   calculateProgress,
   createDefaultReadingGoal,
   detectSupportedBookFormat,
+  findDuplicateBookGroups,
   recordReadingActivity,
-  runWithConcurrency,
   sanitizeId,
   searchLocalSemanticChunks,
   sortAndFilterBooks,
@@ -73,6 +74,7 @@ import {
   saveCourseLocal,
   savePreferencesLocal,
   saveReadingGoalLocal,
+  scanAndBackfillBookHashes,
 } from './utils/offlineStorage';
 import {isDarkUiTheme} from './utils/themeTokens';
 
@@ -114,11 +116,13 @@ export default function App() {
 
   // Unified modals & converter selection
   const [importModalOpen, setImportModalOpen] = useState(false);
+  const [duplicatesOpen, setDuplicatesOpen] = useState(false);
   const [appearanceOpen, setAppearanceOpen] = useState(false);
   const [converterBookId, setConverterBookId] = useState<string | null>(null);
   const pendingUploadFolderRef = useRef<string | undefined>(undefined);
 
   // Library filters & sort state
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [activeCollection, setActiveCollection] = useState<LibraryCollection>('all');
   const [activeFolder, setActiveFolder] = useState<string | null>(null);
   const [activeFormat, setActiveFormat] = useState<BookFormat | 'all'>('all');
@@ -135,6 +139,9 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [syncStatus, setSyncStatus] = useState('Local library ready');
   const [importNotice, setImportNotice] = useState<string | null>(null);
+  const [importProgress, setImportProgress] = useState<{done: number; total: number; currentName: string} | null>(null);
+  const cancelImportRef = useRef(false);
+  const importNoticeTimerRef = useRef<number | null>(null);
 
   // Automated local disk backup handle
   const backupDirHandleRef = useRef<DirectoryHandleLike | null>(null);
@@ -341,55 +348,108 @@ export default function App() {
     [books, openBookId],
   );
 
+  const duplicateRemovableCount = useMemo(() => {
+    const groups = findDuplicateBookGroups(books, annotations);
+    return groups.reduce((acc, g) => acc + Math.max(0, g.books.length - 1), 0);
+  }, [books, annotations]);
+
   const handleImportFileList = async (files: FileList | File[], fallbackFolder?: string) => {
     const supportedFiles = Array.from(files).filter((f) => detectSupportedBookFormat(f.name) !== null);
+    if (importNoticeTimerRef.current) {
+      window.clearTimeout(importNoticeTimerRef.current);
+      importNoticeTimerRef.current = null;
+    }
+
     if (supportedFiles.length === 0) {
       setImportNotice('No supported PDF, EPUB, or DjVu files were found in the selection.');
-      window.setTimeout(() => setImportNotice(null), 4500);
+      importNoticeTimerRef.current = window.setTimeout(() => setImportNotice(null), 4500);
       return;
     }
 
     const ownerId = user?.uid || 'local';
-    setImportNotice(
-      `Importing ${supportedFiles.length} document${supportedFiles.length > 1 ? 's' : ''}...`,
-    );
+    const isBulkBatch = supportedFiles.length > 4;
+    const samplePageLimit = isBulkBatch ? 2 : 6;
+    cancelImportRef.current = false;
 
-    const results = await runWithConcurrency(supportedFiles, 3, async (file) => {
-      const rel = (file as File & {webkitRelativePath?: string}).webkitRelativePath;
-      const explicitFolder = rel && rel.includes('/') ? undefined : fallbackFolder;
-      const res = await ingestImportedFile(file, ownerId, explicitFolder);
-      if (res && user?.emailVerified && isOnline && !simulatedOffline) {
-        void syncBookToCloud(user.uid, res.book);
+    const allSuccessful: NonNullable<Awaited<ReturnType<typeof ingestImportedFile>>>[] = [];
+    let pendingBooks: BookMetadata[] = [];
+    let pendingChunks: DocumentTextChunk[] = [];
+    let pendingCovers: Record<string, string> = {};
+
+    const flushBatchToState = () => {
+      if (pendingBooks.length === 0) return;
+      const booksBatch = pendingBooks;
+      const chunksBatch = pendingChunks;
+      const coversBatch = pendingCovers;
+      pendingBooks = [];
+      pendingChunks = [];
+      pendingCovers = {};
+
+      setBooks((prev) => [...booksBatch, ...prev]);
+      if (Object.keys(coversBatch).length > 0) {
+        setBookCovers((prev) => ({...prev, ...coversBatch}));
       }
-      return res;
-    });
+      if (chunksBatch.length > 0) {
+        setTextChunks((prev) => [...chunksBatch, ...prev]);
+      }
+    };
 
-    const successful = results.filter(
-      (r): r is NonNullable<typeof r> => r !== null,
-    );
+    try {
+      for (let i = 0; i < supportedFiles.length; i++) {
+        if (cancelImportRef.current) break;
 
-    if (successful.length > 0) {
-      const newBooks = successful.map((r) => r.book);
-      const newChunks = successful.flatMap((r) => r.chunks);
-      const newCovers: Record<string, string> = {};
-      for (const r of successful) {
-        if (r.coverDataUrl) newCovers[r.book.id] = r.coverDataUrl;
+        const file = supportedFiles[i];
+        setImportProgress({done: i, total: supportedFiles.length, currentName: file.name});
+        setImportNotice(
+          `Importing ${i + 1} of ${supportedFiles.length}: ${file.name}`,
+        );
+
+        const rel = (file as File & {webkitRelativePath?: string}).webkitRelativePath;
+        const explicitFolder = rel && rel.includes('/') ? undefined : fallbackFolder;
+
+        try {
+          const res = await ingestImportedFile(file, ownerId, explicitFolder, {samplePageLimit});
+          if (res) {
+            allSuccessful.push(res);
+            pendingBooks.unshift(res.book);
+            pendingChunks.push(...res.chunks);
+            if (res.coverDataUrl) pendingCovers[res.book.id] = res.coverDataUrl;
+            if (user?.emailVerified && isOnline && !simulatedOffline) {
+              void syncBookToCloud(user.uid, res.book);
+            }
+          }
+        } catch (err) {
+          console.warn(`Skipped ${file.name} during import:`, err);
+        }
+
+        if (pendingBooks.length >= 4) {
+          flushBatchToState();
+        }
+
+        // Yield to UI event loop & GC between files so CPU/RAM stay bounded
+        if (i < supportedFiles.length - 1) {
+          await new Promise((r) => window.setTimeout(r, isBulkBatch ? 24 : 8));
+        }
       }
 
-      setBooks((prev) => [...newBooks, ...prev]);
-      if (Object.keys(newCovers).length > 0) {
-        setBookCovers((prev) => ({...prev, ...newCovers}));
-      }
-      setTextChunks((prev) => [...newChunks, ...prev]);
+      flushBatchToState();
+    } finally {
+      setImportProgress(null);
+    }
+
+    if (allSuccessful.length > 0) {
       setOfflineBytes(await estimateOfflineStorageBytes());
+      const wasCancelled = cancelImportRef.current;
       setImportNotice(
-        `Imported ${successful.length} document${successful.length > 1 ? 's' : ''} into your library.`,
+        wasCancelled
+          ? `Import stopped early — saved ${allSuccessful.length} of ${supportedFiles.length} documents.`
+          : `Imported ${allSuccessful.length} document${allSuccessful.length > 1 ? 's' : ''} into your library.`,
       );
       scheduleAutoBackup();
 
-      // Quietly index remaining pages of multi-page documents in background without blocking UI
-      const pendingIndex = successful.filter((r) => r.needsFullIndex);
-      if (pendingIndex.length > 0) {
+      // Only auto-run deep background text indexing for small imports (1..6 docs) so bulk imports stay lightweight
+      const pendingIndex = allSuccessful.filter((r) => r.needsFullIndex);
+      if (pendingIndex.length > 0 && allSuccessful.length <= 6) {
         window.setTimeout(() => {
           void (async () => {
             for (const item of pendingIndex) {
@@ -400,14 +460,19 @@ export default function App() {
                   ...fullChunks,
                 ]);
               }
+              await new Promise((r) => window.setTimeout(r, 250));
             }
           })();
-        }, 120);
+        }, 300);
       }
     } else {
-      setImportNotice('No supported PDF, EPUB, or DjVu files could be imported.');
+      setImportNotice(
+        cancelImportRef.current
+          ? 'Import cancelled.'
+          : 'No supported PDF, EPUB, or DjVu files could be imported.',
+      );
     }
-    window.setTimeout(() => setImportNotice(null), 4500);
+    importNoticeTimerRef.current = window.setTimeout(() => setImportNotice(null), 4500);
   };
 
   const handleImportDirectory = async () => {
@@ -549,6 +614,68 @@ export default function App() {
       void deleteBookFromCloud(user.uid, book.id);
     }
     scheduleAutoBackup();
+  };
+
+  const handleScanBookHashes = useCallback(async (): Promise<BookMetadata[]> => {
+    const enriched = await scanAndBackfillBookHashes(books);
+    setBooks(enriched);
+    return enriched;
+  }, [books]);
+
+  const handleDeleteDuplicates = async (
+    removals: {removeBook: BookMetadata; keepBookId: string}[],
+    preserveAnnotations: boolean,
+  ) => {
+    if (removals.length === 0) return;
+    const removeIds = new Set(removals.map((r) => r.removeBook.id));
+    const keepMap = new Map(removals.map((r) => [r.removeBook.id, r.keepBookId]));
+    const bookById = new Map(books.map((b) => [b.id, b]));
+
+    if (preserveAnnotations) {
+      const toMigrate = annotations.filter((a) => removeIds.has(a.bookId));
+      const migrated: Annotation[] = [];
+      for (const oldAnn of toMigrate) {
+        const targetBookId = keepMap.get(oldAnn.bookId);
+        if (!targetBookId || !bookById.has(targetBookId)) continue;
+        const now = Date.now();
+        const nextAnn: Annotation = {
+          ...oldAnn,
+          id: sanitizeId(`ann_${now}_${Math.random().toString(36).slice(2, 6)}`),
+          bookId: targetBookId,
+          createdAtMs: oldAnn.createdAtMs || now,
+          updatedAtMs: now,
+        };
+        migrated.push(nextAnn);
+        await saveAnnotationLocal(nextAnn);
+        await deleteAnnotationLocal(oldAnn.id);
+        if (user?.emailVerified && isOnline && !simulatedOffline) {
+          void syncAnnotationToCloud(user.uid, nextAnn);
+          void deleteAnnotationFromCloud(user.uid, oldAnn.id);
+        }
+      }
+      if (migrated.length > 0) {
+        setAnnotations((prev) => [
+          ...migrated,
+          ...prev.filter((a) => !removeIds.has(a.bookId)),
+        ]);
+      }
+    }
+
+    for (const item of removals) {
+      if (openBookId === item.removeBook.id) {
+        setOpenBookId(item.keepBookId);
+      }
+      await handleDeleteBook(item.removeBook);
+    }
+
+    if (importNoticeTimerRef.current) {
+      window.clearTimeout(importNoticeTimerRef.current);
+      importNoticeTimerRef.current = null;
+    }
+    setImportNotice(
+      `Removed ${removals.length} duplicate ${removals.length === 1 ? 'entry' : 'entries'} from your DocuTrack library.`,
+    );
+    importNoticeTimerRef.current = window.setTimeout(() => setImportNotice(null), 4500);
   };
 
   const handleAddAnnotation = (
@@ -878,6 +1005,15 @@ export default function App() {
         onClose={() => setAppearanceOpen(false)}
       />
 
+      <DuplicatesModal
+        open={duplicatesOpen}
+        books={books}
+        annotations={annotations}
+        onClose={() => setDuplicatesOpen(false)}
+        onScanHashes={handleScanBookHashes}
+        onDeleteDuplicates={handleDeleteDuplicates}
+      />
+
       {/* Strict 3-Zone Top Bar Contract */}
       <header className="h-16 px-6 app-surface border-b app-border flex items-center justify-between gap-8 shrink-0">
         {/* Zone 1: Single-element Brand Wordmark */}
@@ -969,15 +1105,28 @@ export default function App() {
                 'Offline Reading Mode active — all pinned PDF, EPUB, DjVu files, annotations, and study courses remain available from local IndexedDB.'}
             </span>
           </div>
-          {simulatedOffline && (
-            <button
-              type="button"
-              onClick={() => setSimulatedOffline(false)}
-              className="font-medium underline whitespace-nowrap"
-            >
-              Reconnect
-            </button>
-          )}
+          <div className="flex items-center gap-3 shrink-0">
+            {importProgress && (
+              <button
+                type="button"
+                onClick={() => {
+                  cancelImportRef.current = true;
+                }}
+                className="font-medium underline whitespace-nowrap"
+              >
+                Cancel ({importProgress.done}/{importProgress.total})
+              </button>
+            )}
+            {simulatedOffline && (
+              <button
+                type="button"
+                onClick={() => setSimulatedOffline(false)}
+                className="font-medium underline whitespace-nowrap"
+              >
+                Reconnect
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -995,6 +1144,8 @@ export default function App() {
               isOnline={isOnline}
               userEmail={user?.email || null}
               readingGoal={readingGoal}
+              collapsed={sidebarCollapsed}
+              onToggleCollapse={() => setSidebarCollapsed((prev) => !prev)}
               onSelectCollection={setActiveCollection}
               onSelectFolder={setActiveFolder}
               onSelectFormat={setActiveFormat}
@@ -1006,6 +1157,8 @@ export default function App() {
               <LibraryView
                 books={visibleBooks}
                 totalBooksCount={books.length}
+                folderTree={folderTree}
+                activeCollection={activeCollection}
                 bookCovers={bookCovers}
                 annotations={annotations}
                 courses={courses}
@@ -1018,6 +1171,7 @@ export default function App() {
                 sortBy={sortBy}
                 sortDirection={sortDirection}
                 viewMode={viewMode}
+                onSelectFolder={setActiveFolder}
                 onSearchChange={setSearchQuery}
                 onToggleSemanticMode={() => {
                   setSemanticMode((prev) => !prev);
@@ -1045,6 +1199,8 @@ export default function App() {
                 onDropFiles={async (files) => {
                   await handleImportFileList(files);
                 }}
+                onOpenDuplicatesModal={() => setDuplicatesOpen(true)}
+                duplicateCount={duplicateRemovableCount}
               />
             </div>
           </>

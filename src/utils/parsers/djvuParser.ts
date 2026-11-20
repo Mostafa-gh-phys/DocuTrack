@@ -20,6 +20,15 @@ export async function openDjvuDocument(buffer: ArrayBuffer): Promise<WasmDocumen
   return WasmDocument.from_bytes(bytes);
 }
 
+export function closeDjvuDocument(doc: WasmDocument | null | undefined): void {
+  if (!doc) return;
+  try {
+    (doc as unknown as {free?: () => void}).free?.();
+  } catch {
+    // Ignore double-free if WASM already reclaimed
+  }
+}
+
 export function extractDjvuPageTextRange(
   doc: WasmDocument,
   startPage: number,
