@@ -3,7 +3,9 @@ import {GoogleAuthProvider, getAuth, signInWithPopup, signOut, type User} from '
 import {
   collection,
   deleteDoc,
+  disableNetwork,
   doc,
+  enableNetwork,
   getDocFromServer,
   initializeFirestore,
   onSnapshot,
@@ -21,16 +23,51 @@ import {
   clampReadingGoalPayload,
 } from './utils/libraryLogic';
 
+export const isFirebaseConfigured = Boolean(
+  firebaseConfig?.apiKey &&
+    firebaseConfig?.projectId &&
+    firebaseConfig?.firestoreDatabaseId &&
+    firebaseConfig.projectId !== 'remixed-project-id' &&
+    !String(firebaseConfig.apiKey).startsWith('TODO'),
+);
+
 const app = initializeApp(firebaseConfig);
+// Force standard HTTPS long-polling so WebChannel streaming proxies/VPNs/Electron
+// never trigger "[code=unavailable]: Could not reach Cloud Firestore backend".
 export const db = initializeFirestore(
   app,
   {
-    experimentalAutoDetectLongPolling: true,
+    experimentalForceLongPolling: true,
     ignoreUndefinedProperties: true,
   },
   firebaseConfig.firestoreDatabaseId,
 );
 export const auth = getAuth(app);
+
+const isOfflineOrLocalFileProtocol = () =>
+  (typeof navigator !== 'undefined' && navigator.onLine === false) ||
+  (typeof window !== 'undefined' && window.location.protocol === 'file:');
+
+if (isOfflineOrLocalFileProtocol()) {
+  void disableNetwork(db).catch(() => {});
+}
+
+export async function enableCloudNetwork(): Promise<void> {
+  if (!isFirebaseConfigured || isOfflineOrLocalFileProtocol()) return;
+  try {
+    await enableNetwork(db);
+  } catch {
+    // Ignore transient network state errors
+  }
+}
+
+export async function disableCloudNetwork(): Promise<void> {
+  try {
+    await disableNetwork(db);
+  } catch {
+    // Ignore transient network state errors
+  }
+}
 
 export enum OperationType {
   CREATE = 'create',
@@ -84,17 +121,38 @@ export function handleFirestoreError(
   throw new Error(JSON.stringify(errInfo));
 }
 
-async function testConnection() {
-  if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+export async function testConnection(): Promise<boolean> {
+  if (!isFirebaseConfigured) {
+    console.error('Please check your Firebase configuration.');
+    return false;
+  }
+  if (isOfflineOrLocalFileProtocol()) {
+    return false;
+  }
   try {
+    await enableCloudNetwork();
     await getDocFromServer(doc(db, 'test', 'connection'));
+    return true;
   } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
+    const code =
+      error && typeof error === 'object' && 'code' in error ? String((error as {code?: unknown}).code) : '';
+    const message = error instanceof Error ? error.message : String(error);
+    // Security rules intentionally deny /test/connection, so permission-denied proves the server responded.
+    if (code === 'permission-denied') {
+      return true;
     }
+    if (
+      code === 'unavailable' ||
+      message.includes('the client is offline') ||
+      message.includes('Failed to get document from server')
+    ) {
+      console.warn('Cloud Firestore backend unreachable; operating in local-first mode.');
+      return false;
+    }
+    console.warn('Cloud Firestore connectivity check failed:', message);
+    return false;
   }
 }
-void testConnection();
 
 export async function signInWithGoogle(): Promise<User> {
   const provider = new GoogleAuthProvider();
@@ -103,10 +161,12 @@ export async function signInWithGoogle(): Promise<User> {
 }
 
 export async function signOutUser(): Promise<void> {
+  await disableCloudNetwork();
   await signOut(auth);
 }
 
 export async function ensureUserProfile(user: User): Promise<void> {
+  if (!isFirebaseConfigured) return;
   const path = `users/${user.uid}`;
   try {
     await setDoc(

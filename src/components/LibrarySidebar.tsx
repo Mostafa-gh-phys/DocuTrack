@@ -149,7 +149,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
       aria-label="Library navigation"
       data-collapsed={collapsed ? 'true' : 'false'}
       className={`w-full ${
-        collapsed ? 'lg:w-[58px]' : 'lg:w-[260px]'
+        collapsed ? 'lg:w-[54px]' : 'lg:w-[248px]'
       } shrink-0 border-b lg:border-b-0 lg:border-r app-border app-surface flex flex-col justify-between transition-[width] duration-150`}
     >
       <div className="lg:hidden px-4 py-2.5 flex items-center justify-between border-b app-border">
@@ -262,10 +262,10 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
         </div>
       )}
 
-      <div className={`${mobileOpen ? 'block' : 'hidden'} ${collapsed ? 'lg:hidden' : 'lg:block'} p-4 space-y-6 overflow-y-auto`}>
+      <div className={`${mobileOpen ? 'block' : 'hidden'} ${collapsed ? 'lg:hidden' : 'lg:block'} p-3.5 space-y-5 overflow-y-auto`}>
         <div>
           <div className="px-2 flex items-center justify-between">
-            <h2 className="text-xs font-semibold opacity-60 tracking-wide">Collections</h2>
+            <h2 className="text-[11px] font-semibold uppercase tracking-wider opacity-55">Collections</h2>
             <button
               type="button"
               onClick={onToggleCollapse}
@@ -276,7 +276,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
               <PanelLeftClose className="w-4 h-4" aria-hidden="true" />
             </button>
           </div>
-          <nav className="mt-2 space-y-1">
+          <nav className="mt-1.5 space-y-0.5">
             {collections.map((item) => {
               const active = activeCollection === item.id && activeFolder === null;
               return (
@@ -287,7 +287,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
                     onSelectCollection(item.id);
                     onSelectFolder(null);
                   }}
-                  className={`w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-sm transition-colors ${
+                  className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-[13px] transition-colors ${
                     active
                       ? 'accent-soft font-medium'
                       : 'opacity-85 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/5'
@@ -308,7 +308,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
 
         <div>
           <div className="px-2 flex items-center justify-between">
-            <h2 className="text-xs font-semibold opacity-60 tracking-wide">Drive Folder Tree</h2>
+            <h2 className="text-[11px] font-semibold uppercase tracking-wider opacity-55">Folders</h2>
             {activeFolder && (
               <button
                 type="button"

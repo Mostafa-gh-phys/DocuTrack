@@ -1,8 +1,10 @@
 import JSZip from 'jszip';
+import {releaseCanvasMemory, yieldToMain} from '../batchYield';
 
 export interface EpubChapter {
   index: number;
   id: string;
+  href: string;
   title: string;
   html: string;
   plainText: string;
@@ -13,12 +15,24 @@ export interface ParsedEpubDocument {
   author?: string;
   language?: string;
   chapters: EpubChapter[];
+  dispose: () => void;
 }
 
-function resolvePath(baseDir: string, relativePath: string): string {
-  const cleanRel = relativePath.split('#')[0];
-  if (!baseDir) return cleanRel;
-  const stack = baseDir.split('/').filter(Boolean);
+export function safeDecodeUri(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+export function resolveEpubPath(baseDir: string, relativePath: string): string {
+  const cleanRel = relativePath.split('#')[0].split('?')[0].replace(/\\/g, '/').trim();
+  if (!cleanRel) return '';
+  if (cleanRel.startsWith('/')) {
+    return cleanRel.replace(/^\/+/, '');
+  }
+  const stack = baseDir ? baseDir.replace(/\\/g, '/').split('/').filter(Boolean) : [];
   for (const part of cleanRel.split('/')) {
     if (part === '.' || !part) continue;
     if (part === '..') stack.pop();
@@ -27,19 +41,158 @@ function resolvePath(baseDir: string, relativePath: string): string {
   return stack.join('/');
 }
 
-function sanitizeChapterHtml(rawHtml: string): {html: string; plainText: string; extractedHeading?: string} {
+function findZipEntry(zip: JSZip, targetPath: string): JSZip.JSZipObject | null {
+  if (!targetPath) return null;
+  const normalized = targetPath.replace(/\\/g, '/').replace(/^\/+/, '');
+  const decoded = safeDecodeUri(normalized);
+
+  const direct = zip.file(normalized) || zip.file(decoded);
+  if (direct) return direct;
+
+  const lower = normalized.toLowerCase();
+  const decodedLower = decoded.toLowerCase();
+  for (const [key, entry] of Object.entries(zip.files)) {
+    if (entry.dir) continue;
+    const normKey = key.replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
+    if (normKey === lower || normKey === decodedLower || safeDecodeUri(normKey) === decodedLower) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+function getElementsByLocalName(root: Document | Element, localName: string): Element[] {
+  const target = localName.toLowerCase();
+  const out: Element[] = [];
+  const all = root.getElementsByTagName('*');
+  for (let i = 0; i < all.length; i++) {
+    const el = all[i];
+    if ((el.localName || el.nodeName.split(':').pop() || '').toLowerCase() === target) {
+      out.push(el);
+    }
+  }
+  return out;
+}
+
+function getFirstTextByLocalName(root: Document | Element, localName: string): string | undefined {
+  const matches = getElementsByLocalName(root, localName);
+  for (const m of matches) {
+    const val = m.textContent?.trim();
+    if (val) return val;
+  }
+  return undefined;
+}
+
+function guessMimeFromExt(path: string): string {
+  const ext = path.split('.').pop()?.toLowerCase() || '';
+  if (ext === 'png') return 'image/png';
+  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+  if (ext === 'gif') return 'image/gif';
+  if (ext === 'webp') return 'image/webp';
+  if (ext === 'svg') return 'image/svg+xml';
+  return 'application/octet-stream';
+}
+
+function isSafeExternalOrDataUrl(url: string): boolean {
+  const trimmed = url.trim().toLowerCase();
+  if (!trimmed) return false;
+  if (trimmed.startsWith('blob:') || trimmed.startsWith('data:image/')) return true;
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return true;
+  return false;
+}
+
+async function resolveAssetBlobUrl(
+  zip: JSZip,
+  chapterDir: string,
+  rawRef: string,
+  blobUrlCache: Map<string, string>,
+  createdBlobUrls: string[],
+): Promise<string | null> {
+  const trimmed = rawRef.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('#') || isSafeExternalOrDataUrl(trimmed)) return trimmed;
+  // Block dangerous schemes like javascript:, vbscript:, data:text/html
+  if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return null;
+
+  const resolved = resolveEpubPath(chapterDir, safeDecodeUri(trimmed));
+  if (!resolved) return null;
+
+  const cached = blobUrlCache.get(resolved.toLowerCase());
+  if (cached) return cached;
+
+  const entry = findZipEntry(zip, resolved);
+  if (!entry) return null;
+
+  try {
+    const bytes = await entry.async('uint8array');
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    const mime = guessMimeFromExt(resolved);
+    const blobUrl = URL.createObjectURL(new Blob([copy], {type: mime}));
+    blobUrlCache.set(resolved.toLowerCase(), blobUrl);
+    createdBlobUrls.push(blobUrl);
+    return blobUrl;
+  } catch {
+    return null;
+  }
+}
+
+async function sanitizeAndHydrateChapterHtml(
+  rawHtml: string,
+  chapterHref: string,
+  zip: JSZip,
+  blobUrlCache: Map<string, string>,
+  createdBlobUrls: string[],
+): Promise<{html: string; plainText: string; extractedHeading?: string}> {
   const parser = new DOMParser();
   const doc = parser.parseFromString(rawHtml, 'text/html');
+  const chapterDir = chapterHref.includes('/') ? chapterHref.slice(0, chapterHref.lastIndexOf('/')) : '';
 
-  // Remove unsafe or distracting tags
-  doc.querySelectorAll('script, style, iframe, object, embed, link').forEach((el) => el.remove());
-  doc.querySelectorAll('*').forEach((el) => {
+  // Remove executable/unsafe elements
+  doc.querySelectorAll('script, style, iframe, object, embed, link, base').forEach((el) => el.remove());
+
+  const elements = Array.from(doc.querySelectorAll('*'));
+  for (const el of elements) {
     for (const attr of Array.from(el.attributes)) {
-      if (attr.name.toLowerCase().startsWith('on')) {
+      const lowerName = attr.name.toLowerCase();
+      if (lowerName.startsWith('on')) {
         el.removeAttribute(attr.name);
+        continue;
+      }
+      if ((lowerName === 'href' || lowerName === 'xlink:href') && el.tagName.toLowerCase() === 'a') {
+        const v = attr.value.trim().toLowerCase();
+        if (v.startsWith('javascript:') || v.startsWith('vbscript:') || v.startsWith('data:text/html')) {
+          el.removeAttribute(attr.name);
+        }
       }
     }
-  });
+
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'img') {
+      const src = el.getAttribute('src');
+      if (src) {
+        const hydrated = await resolveAssetBlobUrl(zip, chapterDir, src, blobUrlCache, createdBlobUrls);
+        if (hydrated) {
+          el.setAttribute('src', hydrated);
+          el.setAttribute('loading', 'lazy');
+        } else {
+          el.removeAttribute('src');
+        }
+      }
+    } else if (tag === 'image') {
+      const href = el.getAttribute('xlink:href') || el.getAttribute('href');
+      if (href) {
+        const hydrated = await resolveAssetBlobUrl(zip, chapterDir, href, blobUrlCache, createdBlobUrls);
+        if (hydrated) {
+          el.setAttribute('href', hydrated);
+          el.setAttribute('xlink:href', hydrated);
+        } else {
+          el.removeAttribute('href');
+          el.removeAttribute('xlink:href');
+        }
+      }
+    }
+  }
 
   const headingEl = doc.querySelector('h1, h2, h3, title');
   const extractedHeading = headingEl?.textContent?.trim() || undefined;
@@ -50,103 +203,243 @@ function sanitizeChapterHtml(rawHtml: string): {html: string; plainText: string;
   return {html, plainText, extractedHeading};
 }
 
-export async function parseEpubDocument(buffer: ArrayBuffer): Promise<ParsedEpubDocument> {
-  const zip = await JSZip.loadAsync(buffer);
-  const parser = new DOMParser();
-
-  // 1. Locate OPF path from META-INF/container.xml
+async function locateOpfPackage(zip: JSZip, parser: DOMParser): Promise<{
+  opfPath: string;
+  opfDir: string;
+  opfDoc: Document | null;
+}> {
   let opfPath = 'OEBPS/content.opf';
-  const containerFile = zip.file('META-INF/container.xml');
+  const containerFile = findZipEntry(zip, 'META-INF/container.xml');
   if (containerFile) {
-    const containerXml = await containerFile.async('text');
-    const containerDoc = parser.parseFromString(containerXml, 'application/xml');
-    const rootfile = containerDoc.querySelector('rootfile');
-    const fullPath = rootfile?.getAttribute('full-path');
-    if (fullPath) opfPath = fullPath;
+    try {
+      const containerXml = await containerFile.async('text');
+      const containerDoc = parser.parseFromString(containerXml, 'application/xml');
+      const rootfiles = getElementsByLocalName(containerDoc, 'rootfile');
+      const fullPath = rootfiles[0]?.getAttribute('full-path');
+      if (fullPath) opfPath = fullPath;
+    } catch {
+      // Fall back to archive scan below
+    }
   }
 
-  const opfFile = zip.file(opfPath);
+  let opfFile = findZipEntry(zip, opfPath);
   if (!opfFile) {
-    throw new Error('Invalid EPUB archive: missing content.opf');
+    // Scan archive for first .opf file regardless of case or subfolder
+    for (const [key, entry] of Object.entries(zip.files)) {
+      if (!entry.dir && key.toLowerCase().endsWith('.opf')) {
+        opfPath = key;
+        opfFile = entry;
+        break;
+      }
+    }
+  }
+
+  if (!opfFile) {
+    return {opfPath, opfDir: '', opfDoc: null};
   }
 
   const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/')) : '';
   const opfXml = await opfFile.async('text');
   const opfDoc = parser.parseFromString(opfXml, 'application/xml');
+  return {opfPath, opfDir, opfDoc};
+}
 
-  const getMetaText = (selector: string): string | undefined => {
-    const el = opfDoc.querySelector(selector);
-    const val = el?.textContent?.trim();
-    return val || undefined;
+async function buildTocTitleMap(
+  zip: JSZip,
+  parser: DOMParser,
+  opfDoc: Document,
+  opfDir: string,
+  manifest: Map<string, {href: string; mediaType: string; properties: string}>,
+): Promise<Map<string, string>> {
+  const tocTitleByHref = new Map<string, string>();
+
+  // 1. EPUB 2 NCX TOC
+  const spineEl = getElementsByLocalName(opfDoc, 'spine')[0];
+  const ncxId = spineEl?.getAttribute('toc') || '';
+  const ncxEntry =
+    (ncxId ? manifest.get(ncxId) : undefined) ||
+    Array.from(manifest.values()).find((m) => m.href.toLowerCase().endsWith('.ncx'));
+
+  if (ncxEntry) {
+    const ncxFile = findZipEntry(zip, ncxEntry.href);
+    if (ncxFile) {
+      try {
+        const ncxXml = await ncxFile.async('text');
+        const ncxDoc = parser.parseFromString(ncxXml, 'application/xml');
+        const ncxDir = ncxEntry.href.includes('/') ? ncxEntry.href.slice(0, ncxEntry.href.lastIndexOf('/')) : '';
+        for (const np of getElementsByLocalName(ncxDoc, 'navPoint')) {
+          const label = getFirstTextByLocalName(np, 'text');
+          const contentEl = getElementsByLocalName(np, 'content')[0];
+          const src = contentEl?.getAttribute('src');
+          if (label && src) {
+            const resolved = resolveEpubPath(ncxDir, safeDecodeUri(src));
+            if (resolved && !tocTitleByHref.has(resolved.toLowerCase())) {
+              tocTitleByHref.set(resolved.toLowerCase(), label);
+            }
+          }
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+  }
+
+  // 2. EPUB 3 HTML <nav epub:type="toc">
+  const navEntry = Array.from(manifest.values()).find((m) =>
+    m.properties.toLowerCase().split(/\s+/).includes('nav'),
+  );
+  if (navEntry) {
+    const navFile = findZipEntry(zip, navEntry.href);
+    if (navFile) {
+      try {
+        const navHtml = await navFile.async('text');
+        const navDoc = parser.parseFromString(navHtml, 'text/html');
+        const navDir = navEntry.href.includes('/') ? navEntry.href.slice(0, navEntry.href.lastIndexOf('/')) : '';
+        const navEl =
+          navDoc.querySelector('nav[epub\\:type="toc"], nav[role="doc-toc"], nav') || navDoc.body;
+        navEl?.querySelectorAll('a[href]').forEach((a) => {
+          const href = a.getAttribute('href');
+          const label = a.textContent?.replace(/\s+/g, ' ').trim();
+          if (href && label) {
+            const resolved = resolveEpubPath(navDir, safeDecodeUri(href)).toLowerCase();
+            if (resolved && !tocTitleByHref.has(resolved)) {
+              tocTitleByHref.set(resolved, label);
+            }
+          }
+        });
+      } catch {
+        // Non-fatal
+      }
+    }
+  }
+
+  // Also map relative to opfDir if TOC entries used relative names
+  void opfDir;
+  return tocTitleByHref;
+}
+
+export async function parseEpubDocument(buffer: ArrayBuffer): Promise<ParsedEpubDocument> {
+  const zip = await JSZip.loadAsync(buffer);
+  const parser = new DOMParser();
+  const createdBlobUrls: string[] = [];
+  const blobUrlCache = new Map<string, string>();
+
+  const dispose = () => {
+    for (const u of createdBlobUrls) {
+      try {
+        URL.revokeObjectURL(u);
+      } catch {
+        // Ignore already revoked
+      }
+    }
+    createdBlobUrls.length = 0;
+    blobUrlCache.clear();
   };
 
-  const title = getMetaText('title, dc\\:title');
-  const author = getMetaText('creator, dc\\:creator');
-  const language = getMetaText('language, dc\\:language');
+  try {
+    const {opfDir, opfDoc} = await locateOpfPackage(zip, parser);
 
-  // 2. Build manifest lookup
-  const manifest = new Map<string, {href: string; mediaType: string}>();
-  opfDoc.querySelectorAll('manifest > item').forEach((item) => {
-    const id = item.getAttribute('id');
-    const href = item.getAttribute('href');
-    const mediaType = item.getAttribute('media-type') || '';
-    if (id && href) {
-      manifest.set(id, {href: resolvePath(opfDir, decodeURIComponent(href)), mediaType});
-    }
-  });
+    let title: string | undefined;
+    let author: string | undefined;
+    let language: string | undefined;
+    let tocTitleByHref = new Map<string, string>();
+    let orderedEntries: {id: string; href: string}[] = [];
 
-  // 3. Parse NCX TOC titles if available
-  const tocTitleByHref = new Map<string, string>();
-  const spineEl = opfDoc.querySelector('spine');
-  const ncxId = spineEl?.getAttribute('toc');
-  const ncxEntry = (ncxId && manifest.get(ncxId)) || Array.from(manifest.values()).find((m) => m.href.endsWith('.ncx'));
-  if (ncxEntry) {
-    const ncxFile = zip.file(ncxEntry.href);
-    if (ncxFile) {
-      const ncxXml = await ncxFile.async('text');
-      const ncxDoc = parser.parseFromString(ncxXml, 'application/xml');
-      const ncxDir = ncxEntry.href.includes('/') ? ncxEntry.href.slice(0, ncxEntry.href.lastIndexOf('/')) : '';
-      ncxDoc.querySelectorAll('navPoint').forEach((np) => {
-        const label = np.querySelector('navLabel > text')?.textContent?.trim();
-        const src = np.querySelector('content')?.getAttribute('src');
-        if (label && src) {
-          tocTitleByHref.set(resolvePath(ncxDir, decodeURIComponent(src)), label);
+    if (opfDoc) {
+      title = getFirstTextByLocalName(opfDoc, 'title');
+      author = getFirstTextByLocalName(opfDoc, 'creator');
+      language = getFirstTextByLocalName(opfDoc, 'language');
+
+      const manifest = new Map<string, {href: string; mediaType: string; properties: string}>();
+      for (const item of getElementsByLocalName(opfDoc, 'item')) {
+        const id = item.getAttribute('id');
+        const href = item.getAttribute('href');
+        const mediaType = item.getAttribute('media-type') || '';
+        const properties = item.getAttribute('properties') || '';
+        if (id && href) {
+          manifest.set(id, {
+            href: resolveEpubPath(opfDir, safeDecodeUri(href)),
+            mediaType,
+            properties,
+          });
         }
-      });
+      }
+
+      tocTitleByHref = await buildTocTitleMap(zip, parser, opfDoc, opfDir, manifest);
+
+      const spineRefs = getElementsByLocalName(opfDoc, 'itemref')
+        .map((ref) => ref.getAttribute('idref'))
+        .filter((id): id is string => Boolean(id));
+
+      for (const idref of spineRefs) {
+        const entry = manifest.get(idref);
+        if (entry) orderedEntries.push({id: idref, href: entry.href});
+      }
+
+      if (orderedEntries.length === 0) {
+        for (const [id, entry] of manifest.entries()) {
+          if (
+            entry.mediaType.includes('html') ||
+            /\.(xhtml|html|htm)$/i.test(entry.href)
+          ) {
+            orderedEntries.push({id, href: entry.href});
+          }
+        }
+      }
     }
+
+    // Last-resort archive scan for malformed EPUBs missing OPF/spine
+    if (orderedEntries.length === 0) {
+      const htmlKeys = Object.keys(zip.files)
+        .filter((k) => !zip.files[k].dir && /\.(xhtml|html|htm)$/i.test(k) && !/nav\.xhtml$/i.test(k))
+        .sort((a, b) => a.localeCompare(b, undefined, {numeric: true}));
+      orderedEntries = htmlKeys.map((href, idx) => ({id: `sec_${idx + 1}`, href}));
+    }
+
+    const chapters: EpubChapter[] = [];
+    for (let i = 0; i < orderedEntries.length; i++) {
+      const entry = orderedEntries[i];
+      const chapterFile = findZipEntry(zip, entry.href);
+      if (!chapterFile) continue;
+
+      const rawHtml = await chapterFile.async('text');
+      const {html, plainText, extractedHeading} = await sanitizeAndHydrateChapterHtml(
+        rawHtml,
+        entry.href,
+        zip,
+        blobUrlCache,
+        createdBlobUrls,
+      );
+
+      // Skip totally empty structural wrappers only if non-HTML or 0 text & 0 images
+      if (!plainText && !/<img|<svg/i.test(html)) continue;
+
+      const chapterTitle =
+        tocTitleByHref.get(entry.href.toLowerCase()) || extractedHeading || `Chapter ${chapters.length + 1}`;
+
+      chapters.push({
+        index: chapters.length + 1,
+        id: entry.id,
+        href: entry.href,
+        title: chapterTitle,
+        html,
+        plainText,
+      });
+
+      if (i % 10 === 9) {
+        await yieldToMain(0);
+      }
+    }
+
+    if (chapters.length === 0) {
+      throw new Error('EPUB archive contains no readable HTML or XHTML chapters.');
+    }
+
+    return {title, author, language, chapters, dispose};
+  } catch (err) {
+    dispose();
+    throw err;
   }
-
-  // 4. Walk spine items
-  const spineRefs = Array.from(opfDoc.querySelectorAll('spine > itemref'))
-    .map((ref) => ref.getAttribute('idref'))
-    .filter((id): id is string => Boolean(id));
-
-  const chapters: EpubChapter[] = [];
-  for (let i = 0; i < spineRefs.length; i++) {
-    const entry = manifest.get(spineRefs[i]);
-    if (!entry) continue;
-    const chapterFile = zip.file(entry.href);
-    if (!chapterFile) continue;
-
-    const rawHtml = await chapterFile.async('text');
-    const {html, plainText, extractedHeading} = sanitizeChapterHtml(rawHtml);
-    const chapterTitle =
-      tocTitleByHref.get(entry.href) || extractedHeading || `Chapter ${chapters.length + 1}`;
-
-    chapters.push({
-      index: chapters.length + 1,
-      id: spineRefs[i],
-      title: chapterTitle,
-      html,
-      plainText,
-    });
-  }
-
-  if (chapters.length === 0) {
-    throw new Error('EPUB contains no readable chapters in spine');
-  }
-
-  return {title, author, language, chapters};
 }
 
 function fastStripHtmlToText(rawHtml: string): string {
@@ -171,12 +464,17 @@ async function extractCoverFromLoadedZip(
   fallbackAuthor?: string,
 ): Promise<string | undefined> {
   if (typeof document === 'undefined') return undefined;
+  const coverCanvas = document.createElement('canvas');
   try {
     if (opfDoc) {
-      const metaCoverId = opfDoc.querySelector('meta[name="cover"]')?.getAttribute('content');
-      const items = Array.from(opfDoc.querySelectorAll('manifest > item'));
+      const metaEls = getElementsByLocalName(opfDoc, 'meta');
+      const metaCoverId = metaEls
+        .find((m) => (m.getAttribute('name') || '').toLowerCase() === 'cover')
+        ?.getAttribute('content');
+
+      const items = getElementsByLocalName(opfDoc, 'item');
       const coverItem =
-        items.find((it) => (it.getAttribute('properties') || '').split(/\s+/).includes('cover-image')) ||
+        items.find((it) => (it.getAttribute('properties') || '').toLowerCase().split(/\s+/).includes('cover-image')) ||
         (metaCoverId ? items.find((it) => it.getAttribute('id') === metaCoverId) : undefined) ||
         items.find((it) => {
           const id = (it.getAttribute('id') || '').toLowerCase();
@@ -187,8 +485,8 @@ async function extractCoverFromLoadedZip(
 
       const coverHref = coverItem?.getAttribute('href');
       if (coverHref) {
-        const resolved = resolvePath(opfDir, decodeURIComponent(coverHref));
-        const imgFile = zip.file(resolved);
+        const resolved = resolveEpubPath(opfDir, safeDecodeUri(coverHref));
+        const imgFile = findZipEntry(zip, resolved);
         if (imgFile) {
           const blob = await imgFile.async('blob');
           const objectUrl = URL.createObjectURL(blob);
@@ -201,13 +499,12 @@ async function extractCoverFromLoadedZip(
             });
             const maxH = 300;
             const scale = Math.min(1, maxH / Math.max(1, img.naturalHeight));
-            const canvas = document.createElement('canvas');
-            canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
-            canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
-            const ctx = canvas.getContext('2d');
+            coverCanvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+            coverCanvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+            const ctx = coverCanvas.getContext('2d');
             if (ctx) {
-              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-              return canvas.toDataURL('image/jpeg', 0.78);
+              ctx.drawImage(img, 0, 0, coverCanvas.width, coverCanvas.height);
+              return coverCanvas.toDataURL('image/jpeg', 0.78);
             }
           } finally {
             URL.revokeObjectURL(objectUrl);
@@ -216,10 +513,9 @@ async function extractCoverFromLoadedZip(
       }
     }
 
-    const canvas = document.createElement('canvas');
-    canvas.width = 220;
-    canvas.height = 310;
-    const ctx = canvas.getContext('2d');
+    coverCanvas.width = 220;
+    coverCanvas.height = 310;
+    const ctx = coverCanvas.getContext('2d');
     if (!ctx) return undefined;
     ctx.fillStyle = '#F5F0E6';
     ctx.fillRect(0, 0, 220, 310);
@@ -249,9 +545,11 @@ async function extractCoverFromLoadedZip(
     ctx.fillStyle = '#64748B';
     ctx.font = 'italic 12px Georgia, serif';
     ctx.fillText((fallbackAuthor || 'Unknown Author').slice(0, 26), 24, 268);
-    return canvas.toDataURL('image/jpeg', 0.78);
+    return coverCanvas.toDataURL('image/jpeg', 0.78);
   } catch {
     return undefined;
+  } finally {
+    releaseCanvasMemory(coverCanvas);
   }
 }
 
@@ -269,92 +567,75 @@ export async function parseEpubQuickIndex(
 }> {
   const zip = await JSZip.loadAsync(buffer);
   const parser = new DOMParser();
+  const {opfDir, opfDoc} = await locateOpfPackage(zip, parser);
 
-  let opfPath = 'OEBPS/content.opf';
-  const containerFile = zip.file('META-INF/container.xml');
-  if (containerFile) {
-    const containerXml = await containerFile.async('text');
-    const containerDoc = parser.parseFromString(containerXml, 'application/xml');
-    const fullPath = containerDoc.querySelector('rootfile')?.getAttribute('full-path');
-    if (fullPath) opfPath = fullPath;
-  }
+  let title: string | undefined;
+  let author: string | undefined;
+  let language: string | undefined;
+  let tocTitleByHref = new Map<string, string>();
+  let spineHrefs: string[] = [];
 
-  const opfFile = zip.file(opfPath);
-  if (!opfFile) {
-    throw new Error('Invalid EPUB archive: missing content.opf');
-  }
+  if (opfDoc) {
+    title = getFirstTextByLocalName(opfDoc, 'title');
+    author = getFirstTextByLocalName(opfDoc, 'creator');
+    language = getFirstTextByLocalName(opfDoc, 'language');
 
-  const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/')) : '';
-  const opfXml = await opfFile.async('text');
-  const opfDoc = parser.parseFromString(opfXml, 'application/xml');
-
-  const getMetaText = (selector: string): string | undefined => {
-    const val = opfDoc.querySelector(selector)?.textContent?.trim();
-    return val || undefined;
-  };
-
-  const title = getMetaText('title, dc\\:title');
-  const author = getMetaText('creator, dc\\:creator');
-  const language = getMetaText('language, dc\\:language');
-
-  const manifest = new Map<string, string>();
-  opfDoc.querySelectorAll('manifest > item').forEach((item) => {
-    const id = item.getAttribute('id');
-    const href = item.getAttribute('href');
-    if (id && href) {
-      manifest.set(id, resolvePath(opfDir, decodeURIComponent(href)));
+    const manifest = new Map<string, {href: string; mediaType: string; properties: string}>();
+    for (const item of getElementsByLocalName(opfDoc, 'item')) {
+      const id = item.getAttribute('id');
+      const href = item.getAttribute('href');
+      const mediaType = item.getAttribute('media-type') || '';
+      const properties = item.getAttribute('properties') || '';
+      if (id && href) {
+        manifest.set(id, {
+          href: resolveEpubPath(opfDir, safeDecodeUri(href)),
+          mediaType,
+          properties,
+        });
+      }
     }
-  });
 
-  const tocTitleByHref = new Map<string, string>();
-  const ncxId = opfDoc.querySelector('spine')?.getAttribute('toc');
-  const ncxHref =
-    (ncxId && manifest.get(ncxId)) || Array.from(manifest.values()).find((href) => href.endsWith('.ncx'));
-  if (ncxHref) {
-    const ncxFile = zip.file(ncxHref);
-    if (ncxFile) {
-      const ncxXml = await ncxFile.async('text');
-      const ncxDoc = parser.parseFromString(ncxXml, 'application/xml');
-      const ncxDir = ncxHref.includes('/') ? ncxHref.slice(0, ncxHref.lastIndexOf('/')) : '';
-      ncxDoc.querySelectorAll('navPoint').forEach((np) => {
-        const label = np.querySelector('navLabel > text')?.textContent?.trim();
-        const src = np.querySelector('content')?.getAttribute('src');
-        if (label && src) {
-          tocTitleByHref.set(resolvePath(ncxDir, decodeURIComponent(src)), label);
-        }
-      });
+    tocTitleByHref = await buildTocTitleMap(zip, parser, opfDoc, opfDir, manifest);
+    spineHrefs = getElementsByLocalName(opfDoc, 'itemref')
+      .map((ref) => ref.getAttribute('idref'))
+      .filter((id): id is string => Boolean(id))
+      .map((id) => manifest.get(id)?.href)
+      .filter((href): href is string => Boolean(href));
+
+    if (spineHrefs.length === 0) {
+      spineHrefs = Array.from(manifest.values())
+        .filter((m) => m.mediaType.includes('html') || /\.(xhtml|html|htm)$/i.test(m.href))
+        .map((m) => m.href);
     }
   }
-
-  const spineHrefs = Array.from(opfDoc.querySelectorAll('spine > itemref'))
-    .map((ref) => ref.getAttribute('idref'))
-    .filter((id): id is string => Boolean(id))
-    .map((id) => manifest.get(id))
-    .filter((href): href is string => Boolean(href));
 
   if (spineHrefs.length === 0) {
-    throw new Error('EPUB contains no readable chapters in spine');
+    spineHrefs = Object.keys(zip.files)
+      .filter((k) => !zip.files[k].dir && /\.(xhtml|html|htm)$/i.test(k))
+      .sort((a, b) => a.localeCompare(b, undefined, {numeric: true}));
+  }
+
+  if (spineHrefs.length === 0) {
+    throw new Error('EPUB contains no readable chapters');
   }
 
   const sampleLimit = maxSampleChapters > 0 ? Math.min(spineHrefs.length, maxSampleChapters) : spineHrefs.length;
   const sampleHrefs = spineHrefs.slice(0, sampleLimit);
 
-  const [sampled, coverDataUrl] = await Promise.all([
-    Promise.all(
-      sampleHrefs.map(async (href, i) => {
-        const chapterFile = zip.file(href);
-        const rawHtml = chapterFile ? await chapterFile.async('text') : '';
-        const plainText = fastStripHtmlToText(rawHtml);
-        const chTitle = tocTitleByHref.get(href) || `Chapter ${i + 1}`;
-        return {
-          index: i + 1,
-          title: chTitle,
-          plainText,
-        };
-      }),
-    ),
-    includeCover ? extractCoverFromLoadedZip(zip, opfDoc, opfDir, title, author) : Promise.resolve(undefined),
-  ]);
+  const sampled: {index: number; title: string; plainText: string}[] = [];
+  for (let i = 0; i < sampleHrefs.length; i++) {
+    const href = sampleHrefs[i];
+    const chapterFile = findZipEntry(zip, href);
+    const rawHtml = chapterFile ? await chapterFile.async('text') : '';
+    const plainText = fastStripHtmlToText(rawHtml);
+    const chTitle = tocTitleByHref.get(href.toLowerCase()) || `Chapter ${i + 1}`;
+    sampled.push({index: i + 1, title: chTitle, plainText});
+    if (i % 8 === 7) await yieldToMain(0);
+  }
+
+  const coverDataUrl = includeCover
+    ? await extractCoverFromLoadedZip(zip, opfDoc, opfDir, title, author)
+    : undefined;
 
   return {
     title,
@@ -375,22 +656,9 @@ export async function extractEpubCoverThumbnail(
   try {
     const zip = await JSZip.loadAsync(buffer);
     const parser = new DOMParser();
-
-    let opfPath = 'OEBPS/content.opf';
-    const containerFile = zip.file('META-INF/container.xml');
-    if (containerFile) {
-      const containerXml = await containerFile.async('text');
-      const containerDoc = parser.parseFromString(containerXml, 'application/xml');
-      const fullPath = containerDoc.querySelector('rootfile')?.getAttribute('full-path');
-      if (fullPath) opfPath = fullPath;
-    }
-
-    const opfFile = zip.file(opfPath);
-    const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/')) : '';
-    const opfDoc = opfFile ? parser.parseFromString(await opfFile.async('text'), 'application/xml') : null;
+    const {opfDir, opfDoc} = await locateOpfPackage(zip, parser);
     return await extractCoverFromLoadedZip(zip, opfDoc, opfDir, fallbackTitle, fallbackAuthor);
   } catch {
     return undefined;
   }
 }
-

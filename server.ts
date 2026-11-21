@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import dns from 'node:dns/promises';
+import net from 'node:net';
 import express from 'express';
 import fs from 'fs';
 import http from 'http';
@@ -46,11 +48,105 @@ interface SearchChunkInput {
   text: string;
 }
 
+function isPrivateOrReservedIp(rawIp: string): boolean {
+  let ip = rawIp.trim().toLowerCase();
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  if (ip === '::1' || ip === '::' || ip === '0.0.0.0') return true;
+  if (net.isIPv6(ip)) {
+    // Block loopback, link-local (fe80::/10), unique-local (fc00::/7), multicast
+    if (ip.startsWith('fc') || ip.startsWith('fd') || ip.startsWith('fe8') || ip.startsWith('fe9') || ip.startsWith('fea') || ip.startsWith('feb') || ip.startsWith('ff')) {
+      return true;
+    }
+    return false;
+  }
+  if (!net.isIPv4(ip)) return true;
+  const parts = ip.split('.').map((n) => Number(n));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return true;
+  const [a, b] = parts;
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true; // Cloud metadata / link-local
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  return false;
+}
+
+async function assertSafeExternalUrl(rawUrl: string): Promise<URL> {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    throw new Error('Invalid remote endpoint URL.');
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error('Only HTTP and HTTPS remote endpoints are allowed.');
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal')
+  ) {
+    throw new Error('Private or local network hostnames are blocked.');
+  }
+  if (net.isIP(host)) {
+    if (isPrivateOrReservedIp(host)) {
+      throw new Error('Private, loopback, or metadata IP addresses are blocked.');
+    }
+    return parsed;
+  }
+  const records = await dns.lookup(host, {all: true});
+  if (!records || records.length === 0) {
+    throw new Error(`Could not resolve remote host "${host}".`);
+  }
+  for (const rec of records) {
+    if (isPrivateOrReservedIp(rec.address)) {
+      throw new Error('Remote endpoint resolves to a private or reserved network address.');
+    }
+  }
+  return parsed;
+}
+
+async function fetchExternalChecked(
+  initialUrl: string,
+  init: RequestInit,
+  maxRedirects = 2,
+): Promise<Response> {
+  let currentUrl = initialUrl;
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    const validated = await assertSafeExternalUrl(currentUrl);
+    const res = await fetch(validated.toString(), {
+      ...init,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (!loc || hop === maxRedirects) {
+        throw new Error(`Remote endpoint returned unexpected redirect (HTTP ${res.status}).`);
+      }
+      currentUrl = new URL(loc, validated).toString();
+      continue;
+    }
+    return res;
+  }
+  throw new Error('Too many redirects from remote endpoint.');
+}
+
 async function startServer() {
   const app = express();
   const port = Number(process.env.PORT) || 3000;
 
-  app.use(express.json({limit: '4mb'}));
+  const standardJson = express.json({limit: '4mb'});
+  const syncJson = express.json({limit: '12mb'});
+  app.use((req, res, next) => {
+    if (req.path === '/api/cloud/custom-sync') {
+      syncJson(req, res, next);
+    } else {
+      standardJson(req, res, next);
+    }
+  });
 
   app.get('/api/health', (_req, res) => {
     res.json({
@@ -311,6 +407,145 @@ async function startServer() {
       console.error('Gemini semantic search error:', error);
       const message = error instanceof Error ? error.message : 'Semantic search failed.';
       res.status(502).json({error: message});
+    }
+  });
+
+  // 4. Custom Cloud Storage Sync Proxy (WebDAV / Nextcloud / ownCloud / Custom HTTPS JSON)
+  app.post('/api/cloud/custom-sync', async (req, res) => {
+    const {action, provider, targetUrl, authType, username, secret, archive} = (req.body || {}) as {
+      action?: 'test' | 'pull' | 'push';
+      provider?: 'webdav' | 'custom-json';
+      targetUrl?: string;
+      authType?: 'basic' | 'bearer' | 'none';
+      username?: string;
+      secret?: string;
+      archive?: unknown;
+    };
+
+    if (action !== 'test' && action !== 'pull' && action !== 'push') {
+      res.status(400).json({error: 'Invalid sync action.'});
+      return;
+    }
+    if (!targetUrl || typeof targetUrl !== 'string') {
+      res.status(400).json({error: 'Remote target URL is required.'});
+      return;
+    }
+
+    const headers: Record<string, string> = {};
+    if (authType === 'basic' && (username || secret)) {
+      const token = Buffer.from(`${username || ''}:${secret || ''}`, 'utf8').toString('base64');
+      headers.Authorization = `Basic ${token}`;
+    } else if (authType === 'bearer' && secret) {
+      headers.Authorization = `Bearer ${secret}`;
+    }
+
+    try {
+      await assertSafeExternalUrl(targetUrl);
+
+      if (action === 'test') {
+        let remoteRes = await fetchExternalChecked(targetUrl, {
+          method: provider === 'webdav' ? 'PROPFIND' : 'HEAD',
+          headers: provider === 'webdav' ? {...headers, Depth: '0'} : headers,
+        });
+        if (remoteRes.status === 405 || remoteRes.status === 501) {
+          remoteRes = await fetchExternalChecked(targetUrl, {
+            method: 'GET',
+            headers,
+          });
+        }
+        if (remoteRes.status === 401 || remoteRes.status === 403) {
+          res.json({
+            ok: false,
+            status: remoteRes.status,
+            message: `Authentication rejected by server (HTTP ${remoteRes.status}). Check username / app password or token.`,
+          });
+          return;
+        }
+        const ok = (remoteRes.status >= 200 && remoteRes.status < 400) || remoteRes.status === 404;
+        res.json({
+          ok,
+          status: remoteRes.status,
+          message: ok
+            ? remoteRes.status === 404
+              ? 'Endpoint reachable (remote file will be created on first sync).'
+              : `Connected successfully (HTTP ${remoteRes.status}).`
+            : `Remote server returned HTTP ${remoteRes.status}.`,
+        });
+        return;
+      }
+
+      if (action === 'pull') {
+        const remoteRes = await fetchExternalChecked(targetUrl, {
+          method: 'GET',
+          headers: {...headers, Accept: 'application/json'},
+        });
+        if (remoteRes.status === 404) {
+          res.json({found: false});
+          return;
+        }
+        if (!remoteRes.ok) {
+          res.status(remoteRes.status >= 400 && remoteRes.status < 600 ? remoteRes.status : 502).json({
+            error: `Pull failed: remote endpoint returned HTTP ${remoteRes.status}.`,
+          });
+          return;
+        }
+        const text = await remoteRes.text();
+        if (!text.trim()) {
+          res.json({found: false});
+          return;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          res.status(502).json({error: 'Remote sync endpoint did not return valid JSON.'});
+          return;
+        }
+        res.json({found: true, archive: parsed});
+        return;
+      }
+
+      // action === 'push'
+      if (!archive || typeof archive !== 'object') {
+        res.status(400).json({error: 'Valid backup archive payload is required for push.'});
+        return;
+      }
+      const bodyText = JSON.stringify(archive);
+
+      if (provider === 'webdav') {
+        const lastSlash = targetUrl.lastIndexOf('/');
+        if (lastSlash > 8) {
+          const parentDir = targetUrl.slice(0, lastSlash);
+          try {
+            await fetchExternalChecked(parentDir, {method: 'MKCOL', headers});
+          } catch {
+            // Directory already exists or server disallows redundant MKCOL
+          }
+        }
+      }
+
+      const remoteRes = await fetchExternalChecked(targetUrl, {
+        method: 'PUT',
+        headers: {
+          ...headers,
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: bodyText,
+      });
+      if (!remoteRes.ok) {
+        res.status(remoteRes.status >= 400 && remoteRes.status < 600 ? remoteRes.status : 502).json({
+          error: `Push failed: remote server returned HTTP ${remoteRes.status}.`,
+        });
+        return;
+      }
+      res.json({
+        status: remoteRes.status,
+        uploadedBytes: Buffer.byteLength(bodyText, 'utf8'),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Custom cloud sync request failed.';
+      const status = /blocked|invalid|required/i.test(msg) ? 400 : 502;
+      res.status(status).json({error: msg});
     }
   });
 

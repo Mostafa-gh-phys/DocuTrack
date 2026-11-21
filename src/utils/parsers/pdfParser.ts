@@ -1,4 +1,5 @@
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
+import {releaseCanvasMemory, yieldToMain} from '../batchYield';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/workers/pdf.worker.min.mjs';
 
@@ -54,7 +55,7 @@ export async function extractPdfOutlineAndMeta(doc: pdfjsLib.PDFDocumentProxy): 
       try {
         const rawOutline = await doc.getOutline();
         if (rawOutline) {
-          for (const item of rawOutline.slice(0, 30)) {
+          for (const item of rawOutline.slice(0, 40)) {
             let pageNum = 1;
             if (Array.isArray(item.dest) && item.dest[0]) {
               try {
@@ -92,19 +93,35 @@ export async function extractPdfPageTextRange(
   const end = Math.min(doc.numPages, endPage);
   if (end < start) return [];
 
-  const pageNumbers = Array.from({length: end - start + 1}, (_, i) => start + i);
-  return await Promise.all(
-    pageNumbers.map(async (pageNum) => {
-      const page = await doc.getPage(pageNum);
-      const content = await page.getTextContent();
-      const text = content.items
-        .map((item) => ('str' in item ? item.str : ''))
-        .join(' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-      return {page: pageNum, text};
-    }),
-  );
+  const results: {page: number; text: string}[] = [];
+  const batchSize = 4;
+
+  for (let batchStart = start; batchStart <= end; batchStart += batchSize) {
+    const batchEnd = Math.min(end, batchStart + batchSize - 1);
+    const nums = Array.from({length: batchEnd - batchStart + 1}, (_, i) => batchStart + i);
+    const batch = await Promise.all(
+      nums.map(async (pageNum) => {
+        const page = await doc.getPage(pageNum);
+        try {
+          const content = await page.getTextContent();
+          const text = content.items
+            .map((item) => ('str' in item ? item.str : ''))
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          return {page: pageNum, text};
+        } finally {
+          page.cleanup?.();
+        }
+      }),
+    );
+    results.push(...batch);
+    if (batchEnd < end) {
+      await yieldToMain(4);
+    }
+  }
+
+  return results;
 }
 
 export async function extractPdfMetadataAndText(
@@ -258,32 +275,37 @@ export async function renderPdfPageToCanvas(
 
 export async function extractPdfCoverThumbnail(doc: pdfjsLib.PDFDocumentProxy): Promise<string | undefined> {
   if (typeof document === 'undefined' || doc.numPages < 1) return undefined;
+  const canvas = document.createElement('canvas');
   try {
     const page = await doc.getPage(1);
-    const unscaled = page.getViewport({scale: 1});
-    const targetWidth = 220;
-    const scale = Math.max(0.2, Math.min(1.4, targetWidth / Math.max(1, unscaled.width)));
-    const viewport = page.getViewport({scale});
+    try {
+      const unscaled = page.getViewport({scale: 1});
+      const targetWidth = 220;
+      const scale = Math.max(0.2, Math.min(1.4, targetWidth / Math.max(1, unscaled.width)));
+      const viewport = page.getViewport({scale});
 
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.floor(viewport.width));
-    canvas.height = Math.max(1, Math.floor(viewport.height));
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return undefined;
+      canvas.width = Math.max(1, Math.floor(viewport.width));
+      canvas.height = Math.max(1, Math.floor(viewport.height));
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return undefined;
 
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    await page.render({
-      canvasContext: ctx,
-      viewport,
-      canvas,
-    }).promise;
+      await page.render({
+        canvasContext: ctx,
+        viewport,
+        canvas,
+      }).promise;
 
-    page.cleanup?.();
-    return canvas.toDataURL('image/jpeg', 0.76);
+      return canvas.toDataURL('image/jpeg', 0.76);
+    } finally {
+      page.cleanup?.();
+    }
   } catch {
     return undefined;
+  } finally {
+    releaseCanvasMemory(canvas);
   }
 }
 

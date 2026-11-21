@@ -109,6 +109,7 @@ export default defineConfig(() => {
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
+        'pngjs/browser': path.resolve(__dirname, 'src/utils/parsers/pngjsStub.ts'),
       },
     },
     server: {

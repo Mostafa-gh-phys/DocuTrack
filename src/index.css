@@ -255,6 +255,20 @@
   border-left: 1px solid currentColor;
 }
 
+.epub-prose img,
+.epub-prose svg {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 1.25em auto;
+  border-radius: 6px;
+}
+
+.scroll-smooth-reader {
+  scroll-behavior: smooth;
+  overscroll-behavior: contain;
+}
+
 /* Book spread central gutter */
 .epub-spread-surface {
   background-image: linear-gradient(
@@ -299,5 +313,8 @@ mark[data-ann-id]:hover {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
+  }
+  .scroll-smooth-reader {
+    scroll-behavior: auto !important;
   }
 }

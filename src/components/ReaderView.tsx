@@ -1,6 +1,5 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import type {PDFDocumentProxy} from 'pdfjs-dist';
-import type {WasmDocument} from 'djvu-rs';
 import {
   ArrowLeft,
   ArrowRightLeft,
@@ -50,6 +49,7 @@ import type {
   ScanPreset,
   StudyCourse,
 } from '../types/library';
+import {BoundedTaskQueue, computeAutofitZoom, type DocumentFitMode} from '../utils/batchYield';
 import {renderEpubChapterWithAnnotations} from '../utils/epubHighlighter';
 import {
   calculateProgress,
@@ -57,7 +57,12 @@ import {
   formatZoteroCitation,
 } from '../utils/libraryLogic';
 import {getBookBinary, getBookTextChunks} from '../utils/offlineStorage';
-import {closeDjvuDocument, openDjvuDocument} from '../utils/parsers/djvuParser';
+import {
+  closeDjvuDocument,
+  openDjvuDocument,
+  type DjvuOutlineItem,
+  type UnifiedDjvuDocument,
+} from '../utils/parsers/djvuParser';
 import {parseEpubDocument, type ParsedEpubDocument} from '../utils/parsers/epubParser';
 import {
   closePdfDocument,
@@ -71,7 +76,7 @@ import {
 } from '../utils/scanEnhance';
 import {FONT_OPTIONS, getReaderFontClass, READER_THEMES} from '../utils/themeTokens';
 import {AnnotationPopover} from './AnnotationPopover';
-import {DocumentPageSheet} from './DocumentPageSheet';
+import {DocumentPageSheet, type PageMetricsInfo} from './DocumentPageSheet';
 
 export type ZoteroTool = 'select' | 'highlight' | 'underline' | 'note' | 'area' | 'ink';
 
@@ -180,11 +185,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const [epubDoc, setEpubDoc] = useState<ParsedEpubDocument | null>(null);
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
   const [pdfOutline, setPdfOutline] = useState<{title: string; page: number}[]>([]);
-  const [djvuDoc, setDjvuDoc] = useState<WasmDocument | null>(null);
+  const [djvuDoc, setDjvuDoc] = useState<UnifiedDjvuDocument | null>(null);
+  const [djvuOutline, setDjvuOutline] = useState<DjvuOutlineItem[]>([]);
   const [renderedPageTexts, setRenderedPageTexts] = useState<Record<number, string>>({});
-  const [zoomScale, setZoomScale] = useState(1.35);
-  const [fitWidthMode, setFitWidthMode] = useState(false);
+  const [zoomScale, setZoomScale] = useState(1.25);
+  const [fitMode, setFitMode] = useState<DocumentFitMode>('page');
+  const [viewportSize, setViewportSize] = useState<{width: number; height: number}>({width: 960, height: 720});
+  const [pageMetrics, setPageMetrics] = useState<Record<number, PageMetricsInfo>>({});
   const [textChunks, setTextChunks] = useState<DocumentTextChunk[]>([]);
+  const renderQueueRef = useRef<BoundedTaskQueue>(new BoundedTaskQueue(2));
 
   // Scanned PDF & DjVu Enhancement State
   const [scanOpen, setScanOpen] = useState(false);
@@ -308,11 +317,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     [courses, book.id],
   );
 
-  // Load document binary from IndexedDB
+  // Load document binary from IndexedDB (and strictly clean up PDF, DjVu, and EPUB blob URLs)
   useEffect(() => {
     let cancelled = false;
     let loadedPdfDoc: PDFDocumentProxy | null = null;
-    let loadedDjvuDoc: WasmDocument | null = null;
+    let loadedDjvuDoc: UnifiedDjvuDocument | null = null;
+    let loadedEpubDoc: ParsedEpubDocument | null = null;
 
     async function loadDocument() {
       setLoadingDoc(true);
@@ -320,6 +330,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       setPdfDoc(null);
       setEpubDoc(null);
       setDjvuDoc(null);
+      setDjvuOutline([]);
+      setPageMetrics({});
       setRenderedPageTexts({});
 
       try {
@@ -338,7 +350,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
         if (book.format === 'epub') {
           const parsed = await parseEpubDocument(buffer);
-          if (cancelled) return;
+          if (cancelled) {
+            parsed.dispose();
+            return;
+          }
+          loadedEpubDoc = parsed;
           setEpubDoc(parsed);
           setTotalPages(parsed.chapters.length);
         } else if (book.format === 'pdf') {
@@ -360,7 +376,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             return;
           }
           loadedDjvuDoc = doc;
+          const outline = await doc.getOutline().catch(() => []);
+          if (cancelled) return;
           setDjvuDoc(doc);
+          setDjvuOutline(outline);
           setTotalPages(Math.max(1, doc.page_count()));
         }
       } catch (err) {
@@ -376,30 +395,96 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       cancelled = true;
       void closePdfDocument(loadedPdfDoc);
       closeDjvuDocument(loadedDjvuDoc);
+      loadedEpubDoc?.dispose();
     };
   }, [book.id, book.format, book.title]);
 
-  // Fit-width zoom auto-calculation for PDF (adapts to double spread vs single/scroll)
+  // Observe reader viewport dimensions cleanly for PDF/DjVu autofit & responsive EPUB leaf height
   useEffect(() => {
-    if (!fitWidthMode || book.format !== 'pdf' || !pdfDoc || !readerViewportRef.current) return;
+    const el = readerViewportRef.current;
+    if (!el) return;
+    const updateSize = () => {
+      setViewportSize({
+        width: Math.max(320, el.clientWidth),
+        height: Math.max(360, el.clientHeight),
+      });
+    };
+    updateSize();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => updateSize());
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [distractionFree, leftTab, rightTab, scanOpen]);
+
+  // Responsive Fit Width / Fit Page zoom calculation shared cleanly across PDF & DjVu
+  useEffect(() => {
+    if (fitMode === 'manual' || book.format === 'epub') return;
     let cancelled = false;
-    void (async () => {
-      try {
-        const page = await pdfDoc.getPage(Math.max(1, Math.min(currentPage, pdfDoc.numPages)));
-        if (cancelled || !readerViewportRef.current) return;
-        const baseViewport = page.getViewport({scale: 1});
-        const containerW = Math.max(360, readerViewportRef.current.clientWidth - 72);
-        const availWidth = pageLayoutMode === 'double' ? Math.max(260, (containerW - 24) / 2) : containerW;
-        const computed = Number(Math.min(2.4, Math.max(0.65, availWidth / baseViewport.width)).toFixed(2));
-        setZoomScale(computed);
-      } catch {
-        // Ignore fit calc error
-      }
-    })();
+
+    const applyComputedZoom = (pageWidth: number, pageHeight: number) => {
+      if (cancelled) return;
+      const computed = computeAutofitZoom({
+        fitMode,
+        manualZoom: zoomScale,
+        pageWidth,
+        pageHeight,
+        viewportWidth: viewportSize.width,
+        viewportHeight: viewportSize.height,
+        isDoublePage: pageLayoutMode === 'double',
+      });
+      setZoomScale((prev) => (Math.abs(prev - computed) < 0.01 ? prev : computed));
+    };
+
+    const cached = pageMetrics[currentPage];
+    if (cached) {
+      applyComputedZoom(cached.nativeWidth, cached.nativeHeight);
+      return;
+    }
+
+    if (book.format === 'pdf' && pdfDoc) {
+      void (async () => {
+        try {
+          const page = await pdfDoc.getPage(Math.max(1, Math.min(currentPage, pdfDoc.numPages)));
+          if (cancelled) return;
+          const baseViewport = page.getViewport({scale: 1});
+          applyComputedZoom(baseViewport.width, baseViewport.height);
+        } catch {
+          // Ignore fit calculation failure
+        }
+      })();
+    } else if (book.format === 'djvu' && djvuDoc) {
+      void (async () => {
+        try {
+          const native = await djvuDoc.getPageNativeSize(currentPage);
+          if (cancelled) return;
+          const aspect = native.width / Math.max(1, native.height);
+          applyComputedZoom(612, Math.round(612 / Math.max(0.25, aspect)));
+        } catch {
+          applyComputedZoom(612, 792);
+        }
+      })();
+    }
+
     return () => {
       cancelled = true;
     };
-  }, [fitWidthMode, book.format, pdfDoc, currentPage, pageLayoutMode]);
+  }, [
+    fitMode,
+    book.format,
+    pdfDoc,
+    djvuDoc,
+    currentPage,
+    pageLayoutMode,
+    viewportSize.width,
+    viewportSize.height,
+    pageMetrics,
+    zoomScale,
+  ]);
+
+  const epubSpreadHeightPx = useMemo(
+    () => Math.max(380, Math.min(780, viewportSize.height - 175)),
+    [viewportSize.height],
+  );
 
   // Populate EPUB chapter DOM + wrap in-page <mark data-ann-id> highlights & underlines cleanly
   useEffect(() => {
@@ -434,6 +519,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     epubViewMode,
     pageLayoutMode,
     readingDirection,
+    epubSpreadHeightPx,
+    viewportSize.width,
     preferences.fontSize,
     preferences.lineHeight,
     preferences.maxWidth,
@@ -487,11 +574,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         suppressAutoScrollRef.current = false;
       }, 650);
 
-      if (mode === 'double' && book.format === 'pdf') {
-        setFitWidthMode(true);
-      } else if (fitWidthMode) {
-        setFitWidthMode(false);
-        setZoomScale(mode === 'horizontal' ? 1.05 : 1.25);
+      if (book.format !== 'epub') {
+        if (mode === 'double') {
+          setFitMode('page');
+        } else if (mode === 'single') {
+          setFitMode((prev) => (prev === 'manual' ? 'width' : prev));
+        } else if (mode === 'horizontal') {
+          setFitMode('page');
+        }
       }
 
       onUpdatePreferences({
@@ -503,7 +593,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         updatedAtMs: Date.now(),
       });
     },
-    [book.format, fitWidthMode, onUpdatePreferences, preferences],
+    [book.format, onUpdatePreferences, preferences],
   );
 
   const handleToggleReadingDirection = useCallback(() => {
@@ -584,8 +674,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     if (book.format === 'pdf') {
       return pdfOutline.find((o) => o.page === currentPage)?.title || `Page ${currentPage}`;
     }
+    if (book.format === 'djvu') {
+      return djvuOutline.find((o) => o.page === currentPage)?.title || `Page ${currentPage}`;
+    }
     return `Page ${currentPage}`;
-  }, [book.format, epubDoc, pdfOutline, currentPage]);
+  }, [book.format, epubDoc, pdfOutline, djvuOutline, currentPage]);
 
   const estimatedChapterMinutes = useMemo(() => {
     const words = currentPagePlainText.trim().split(/\s+/).filter(Boolean).length;
@@ -1481,6 +1574,20 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                       <span className="tabular-nums opacity-70 shrink-0">p.{item.page}</span>
                     </button>
                   ))
+                ) : book.format === 'djvu' && djvuOutline.length > 0 ? (
+                  djvuOutline.map((item, i) => (
+                    <button
+                      key={`${item.title}-${i}`}
+                      type="button"
+                      onClick={() => goToPage(item.page)}
+                      className={`w-full text-left px-3 py-2 rounded-lg text-xs transition-colors flex items-center justify-between gap-2 ${
+                        currentPage === item.page ? 'accent-btn font-medium' : 'hover:bg-black/5 dark:hover:bg-white/10'
+                      }`}
+                    >
+                      <span className="truncate">{item.title}</span>
+                      <span className="tabular-nums opacity-70 shrink-0">p.{item.page}</span>
+                    </button>
+                  ))
                 ) : (
                   Array.from({length: totalPages}, (_, idx) => idx + 1).map((p) => (
                     <button
@@ -1754,7 +1861,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               const el = readerViewportRef.current;
               if (el.scrollWidth > el.clientWidth && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
                 e.preventDefault();
-                el.scrollLeft += readingDirection === 'rtl' ? -e.deltaY : e.deltaY;
+                const unitPx = e.deltaMode === 1 ? 36 : e.deltaMode === 2 ? el.clientHeight : 1;
+                const delta = e.deltaY * unitPx;
+                el.scrollLeft += readingDirection === 'rtl' ? -delta : delta;
               }
             }
           }}
@@ -1769,7 +1878,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               setFocusedAnnotationId(null);
             }
           }}
-          className={`flex-1 min-w-0 overflow-x-auto overflow-y-auto px-4 sm:px-8 py-8 flex flex-col relative ${
+          className={`flex-1 min-w-0 overflow-x-auto overflow-y-auto scroll-smooth-reader px-4 sm:px-8 py-6 flex flex-col relative ${
             spatialToolActive ? 'select-none' : ''
           }`}
         >
@@ -1994,14 +2103,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               ) : (
                 /* Paginated Book / Horizontal Leaf / Two-Page Open Spread */
                 <div key="epub-paginated-view" className="relative">
-                  <div ref={epubSpreadViewportRef} className="overflow-hidden" style={{height: '62vh'}}>
+                  <div
+                    ref={epubSpreadViewportRef}
+                    className="overflow-hidden"
+                    style={{height: `${epubSpreadHeightPx}px`}}
+                  >
                     <div
                       key={`epub-cols-${epubViewMode}-${readingDirection}`}
                       ref={epubBodyRef}
                       data-testid="epub-prose-container"
                       style={{
-                        height: '62vh',
-                        columnWidth: epubViewMode === 'spread' ? '360px' : '100%',
+                        height: `${epubSpreadHeightPx}px`,
+                        columnWidth: epubViewMode === 'spread' ? 'calc(50% - 2rem)' : '100%',
                         columnCount: epubViewMode === 'spread' ? 2 : 1,
                         columnGap: epubViewMode === 'spread' ? '4rem' : '2rem',
                         columnFill: 'auto',
@@ -2058,12 +2171,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 pageLayoutMode === 'horizontal' ? 'w-max min-w-full items-start' : 'w-fit min-w-full items-center'
               }`}
             >
-              <div dir="ltr" className="sticky left-0 self-center z-20 flex items-center gap-2">
+              <div dir="ltr" className="sticky left-0 self-center z-20 flex items-center gap-1.5 flex-wrap justify-center">
                 <button
                   type="button"
                   onClick={() => {
-                    setFitWidthMode(false);
-                    setZoomScale((z) => Math.max(0.6, Number((z - 0.15).toFixed(2))));
+                    setFitMode('manual');
+                    setZoomScale((z) => Math.max(0.45, Number((z - 0.15).toFixed(2))));
                   }}
                   aria-label="Zoom out"
                   className={`p-1.5 rounded-lg border ${theme.border} ${theme.surface}`}
@@ -2076,8 +2189,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 <button
                   type="button"
                   onClick={() => {
-                    setFitWidthMode(false);
-                    setZoomScale((z) => Math.min(2.4, Number((z + 0.15).toFixed(2))));
+                    setFitMode('manual');
+                    setZoomScale((z) => Math.min(2.6, Number((z + 0.15).toFixed(2))));
                   }}
                   aria-label="Zoom in"
                   className={`p-1.5 rounded-lg border ${theme.border} ${theme.surface}`}
@@ -2086,13 +2199,23 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 </button>
                 <button
                   type="button"
-                  aria-pressed={fitWidthMode}
-                  onClick={() => setFitWidthMode((prev) => !prev)}
-                  className={`px-2.5 py-1 rounded-lg border text-xs font-medium ${
-                    fitWidthMode ? 'accent-btn border-transparent' : `${theme.border} ${theme.surface}`
+                  aria-pressed={fitMode === 'width'}
+                  onClick={() => setFitMode('width')}
+                  className={`px-2.5 py-1 rounded-lg border text-xs font-medium whitespace-nowrap ${
+                    fitMode === 'width' ? 'accent-btn border-transparent' : `${theme.border} ${theme.surface}`
                   }`}
                 >
                   Fit Width
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={fitMode === 'page'}
+                  onClick={() => setFitMode('page')}
+                  className={`px-2.5 py-1 rounded-lg border text-xs font-medium whitespace-nowrap ${
+                    fitMode === 'page' ? 'accent-btn border-transparent' : `${theme.border} ${theme.surface}`
+                  }`}
+                >
+                  Fit Page
                 </button>
               </div>
 
@@ -2118,6 +2241,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                         ? 'flex flex-col items-center gap-6'
                         : 'flex flex-col items-center';
 
+                const defaultRatio = pageMetrics[currentPage]?.aspectRatio || pageMetrics[1]?.aspectRatio || 612 / 792;
+
                 return (
                   <div
                     dir={pageLayoutMode === 'horizontal' ? readingDirection : undefined}
@@ -2130,8 +2255,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                         format={book.format === 'djvu' ? 'djvu' : 'pdf'}
                         bookTitle={book.title}
                         pageNumber={pageNum}
+                        totalPages={totalPages}
                         pdfDoc={pdfDoc}
                         djvuDoc={djvuDoc}
+                        renderQueue={renderQueueRef.current}
+                        defaultAspectRatio={defaultRatio}
                         fallbackText={textChunks.find((c) => c.page === pageNum)?.text || ''}
                         zoomScale={zoomScale}
                         scanSettings={scanSettings}
@@ -2162,6 +2290,19 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                           setRenderedPageTexts((prev) =>
                             prev[pNum] === plainText ? prev : {...prev, [pNum]: plainText},
                           );
+                        }}
+                        onPageMetrics={(pNum, metrics) => {
+                          setPageMetrics((prev) => {
+                            const prevEntry = prev[pNum];
+                            if (
+                              prevEntry &&
+                              prevEntry.nativeWidth === metrics.nativeWidth &&
+                              prevEntry.nativeHeight === metrics.nativeHeight
+                            ) {
+                              return prev;
+                            }
+                            return {...prev, [pNum]: metrics};
+                          });
                         }}
                       />
                     ))}

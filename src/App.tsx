@@ -16,6 +16,8 @@ import {
   auth,
   deleteAnnotationFromCloud,
   deleteBookFromCloud,
+  disableCloudNetwork,
+  enableCloudNetwork,
   ensureUserProfile,
   signInWithGoogle,
   signOutUser,
@@ -25,6 +27,7 @@ import {
   syncCourseToCloud,
   syncPreferencesToCloud,
   syncReadingGoalToCloud,
+  testConnection,
 } from './firebase';
 import {useOnlineStatus} from './hooks/useOnlineStatus';
 import type {
@@ -54,6 +57,15 @@ import {
   sortAndFilterBooks,
   validateBackupArchive,
 } from './utils/libraryLogic';
+import {
+  loadCustomCloudConfig,
+  mergeLibraryArchives,
+  pullFromCustomCloud,
+  pushToCustomCloud,
+  saveCustomCloudConfig,
+  testCustomCloudConnection,
+  type CustomCloudConfig,
+} from './utils/customCloudSync';
 import {
   createLocalBackupSnapshot,
   DEFAULT_PREFERENCES,
@@ -137,16 +149,20 @@ export default function App() {
 
   // Firebase Cloud Auth & Sync
   const [user, setUser] = useState<User | null>(null);
+  const [cloudReachable, setCloudReachable] = useState(false);
   const [syncStatus, setSyncStatus] = useState('Local library ready');
   const [importNotice, setImportNotice] = useState<string | null>(null);
   const [importProgress, setImportProgress] = useState<{done: number; total: number; currentName: string} | null>(null);
   const cancelImportRef = useRef(false);
   const importNoticeTimerRef = useRef<number | null>(null);
 
-  // Automated local disk backup handle
+  // Automated local disk backup handle & Custom Cloud Sync
   const backupDirHandleRef = useRef<DirectoryHandleLike | null>(null);
   const [linkedBackupDirName, setLinkedBackupDirName] = useState<string | null>(null);
   const autoBackupTimerRef = useRef<number | null>(null);
+  const [customCloudConfig, setCustomCloudConfig] = useState<CustomCloudConfig>(() => loadCustomCloudConfig());
+  const [customCloudStatus, setCustomCloudStatus] = useState<string | null>(null);
+  const [customCloudBusy, setCustomCloudBusy] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
@@ -208,8 +224,10 @@ export default function App() {
   // Firebase Auth Listener & Cross-Device Cloud Subscription
   useEffect(() => {
     let unsubCloud: (() => void) | null = null;
+    let activeAuthGeneration = 0;
 
     const unsubAuth = onAuthStateChanged(auth, async (nextUser) => {
+      const generation = ++activeAuthGeneration;
       setUser(nextUser);
       if (unsubCloud) {
         unsubCloud();
@@ -217,9 +235,28 @@ export default function App() {
       }
 
       if (nextUser) {
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          setCloudReachable(false);
+          await disableCloudNetwork();
+          setSyncStatus('Offline — changes saved locally in IndexedDB');
+          return;
+        }
+
+        const reachable = await testConnection();
+        if (generation !== activeAuthGeneration) return;
+
+        if (!reachable) {
+          setCloudReachable(false);
+          await disableCloudNetwork();
+          setSyncStatus('Cloud Firestore unreachable — operating in local-first mode');
+          return;
+        }
+
+        setCloudReachable(true);
         setSyncStatus('Connected to Cloud Sync');
         try {
           await ensureUserProfile(nextUser);
+          if (generation !== activeAuthGeneration) return;
           unsubCloud = subscribeToCloudLibrary(nextUser.uid, {
             onBooks: (cloudBooks) => {
               if (cloudBooks.length > 0) {
@@ -265,22 +302,62 @@ export default function App() {
               void saveReadingGoalLocal(cloudGoal);
             },
             onError: (err) => {
-              setSyncStatus(`Sync warning: ${err.message}`);
+              if (err.message.includes('unavailable') || err.message.includes('offline')) {
+                setCloudReachable(false);
+                void disableCloudNetwork();
+                setSyncStatus('Cloud Firestore temporarily unreachable — local-first mode active');
+              } else {
+                setSyncStatus(`Sync warning: ${err.message}`);
+              }
             },
           });
         } catch (err) {
           setSyncStatus(err instanceof Error ? err.message : 'Cloud initialization warning');
         }
       } else {
+        setCloudReachable(false);
+        void disableCloudNetwork();
         setSyncStatus('Local-first mode (sign in for cross-device sync)');
       }
     });
 
     return () => {
+      activeAuthGeneration++;
       unsubAuth();
       if (unsubCloud) unsubCloud();
     };
   }, []);
+
+  // Keep Firestore network aligned with browser online/offline & simulated-offline state
+  useEffect(() => {
+    let cancelled = false;
+    if (!user) {
+      setCloudReachable(false);
+      void disableCloudNetwork();
+      return;
+    }
+    if (!isOnline || simulatedOffline) {
+      setCloudReachable(false);
+      void disableCloudNetwork();
+      setSyncStatus('Offline mode — changes saved locally in IndexedDB');
+      return;
+    }
+    void (async () => {
+      await enableCloudNetwork();
+      const reachable = await testConnection();
+      if (cancelled) return;
+      setCloudReachable(reachable);
+      if (!reachable) {
+        await disableCloudNetwork();
+        setSyncStatus('Cloud Firestore unreachable — operating in local-first mode');
+      } else {
+        setSyncStatus('Connected to Cloud Sync');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user, isOnline, simulatedOffline]);
 
   // Automated Local Storage Backup Runner
   const runBackupSnapshot = useCallback(
@@ -314,7 +391,7 @@ export default function App() {
     }
     autoBackupTimerRef.current = window.setTimeout(() => {
       void runBackupSnapshot('auto');
-    }, 1500);
+    }, 4000);
   }, [preferences.backupFrequency, runBackupSnapshot]);
 
   // Scheduled Hourly / Daily Backup Interval
@@ -414,7 +491,7 @@ export default function App() {
             pendingBooks.unshift(res.book);
             pendingChunks.push(...res.chunks);
             if (res.coverDataUrl) pendingCovers[res.book.id] = res.coverDataUrl;
-            if (user?.emailVerified && isOnline && !simulatedOffline) {
+            if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
               void syncBookToCloud(user.uid, res.book);
             }
           }
@@ -524,7 +601,7 @@ export default function App() {
     }
     setTextChunks((prev) => [...res.chunks, ...prev]);
     setOfflineBytes(await estimateOfflineStorageBytes());
-    if (user?.emailVerified && isOnline && !simulatedOffline) {
+    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
       void syncBookToCloud(user.uid, res.book);
     }
     scheduleAutoBackup();
@@ -566,7 +643,7 @@ export default function App() {
             updatedAtMs: Date.now(),
           };
           void saveBookLocal(updated);
-          if (user?.emailVerified && isOnline && !simulatedOffline) {
+          if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
             void syncBookToCloud(user.uid, updated);
           }
           return updated;
@@ -574,14 +651,14 @@ export default function App() {
       );
       scheduleAutoBackup();
     },
-    [isOnline, scheduleAutoBackup, simulatedOffline, user],
+    [cloudReachable, isOnline, scheduleAutoBackup, simulatedOffline, user],
   );
 
   const handleToggleFavorite = (book: BookMetadata) => {
     const updated = {...book, isFavorite: !book.isFavorite, updatedAtMs: Date.now()};
     setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)));
     void saveBookLocal(updated);
-    if (user?.emailVerified && isOnline && !simulatedOffline) {
+    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
       void syncBookToCloud(user.uid, updated);
     }
     scheduleAutoBackup();
@@ -592,7 +669,7 @@ export default function App() {
     setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)));
     await saveBookLocal(updated);
     setOfflineBytes(await estimateOfflineStorageBytes());
-    if (user?.emailVerified && isOnline && !simulatedOffline) {
+    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
       void syncBookToCloud(user.uid, updated);
     }
     scheduleAutoBackup();
@@ -610,7 +687,7 @@ export default function App() {
     setTextChunks((prev) => prev.filter((t) => t.bookId !== book.id));
     await deleteBookLocal(book.id);
     setOfflineBytes(await estimateOfflineStorageBytes());
-    if (user?.emailVerified && isOnline && !simulatedOffline) {
+    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
       void deleteBookFromCloud(user.uid, book.id);
     }
     scheduleAutoBackup();
@@ -648,7 +725,7 @@ export default function App() {
         migrated.push(nextAnn);
         await saveAnnotationLocal(nextAnn);
         await deleteAnnotationLocal(oldAnn.id);
-        if (user?.emailVerified && isOnline && !simulatedOffline) {
+        if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
           void syncAnnotationToCloud(user.uid, nextAnn);
           void deleteAnnotationFromCloud(user.uid, oldAnn.id);
         }
@@ -691,7 +768,7 @@ export default function App() {
     };
     setAnnotations((prev) => [ann, ...prev]);
     void saveAnnotationLocal(ann);
-    if (user?.emailVerified && isOnline && !simulatedOffline) {
+    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
       void syncAnnotationToCloud(user.uid, ann);
     }
     scheduleAutoBackup();
@@ -706,7 +783,7 @@ export default function App() {
         if (a.id !== id) return a;
         const updated: Annotation = {...a, ...patch, updatedAtMs: Date.now()};
         void saveAnnotationLocal(updated);
-        if (user?.emailVerified && isOnline && !simulatedOffline) {
+        if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
           void syncAnnotationToCloud(user.uid, updated);
         }
         return updated;
@@ -718,7 +795,7 @@ export default function App() {
   const handleDeleteAnnotation = (id: string) => {
     setAnnotations((prev) => prev.filter((a) => a.id !== id));
     void deleteAnnotationLocal(id);
-    if (user?.emailVerified && isOnline && !simulatedOffline) {
+    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
       void deleteAnnotationFromCloud(user.uid, id);
     }
     scheduleAutoBackup();
@@ -727,7 +804,7 @@ export default function App() {
   const handleUpdatePreferences = (nextPrefs: ReaderPreferences) => {
     setPreferences(nextPrefs);
     void savePreferencesLocal(nextPrefs);
-    if (user?.emailVerified && isOnline && !simulatedOffline) {
+    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
       void syncPreferencesToCloud(user.uid, nextPrefs);
     }
   };
@@ -737,14 +814,14 @@ export default function App() {
       setReadingGoal((prev) => {
         const next = recordReadingActivity(prev, pagesDelta, minutesDelta);
         void saveReadingGoalLocal(next);
-        if (user?.emailVerified && isOnline && !simulatedOffline) {
+        if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
           void syncReadingGoalToCloud(user.uid, next);
         }
         return next;
       });
       scheduleAutoBackup();
     },
-    [isOnline, scheduleAutoBackup, simulatedOffline, user],
+    [cloudReachable, isOnline, scheduleAutoBackup, simulatedOffline, user],
   );
 
   const handleUpdateGoalTargets = (targets: {
@@ -759,7 +836,7 @@ export default function App() {
         updatedAtMs: Date.now(),
       };
       void saveReadingGoalLocal(next);
-      if (user?.emailVerified && isOnline && !simulatedOffline) {
+      if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
         void syncReadingGoalToCloud(user.uid, next);
       }
       return next;
@@ -828,7 +905,7 @@ export default function App() {
     };
     setCourses((prev) => [course, ...prev.filter((c) => c.bookId !== book.id)]);
     await saveCourseLocal(course);
-    if (user?.emailVerified && isOnline && !simulatedOffline) {
+    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
       void syncCourseToCloud(user.uid, course);
     }
     scheduleAutoBackup();
@@ -837,6 +914,19 @@ export default function App() {
 
   const handleSyncAllToCloud = async () => {
     if (!user) return;
+    if (!isOnline || simulatedOffline) {
+      setSyncStatus('Offline mode — library is saved locally and will sync when online.');
+      return;
+    }
+    setSyncStatus('Checking Firestore connection...');
+    const reachable = await testConnection();
+    if (!reachable) {
+      setCloudReachable(false);
+      await disableCloudNetwork();
+      setSyncStatus('Cloud Firestore unreachable — changes remain safely stored locally in IndexedDB.');
+      return;
+    }
+    setCloudReachable(true);
     setSyncStatus('Synchronizing library to Firestore...');
     try {
       await ensureUserProfile(user);
@@ -916,6 +1006,108 @@ export default function App() {
       if (!(err instanceof DOMException && err.name === 'AbortError')) {
         console.warn('Directory link cancelled or unavailable:', err);
       }
+    }
+  };
+
+  const handleUpdateCustomCloudConfig = (next: CustomCloudConfig, persistSecret: boolean) => {
+    setCustomCloudConfig(next);
+    saveCustomCloudConfig(next, persistSecret);
+  };
+
+  const handleTestCustomCloud = async (): Promise<{ok: boolean; message: string}> => {
+    if (!isOnline || simulatedOffline) {
+      return {ok: false, message: 'Disable Offline Reading Mode to test your remote storage endpoint.'};
+    }
+    setCustomCloudBusy(true);
+    try {
+      return await testCustomCloudConnection(customCloudConfig);
+    } catch (err) {
+      return {ok: false, message: err instanceof Error ? err.message : 'Connection test failed.'};
+    } finally {
+      setCustomCloudBusy(false);
+    }
+  };
+
+  const handlePullCustomCloud = async () => {
+    if (!isOnline || simulatedOffline) {
+      setCustomCloudStatus('Offline mode active — reconnect to pull from custom cloud storage.');
+      return;
+    }
+    setCustomCloudBusy(true);
+    setCustomCloudStatus('Pulling remote library archive...');
+    try {
+      const remote = await pullFromCustomCloud(customCloudConfig);
+      if (!remote.found || !remote.archive) {
+        setCustomCloudStatus('No remote DocuTrack archive found at this endpoint yet.');
+        return;
+      }
+      const {archive: localArchive} = await createLocalBackupSnapshot('auto', 'Pre-Pull Local State');
+      const merged = mergeLibraryArchives(localArchive, remote.archive);
+      await restoreFromArchive(merged);
+      const refreshed = await initializeLibraryStore();
+      setBooks(refreshed.books);
+      setBookCovers(refreshed.covers);
+      setAnnotations(refreshed.annotations);
+      setCourses(refreshed.courses);
+      setPreferences(refreshed.preferences);
+      setReadingGoal(refreshed.readingGoal);
+      setTextChunks(refreshed.textChunks);
+      const nextCfg: CustomCloudConfig = {...customCloudConfig, lastSyncedAtMs: Date.now()};
+      setCustomCloudConfig(nextCfg);
+      saveCustomCloudConfig(nextCfg, Boolean(nextCfg.secret));
+      setCustomCloudStatus(
+        `Merged ${merged.books.length} books & ${merged.annotations.length} annotations from remote storage.`,
+      );
+    } catch (err) {
+      setCustomCloudStatus(err instanceof Error ? err.message : 'Pull from custom cloud failed.');
+    } finally {
+      setCustomCloudBusy(false);
+    }
+  };
+
+  const handleSyncCustomCloud = async () => {
+    if (!isOnline || simulatedOffline) {
+      setCustomCloudStatus('Offline mode active — changes remain safely in IndexedDB.');
+      return;
+    }
+    setCustomCloudBusy(true);
+    setCustomCloudStatus('Synchronizing with custom cloud storage...');
+    try {
+      const {archive: localArchive} = await createLocalBackupSnapshot('manual', 'Custom Cloud Sync Snapshot');
+      let payloadToPush = localArchive;
+
+      try {
+        const remote = await pullFromCustomCloud(customCloudConfig);
+        if (remote.found && remote.archive) {
+          payloadToPush = mergeLibraryArchives(localArchive, remote.archive);
+          await restoreFromArchive(payloadToPush);
+          const refreshed = await initializeLibraryStore();
+          setBooks(refreshed.books);
+          setBookCovers(refreshed.covers);
+          setAnnotations(refreshed.annotations);
+          setCourses(refreshed.courses);
+          setPreferences(refreshed.preferences);
+          setReadingGoal(refreshed.readingGoal);
+          setTextChunks(refreshed.textChunks);
+        }
+      } catch (pullErr) {
+        // Proceed with push if file does not exist yet (404 handled cleanly inside pullFromCustomCloud)
+        throw pullErr;
+      }
+
+      const pushRes = await pushToCustomCloud(customCloudConfig, payloadToPush);
+      const nextCfg: CustomCloudConfig = {...customCloudConfig, lastSyncedAtMs: Date.now()};
+      setCustomCloudConfig(nextCfg);
+      saveCustomCloudConfig(nextCfg, Boolean(nextCfg.secret));
+      setCustomCloudStatus(
+        `Synced ${payloadToPush.books.length} books & ${payloadToPush.annotations.length} notes (${Math.round(
+          pushRes.uploadedBytes / 1024,
+        )} KB) to custom cloud.`,
+      );
+    } catch (err) {
+      setCustomCloudStatus(err instanceof Error ? err.message : 'Custom cloud sync failed.');
+    } finally {
+      setCustomCloudBusy(false);
     }
   };
 
@@ -1245,6 +1437,9 @@ export default function App() {
             backups={backups}
             preferences={preferences}
             linkedBackupDirName={linkedBackupDirName}
+            customCloudConfig={customCloudConfig}
+            customCloudStatus={customCloudStatus}
+            customCloudBusy={customCloudBusy}
             onSignIn={() => void signInWithGoogle()}
             onSignOut={() => void signOutUser()}
             onSyncAllToCloud={() => void handleSyncAllToCloud()}
@@ -1262,6 +1457,10 @@ export default function App() {
             onRestoreBackupFile={(file) => void handleRestoreBackupFile(file)}
             onRestoreSnapshot={(id) => void handleRestoreSnapshot(id)}
             onLinkLocalBackupFolder={() => void handleLinkLocalBackupFolder()}
+            onUpdateCustomCloudConfig={handleUpdateCustomCloudConfig}
+            onTestCustomCloud={handleTestCustomCloud}
+            onSyncCustomCloud={handleSyncCustomCloud}
+            onPullCustomCloud={handlePullCustomCloud}
           />
         )}
       </div>

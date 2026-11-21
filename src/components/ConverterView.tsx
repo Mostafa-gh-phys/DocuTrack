@@ -8,6 +8,7 @@ import {
   FileUp,
   RefreshCw,
   Sparkles,
+  X,
 } from 'lucide-react';
 import type {BookFormat, BookMetadata} from '../types/library';
 import {
@@ -62,6 +63,7 @@ export const ConverterView: React.FC<ConverterViewProps> = ({
   const [savedBook, setSavedBook] = useState<BookMetadata | null>(null);
 
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const selectedBook = useMemo(
     () => books.find((b) => b.id === selectedBookId) || null,
@@ -118,10 +120,14 @@ export const ConverterView: React.FC<ConverterViewProps> = ({
       return;
     }
 
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setConverting(true);
     setStatusText('Preparing local conversion engine...');
     try {
-      let buffer: ArrayBuffer;
+      let buffer: ArrayBuffer | null = null;
       let title = 'Converted Document';
       let author = 'DocuTrack Converter';
       let baseFilename = 'document';
@@ -151,15 +157,22 @@ export const ConverterView: React.FC<ConverterViewProps> = ({
         author,
         baseFilename,
         cleanScannedImages,
+        signal: controller.signal,
         onProgress: (msg) => setStatusText(msg),
       });
+      buffer = null;
 
       setResult(conv);
       setStatusText(null);
     } catch (err) {
-      setErrorText(err instanceof Error ? err.message : 'Local document conversion failed.');
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setErrorText('Conversion cancelled.');
+      } else {
+        setErrorText(err instanceof Error ? err.message : 'Local document conversion failed.');
+      }
       setStatusText(null);
     } finally {
+      abortControllerRef.current = null;
       setConverting(false);
     }
   };
@@ -322,18 +335,31 @@ export const ConverterView: React.FC<ConverterViewProps> = ({
               })}
             </div>
 
-            <button
-              type="button"
-              disabled={converting || !activeSourceFormat || activeSourceFormat === targetFormat}
-              onClick={() => void handleConvert()}
-              className="w-full py-2.5 px-4 rounded-xl accent-btn text-xs font-medium disabled:opacity-45 flex items-center justify-center gap-2"
-            >
-              <RefreshCw className={`w-4 h-4 ${converting ? 'animate-spin' : ''}`} aria-hidden="true" />
-              {converting
-                ? statusText || 'Converting locally...'
-                : `Convert ${activeSourceFormat ? activeSourceFormat.toUpperCase() : 'Source'} to ${targetFormat.toUpperCase()}`}
-              {!converting && <ArrowRight className="w-3.5 h-3.5" aria-hidden="true" />}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={converting || !activeSourceFormat || activeSourceFormat === targetFormat}
+                onClick={() => void handleConvert()}
+                className="flex-1 py-2.5 px-4 rounded-xl accent-btn text-xs font-medium disabled:opacity-45 flex items-center justify-center gap-2"
+              >
+                <RefreshCw className={`w-4 h-4 ${converting ? 'animate-spin' : ''}`} aria-hidden="true" />
+                {converting
+                  ? statusText || 'Converting locally...'
+                  : `Convert ${activeSourceFormat ? activeSourceFormat.toUpperCase() : 'Source'} to ${targetFormat.toUpperCase()}`}
+                {!converting && <ArrowRight className="w-3.5 h-3.5" aria-hidden="true" />}
+              </button>
+              {converting && (
+                <button
+                  type="button"
+                  onClick={() => abortControllerRef.current?.abort()}
+                  aria-label="Cancel conversion"
+                  className="py-2.5 px-3 rounded-xl border app-border hover:bg-black/5 dark:hover:bg-white/10 text-xs font-medium flex items-center gap-1 whitespace-nowrap"
+                >
+                  <X className="w-3.5 h-3.5" aria-hidden="true" />
+                  Cancel
+                </button>
+              )}
+            </div>
 
             {errorText && (
               <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 text-xs">

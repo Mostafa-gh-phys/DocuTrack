@@ -82,12 +82,19 @@ function startDesktopServer() {
 
 async function createWindow() {
   const port = await startDesktopServer();
+  const iconCandidates = [
+    path.join(__dirname, '..', 'dist', 'pwa-512x512.png'),
+    path.join(__dirname, '..', 'public', 'pwa-512x512.png'),
+  ];
+  const resolvedIcon = iconCandidates.find((p) => fs.existsSync(p));
+
   mainWindow = new BrowserWindow({
     width: 1360,
     height: 860,
     minWidth: 920,
     minHeight: 620,
     title: 'DocuTrack',
+    ...(resolvedIcon ? {icon: resolvedIcon} : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,

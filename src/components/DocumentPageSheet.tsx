@@ -1,6 +1,5 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import type {PDFDocumentProxy} from 'pdfjs-dist';
-import type {WasmDocument} from 'djvu-rs';
 import {StickyNote} from 'lucide-react';
 import type {
   Annotation,
@@ -10,7 +9,8 @@ import type {
   ReaderTheme,
   ScanEnhanceSettings,
 } from '../types/library';
-import {renderDjvuPageToCanvas} from '../utils/parsers/djvuParser';
+import {BoundedTaskQueue, releaseCanvasMemory} from '../utils/batchYield';
+import {renderDjvuPageToCanvas, type UnifiedDjvuDocument} from '../utils/parsers/djvuParser';
 import {renderPdfPageToCanvas, type PdfRenderTextItem} from '../utils/parsers/pdfParser';
 import {applyScanEnhancementToCanvas, isScanEnhancementActive} from '../utils/scanEnhance';
 
@@ -29,12 +29,21 @@ const HIGHLIGHT_STYLES: Record<HighlightColor, HighlightColorStyle> = {
   violet: {hex: '#7c3aed', fillRgba: 'rgba(167, 139, 250, 0.32)'},
 };
 
+export interface PageMetricsInfo {
+  nativeWidth: number;
+  nativeHeight: number;
+  aspectRatio: number;
+}
+
 interface DocumentPageSheetProps {
   format: 'pdf' | 'djvu';
   bookTitle: string;
   pageNumber: number;
+  totalPages?: number;
   pdfDoc: PDFDocumentProxy | null;
-  djvuDoc: WasmDocument | null;
+  djvuDoc: UnifiedDjvuDocument | null;
+  renderQueue?: BoundedTaskQueue;
+  defaultAspectRatio?: number;
   fallbackText?: string;
   zoomScale: number;
   scanSettings: ScanEnhanceSettings;
@@ -64,14 +73,18 @@ interface DocumentPageSheetProps {
   ) => void;
   onVisible?: (pageNumber: number) => void;
   onRenderedText?: (pageNumber: number, plainText: string) => void;
+  onPageMetrics?: (pageNumber: number, metrics: PageMetricsInfo) => void;
 }
 
 export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
   format,
   bookTitle,
   pageNumber,
+  totalPages = 1,
   pdfDoc,
   djvuDoc,
+  renderQueue,
+  defaultAspectRatio = 612 / 792,
   fallbackText = '',
   zoomScale,
   scanSettings,
@@ -94,20 +107,21 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
   onCreateSpatialAnnotation,
   onVisible,
   onRenderedText,
+  onPageMetrics,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const onVisibleRef = useRef(onVisible);
   const onRenderedTextRef = useRef(onRenderedText);
+  const onPageMetricsRef = useRef(onPageMetrics);
   onVisibleRef.current = onVisible;
   onRenderedTextRef.current = onRenderedText;
+  onPageMetricsRef.current = onPageMetrics;
 
   const [inViewport, setInViewport] = useState(!lazy);
   const [pdfTextItems, setPdfTextItems] = useState<PdfRenderTextItem[]>([]);
-  const [canvasSize, setCanvasSize] = useState<{width: number; height: number}>({
-    width: Math.round(520 * zoomScale),
-    height: Math.round(680 * zoomScale),
-  });
+  const [nativeMetrics, setNativeMetrics] = useState<PageMetricsInfo | null>(null);
+  const [renderedSize, setRenderedSize] = useState<{width: number; height: number} | null>(null);
   const [djvuBlankBitmap, setDjvuBlankBitmap] = useState(false);
   const [djvuPageText, setDjvuPageText] = useState('');
 
@@ -132,23 +146,32 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
         for (const entry of entries) {
           if (entry.isIntersecting) {
             setInViewport(true);
-            if (entry.intersectionRatio >= 0.65) {
+            if (entry.intersectionRatio >= 0.55) {
               onVisibleRef.current?.(pageNumber);
             }
+          } else if (totalPages > 8) {
+            setInViewport(false);
+            releaseCanvasMemory(canvasRef.current);
           }
         }
       },
-      {rootMargin: '420px', threshold: [0.05, 0.65]},
+      {rootMargin: '520px', threshold: [0.02, 0.55]},
     );
     observer.observe(el);
     return () => observer.disconnect();
-  }, [lazy, pageNumber]);
+  }, [lazy, pageNumber, totalPages]);
 
   useEffect(() => {
-    if (!inViewport) return;
+    if (!inViewport) {
+      if (lazy && totalPages > 8) {
+        releaseCanvasMemory(canvasRef.current);
+      }
+      return;
+    }
     let cancelled = false;
 
-    async function renderPage() {
+    const executeRender = async () => {
+      if (cancelled) return;
       const canvas = canvasRef.current;
       if (!canvas) return;
 
@@ -158,7 +181,18 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
           const res = await renderPdfPageToCanvas(pdfDoc, clampedPage, canvas, zoomScale);
           if (cancelled) return;
           applyScanEnhancementToCanvas(canvas, scanSettings);
-          setCanvasSize({width: res.width, height: res.height});
+          const safeW = Math.max(1, res.width);
+          const safeH = Math.max(1, res.height);
+          const baseW = Math.max(120, Math.round(safeW / Math.max(0.1, zoomScale)));
+          const baseH = Math.max(120, Math.round(safeH / Math.max(0.1, zoomScale)));
+          const metrics: PageMetricsInfo = {
+            nativeWidth: baseW,
+            nativeHeight: baseH,
+            aspectRatio: baseW / baseH,
+          };
+          setNativeMetrics(metrics);
+          setRenderedSize({width: safeW, height: safeH});
+          onPageMetricsRef.current?.(pageNumber, metrics);
           setPdfTextItems(res.textItems);
           const text = res.textItems.map((i) => i.str).join(' ').replace(/\s+/g, ' ').trim();
           if (text) onRenderedTextRef.current?.(pageNumber, text);
@@ -168,13 +202,36 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
         }
       } else if (format === 'djvu' && djvuDoc) {
         try {
-          const dpi = Math.round((isScanEnhancementActive(scanSettings) ? 145 : 120) * zoomScale);
-          const res = renderDjvuPageToCanvas(djvuDoc, pageNumber, canvas, dpi);
+          const native = await djvuDoc.getPageNativeSize(pageNumber);
           if (cancelled) return;
+          const displayW = Math.max(120, Math.round(612 * zoomScale));
+          const aspect = native.width / Math.max(1, native.height);
+          const displayH = Math.max(160, Math.round(displayW / aspect));
+
+          const baseDpi = isScanEnhancementActive(scanSettings) ? 132 : 112;
+          const dpi = Math.min(190, Math.max(65, Math.round(baseDpi * zoomScale)));
+          const res = await renderDjvuPageToCanvas(djvuDoc, pageNumber, canvas, dpi);
+          if (cancelled) return;
+
           if (!res.isBlankBitmap) {
             applyScanEnhancementToCanvas(canvas, scanSettings);
           }
-          setCanvasSize({width: res.width, height: res.height});
+
+          const finalAspect = res.width / Math.max(1, res.height);
+          const metrics: PageMetricsInfo = {
+            nativeWidth: 612,
+            nativeHeight: Math.round(612 / Math.max(0.25, finalAspect)),
+            aspectRatio: finalAspect,
+          };
+          // Keep canvas CSS size aligned cleanly with zoomScale while preserving native crispness inside backing buffer
+          canvas.style.width = `${displayW}px`;
+          canvas.style.height = `${Math.max(160, Math.round(displayW / finalAspect))}px`;
+          setNativeMetrics(metrics);
+          setRenderedSize({
+            width: displayW,
+            height: res.isBlankBitmap ? displayH : Math.max(160, Math.round(displayW / finalAspect)),
+          });
+          onPageMetricsRef.current?.(pageNumber, metrics);
           setDjvuBlankBitmap(res.isBlankBitmap);
           const resolvedText = res.text || fallbackText;
           setDjvuPageText(resolvedText);
@@ -183,13 +240,34 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
           console.error(`DjVu render error on page ${pageNumber}:`, err);
         }
       }
-    }
+    };
 
-    void renderPage();
+    const schedule = renderQueue ? renderQueue.run(executeRender) : executeRender();
+    void schedule;
+
     return () => {
       cancelled = true;
     };
-  }, [inViewport, format, pdfDoc, djvuDoc, pageNumber, zoomScale, scanSettings, fallbackText]);
+  }, [
+    inViewport,
+    lazy,
+    totalPages,
+    format,
+    pdfDoc,
+    djvuDoc,
+    renderQueue,
+    pageNumber,
+    zoomScale,
+    scanSettings,
+    fallbackText,
+  ]);
+
+  // Deterministic sheet sizing eliminates vertical/horizontal scroll jump even before page decodes
+  const activeAspect = nativeMetrics?.aspectRatio || defaultAspectRatio;
+  const predictedWidth = Math.max(180, Math.round((nativeMetrics?.nativeWidth || 612) * zoomScale));
+  const predictedHeight = Math.max(220, Math.round(predictedWidth / Math.max(0.25, activeAspect)));
+  const stageWidth = renderedSize && Math.abs(renderedSize.width - predictedWidth) < 24 ? renderedSize.width : predictedWidth;
+  const stageHeight = renderedSize && Math.abs(renderedSize.width - predictedWidth) < 24 ? renderedSize.height : predictedHeight;
 
   const captureSelectionRects = (): AnnotationPosition[] | undefined => {
     const sel = window.getSelection();
@@ -335,243 +413,247 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
 
   return (
     <div
-      ref={containerRef}
-      data-page-number={pageNumber}
-      onMouseUp={handleMouseUpOnSheet}
-      className={`relative shrink-0 border ${themeBorder} shadow-sm ${
+      className={`shrink-0 border ${themeBorder} shadow-sm ${
         !isDarkTheme ? themeBgSurface : 'bg-white'
-      } overflow-hidden`}
-      style={
-        format === 'pdf'
-          ? {width: `${canvasSize.width}px`, height: `${canvasSize.height}px`}
-          : {minWidth: `${Math.max(340, canvasSize.width)}px`, minHeight: `${Math.max(420, canvasSize.height)}px`}
-      }
+      } flex flex-col`}
+      style={{width: `${stageWidth}px`}}
     >
-      {pageBadgeLabel && (
-        <div className="absolute top-2 right-2 z-30 px-1.5 py-0.5 rounded bg-black/55 text-white text-[10px] font-mono tabular-nums pointer-events-none">
-          {pageBadgeLabel}
-        </div>
-      )}
+      <div
+        ref={containerRef}
+        data-page-number={pageNumber}
+        onMouseUp={handleMouseUpOnSheet}
+        className="relative w-full overflow-hidden"
+        style={{width: `${stageWidth}px`, height: `${stageHeight}px`}}
+      >
+        {pageBadgeLabel && (
+          <div className="absolute top-2 right-2 z-30 px-1.5 py-0.5 rounded bg-black/55 text-white text-[10px] font-mono tabular-nums pointer-events-none">
+            {pageBadgeLabel}
+          </div>
+        )}
 
-      <canvas
-        ref={canvasRef}
-        data-testid="document-canvas"
-        className={`block ${
-          isDarkTheme
-            ? 'invert-[0.88] hue-rotate-180'
-            : themeId !== 'paper'
-              ? 'mix-blend-multiply'
-              : ''
-        }`}
-      />
+        <canvas
+          ref={canvasRef}
+          data-testid="document-canvas"
+          className={`block max-w-full ${
+            isDarkTheme
+              ? 'invert-[0.88] hue-rotate-180'
+              : themeId !== 'paper'
+                ? 'mix-blend-multiply'
+                : ''
+          }`}
+        />
 
-      {format === 'pdf' && pdfTextItems.length > 0 && (
-        <div className="pdf-text-layer absolute inset-0 select-text overflow-hidden pointer-events-auto z-10">
-          {pdfTextItems.map((item, idx) => (
-            <span
-              key={idx}
-              style={{
-                position: 'absolute',
-                left: `${item.x}px`,
-                top: `${item.y}px`,
-                fontSize: `${item.fontSize}px`,
-                fontFamily: item.fontFamily,
-                transform: `scaleX(${item.scaleX})`,
-                transformOrigin: '0 0',
-                lineHeight: 1.05,
-                color: 'transparent',
-                whiteSpace: 'pre',
-              }}
-            >
-              {item.str}
-            </span>
-          ))}
-        </div>
-      )}
+        {format === 'pdf' && pdfTextItems.length > 0 && (
+          <div className="pdf-text-layer absolute inset-0 select-text overflow-hidden pointer-events-auto z-10">
+            {pdfTextItems.map((item, idx) => (
+              <span
+                key={idx}
+                style={{
+                  position: 'absolute',
+                  left: `${item.x}px`,
+                  top: `${item.y}px`,
+                  fontSize: `${item.fontSize}px`,
+                  fontFamily: item.fontFamily,
+                  transform: `scaleX(${item.scaleX})`,
+                  transformOrigin: '0 0',
+                  lineHeight: 1.05,
+                  color: 'transparent',
+                  whiteSpace: 'pre',
+                }}
+              >
+                {item.str}
+              </span>
+            ))}
+          </div>
+        )}
 
-      {format === 'djvu' && djvuPageText && (
-        <div
-          className={
-            djvuBlankBitmap
-              ? `absolute inset-0 p-10 overflow-y-auto ${themeBgSurface} ${themeText} z-10`
-              : `p-4 border-t ${themeBorder} ${themeBgSurface} ${themeText}`
-          }
-        >
-          {djvuBlankBitmap && (
+        {format === 'djvu' && djvuBlankBitmap && djvuPageText && (
+          <div className={`absolute inset-0 p-8 sm:p-10 overflow-y-auto ${themeBgSurface} ${themeText} z-10`}>
             <div className={`text-[11px] font-mono uppercase tracking-wider ${themeMuted} mb-4`}>
               DjVu Text Layer (TXTa) · {bookTitle}
             </div>
-          )}
-          <div className={`${fontClass} text-base leading-relaxed whitespace-pre-wrap select-text`}>
-            {djvuPageText}
+            <div className={`${fontClass} text-base leading-relaxed whitespace-pre-wrap select-text`}>
+              {djvuPageText}
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Spatial Overlays for this specific page */}
-      <div
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={finishStroke}
-        className={`absolute inset-0 z-20 ${
-          spatialToolActive
-            ? activeTool === 'ink'
-              ? 'cursor-cell pointer-events-auto touch-none'
-              : 'cursor-crosshair pointer-events-auto touch-none'
-            : 'pointer-events-none'
-        }`}
-      >
-        {rectHighlightAnns.map((ann) => {
-          const kind = ann.kind || 'highlight';
-          const c = HIGHLIGHT_STYLES[ann.color] || HIGHLIGHT_STYLES.amber;
-          const rects = ann.rects && ann.rects.length > 0 ? ann.rects : ann.position ? [ann.position] : [];
-          const isFocused = focusedAnnotationId === ann.id;
-          return rects.map((r, rIdx) => (
-            <button
-              key={`${ann.id}-r-${rIdx}`}
-              type="button"
-              data-testid={kind === 'underline' ? 'pdf-underline-rect' : 'pdf-highlight-rect'}
-              aria-label={`Inspect ${kind} annotation on page ${ann.page}`}
-              onClick={(ev) => {
-                ev.stopPropagation();
-                onFocusAnnotation(ann.id);
-              }}
-              style={{
-                left: `${r.x * 100}%`,
-                top: `${r.y * 100}%`,
-                width: `${r.width * 100}%`,
-                height: `${r.height * 100}%`,
-                backgroundColor: kind === 'highlight' ? c.fillRgba : 'transparent',
-                borderBottom: kind === 'underline' ? `2.5px solid ${c.hex}` : undefined,
-              }}
-              className={`absolute pointer-events-auto rounded-[2px] transition-shadow ${
-                kind === 'highlight' && !isDarkTheme ? 'mix-blend-multiply' : ''
-              } ${isFocused ? 'ring-2 ring-blue-700' : ''}`}
-            />
-          ));
-        })}
+        {/* Spatial Overlays for this specific page */}
+        <div
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={finishStroke}
+          className={`absolute inset-0 z-20 ${
+            spatialToolActive
+              ? activeTool === 'ink'
+                ? 'cursor-cell pointer-events-auto touch-none'
+                : 'cursor-crosshair pointer-events-auto touch-none'
+              : 'pointer-events-none'
+          }`}
+        >
+          {rectHighlightAnns.map((ann) => {
+            const kind = ann.kind || 'highlight';
+            const c = HIGHLIGHT_STYLES[ann.color] || HIGHLIGHT_STYLES.amber;
+            const rects = ann.rects && ann.rects.length > 0 ? ann.rects : ann.position ? [ann.position] : [];
+            const isFocused = focusedAnnotationId === ann.id;
+            return rects.map((r, rIdx) => (
+              <button
+                key={`${ann.id}-r-${rIdx}`}
+                type="button"
+                data-testid={kind === 'underline' ? 'pdf-underline-rect' : 'pdf-highlight-rect'}
+                aria-label={`Inspect ${kind} annotation on page ${ann.page}`}
+                onClick={(ev) => {
+                  ev.stopPropagation();
+                  onFocusAnnotation(ann.id);
+                }}
+                style={{
+                  left: `${r.x * 100}%`,
+                  top: `${r.y * 100}%`,
+                  width: `${r.width * 100}%`,
+                  height: `${r.height * 100}%`,
+                  backgroundColor: kind === 'highlight' ? c.fillRgba : 'transparent',
+                  borderBottom: kind === 'underline' ? `2.5px solid ${c.hex}` : undefined,
+                }}
+                className={`absolute pointer-events-auto rounded-[2px] transition-shadow ${
+                  kind === 'highlight' && !isDarkTheme ? 'mix-blend-multiply' : ''
+                } ${isFocused ? 'ring-2 ring-blue-700' : ''}`}
+              />
+            ));
+          })}
 
-        {(inkAnns.length > 0 || liveStrokePath) && (
-          <svg
-            viewBox="0 0 1 1"
-            preserveAspectRatio="none"
-            className="absolute inset-0 w-full h-full pointer-events-none"
-          >
-            {inkAnns.map((ann) =>
-              (ann.inkStrokes || []).map((d, i) => (
+          {(inkAnns.length > 0 || liveStrokePath) && (
+            <svg
+              viewBox="0 0 1 1"
+              preserveAspectRatio="none"
+              className="absolute inset-0 w-full h-full pointer-events-none"
+            >
+              {inkAnns.map((ann) =>
+                (ann.inkStrokes || []).map((d, i) => (
+                  <path
+                    key={`${ann.id}-${i}`}
+                    d={d}
+                    fill="none"
+                    stroke={HIGHLIGHT_STYLES[ann.color].hex}
+                    strokeWidth={focusedAnnotationId === ann.id ? 4 : 2.5}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    vectorEffect="non-scaling-stroke"
+                    opacity={0.88}
+                    style={{pointerEvents: 'stroke', cursor: 'pointer'}}
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      onFocusAnnotation(ann.id);
+                    }}
+                  />
+                )),
+              )}
+              {liveStrokePath && (
                 <path
-                  key={`${ann.id}-${i}`}
-                  d={d}
+                  d={liveStrokePath}
                   fill="none"
-                  stroke={HIGHLIGHT_STYLES[ann.color].hex}
-                  strokeWidth={focusedAnnotationId === ann.id ? 4 : 2.5}
+                  stroke={HIGHLIGHT_STYLES[selectedColor].hex}
+                  strokeWidth={2.5}
                   strokeLinecap="round"
                   strokeLinejoin="round"
                   vectorEffect="non-scaling-stroke"
-                  opacity={0.88}
-                  style={{pointerEvents: 'stroke', cursor: 'pointer'}}
+                />
+              )}
+            </svg>
+          )}
+
+          {pageAnnotations
+            .filter((a) => a.kind === 'area' && a.position)
+            .map((ann) => {
+              const pos = ann.position!;
+              const c = HIGHLIGHT_STYLES[ann.color];
+              const isFocused = focusedAnnotationId === ann.id;
+              return (
+                <button
+                  key={ann.id}
+                  type="button"
+                  title={ann.note || ann.quote}
                   onClick={(ev) => {
                     ev.stopPropagation();
                     onFocusAnnotation(ann.id);
                   }}
-                />
-              )),
-            )}
-            {liveStrokePath && (
-              <path
-                d={liveStrokePath}
-                fill="none"
-                stroke={HIGHLIGHT_STYLES[selectedColor].hex}
-                strokeWidth={2.5}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                vectorEffect="non-scaling-stroke"
-              />
-            )}
-          </svg>
-        )}
-
-        {pageAnnotations
-          .filter((a) => a.kind === 'area' && a.position)
-          .map((ann) => {
-            const pos = ann.position!;
-            const c = HIGHLIGHT_STYLES[ann.color];
-            const isFocused = focusedAnnotationId === ann.id;
-            return (
-              <button
-                key={ann.id}
-                type="button"
-                title={ann.note || ann.quote}
-                onClick={(ev) => {
-                  ev.stopPropagation();
-                  onFocusAnnotation(ann.id);
-                }}
-                style={{
-                  left: `${pos.x * 100}%`,
-                  top: `${pos.y * 100}%`,
-                  width: `${pos.width * 100}%`,
-                  height: `${pos.height * 100}%`,
-                  borderColor: c.hex,
-                  backgroundColor: `${c.hex}18`,
-                }}
-                className={`absolute pointer-events-auto border-2 rounded-sm transition-shadow ${
-                  isFocused ? 'ring-2 ring-blue-700' : ''
-                }`}
-              >
-                <span
-                  style={{backgroundColor: c.hex}}
-                  className="absolute -top-4 left-0 px-1 text-[10px] font-medium text-white rounded-t-xs whitespace-nowrap"
+                  style={{
+                    left: `${pos.x * 100}%`,
+                    top: `${pos.y * 100}%`,
+                    width: `${pos.width * 100}%`,
+                    height: `${pos.height * 100}%`,
+                    borderColor: c.hex,
+                    backgroundColor: `${c.hex}18`,
+                  }}
+                  className={`absolute pointer-events-auto border-2 rounded-sm transition-shadow ${
+                    isFocused ? 'ring-2 ring-blue-700' : ''
+                  }`}
                 >
-                  Area
-                </span>
-              </button>
-            );
-          })}
+                  <span
+                    style={{backgroundColor: c.hex}}
+                    className="absolute -top-4 left-0 px-1 text-[10px] font-medium text-white rounded-t-xs whitespace-nowrap"
+                  >
+                    Area
+                  </span>
+                </button>
+              );
+            })}
 
-        {pageAnnotations
-          .filter((a) => a.kind === 'note' && a.position)
-          .map((ann) => {
-            const pos = ann.position!;
-            const c = HIGHLIGHT_STYLES[ann.color];
-            const isFocused = focusedAnnotationId === ann.id;
-            return (
-              <button
-                key={ann.id}
-                type="button"
-                aria-label={`Sticky note on page ${ann.page}`}
-                title={ann.note || ann.quote}
-                onClick={(ev) => {
-                  ev.stopPropagation();
-                  onFocusAnnotation(ann.id);
-                }}
-                style={{
-                  left: `${pos.x * 100}%`,
-                  top: `${pos.y * 100}%`,
-                  backgroundColor: c.hex,
-                }}
-                className={`absolute -translate-x-1/2 -translate-y-1/2 pointer-events-auto w-6 h-6 rounded-md text-white shadow-md flex items-center justify-center hover:scale-110 transition-transform ${
-                  isFocused ? 'ring-2 ring-offset-1 ring-slate-900' : ''
-                }`}
-              >
-                <StickyNote className="w-3.5 h-3.5" aria-hidden="true" />
-              </button>
-            );
-          })}
+          {pageAnnotations
+            .filter((a) => a.kind === 'note' && a.position)
+            .map((ann) => {
+              const pos = ann.position!;
+              const c = HIGHLIGHT_STYLES[ann.color];
+              const isFocused = focusedAnnotationId === ann.id;
+              return (
+                <button
+                  key={ann.id}
+                  type="button"
+                  aria-label={`Sticky note on page ${ann.page}`}
+                  title={ann.note || ann.quote}
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    onFocusAnnotation(ann.id);
+                  }}
+                  style={{
+                    left: `${pos.x * 100}%`,
+                    top: `${pos.y * 100}%`,
+                    backgroundColor: c.hex,
+                  }}
+                  className={`absolute -translate-x-1/2 -translate-y-1/2 pointer-events-auto w-6 h-6 rounded-md text-white shadow-md flex items-center justify-center hover:scale-110 transition-transform ${
+                    isFocused ? 'ring-2 ring-offset-1 ring-slate-900' : ''
+                  }`}
+                >
+                  <StickyNote className="w-3.5 h-3.5" aria-hidden="true" />
+                </button>
+              );
+            })}
 
-        {liveBox && (
-          <div
-            style={{
-              left: `${liveBox.x * 100}%`,
-              top: `${liveBox.y * 100}%`,
-              width: `${liveBox.width * 100}%`,
-              height: `${liveBox.height * 100}%`,
-              borderColor: HIGHLIGHT_STYLES[selectedColor].hex,
-              backgroundColor: `${HIGHLIGHT_STYLES[selectedColor].hex}22`,
-            }}
-            className="absolute border-2 border-dashed rounded-sm pointer-events-none"
-          />
-        )}
+          {liveBox && (
+            <div
+              style={{
+                left: `${liveBox.x * 100}%`,
+                top: `${liveBox.y * 100}%`,
+                width: `${liveBox.width * 100}%`,
+                height: `${liveBox.height * 100}%`,
+                borderColor: HIGHLIGHT_STYLES[selectedColor].hex,
+                backgroundColor: `${HIGHLIGHT_STYLES[selectedColor].hex}22`,
+              }}
+              className="absolute border-2 border-dashed rounded-sm pointer-events-none"
+            />
+          )}
+        </div>
       </div>
+
+      {format === 'djvu' && !djvuBlankBitmap && djvuPageText && (
+        <details className={`border-t ${themeBorder} ${themeBgSurface} ${themeText} text-xs`}>
+          <summary className={`px-3 py-1.5 cursor-pointer select-none ${themeMuted} hover:opacity-100`}>
+            Selectable OCR Text Layer (Page {pageNumber})
+          </summary>
+          <div className={`px-4 pb-3 pt-1 max-h-40 overflow-y-auto ${fontClass} leading-relaxed whitespace-pre-wrap select-text`}>
+            {djvuPageText}
+          </div>
+        </details>
+      )}
     </div>
   );
 };

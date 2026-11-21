@@ -16,6 +16,7 @@ import {
   detectSupportedBookFormat,
   sanitizeId,
 } from './libraryLogic';
+import {yieldToMain} from './batchYield';
 import {
   closeDjvuDocument,
   extractDjvuCoverThumbnail,
@@ -289,6 +290,7 @@ export async function scanAndBackfillBookHashes(books: BookMetadata[]): Promise<
     } catch {
       updated.push(book);
     }
+    await yieldToMain(8);
   }
   return updated;
 }
@@ -331,7 +333,8 @@ export async function createLocalBackupSnapshot(
   const courses = await db.getAll('courses');
   const preferences = (await db.get('preferences', 'reader')) || DEFAULT_PREFERENCES;
   const readingGoal = (await db.get('goals', 'default')) || createDefaultReadingGoal('local');
-  const textChunks = (await db.getAll('textChunks')).flat();
+  // Automatic snapshots omit heavy full-text search chunks so frequent backups stay instantaneous & low-RAM
+  const textChunks = trigger === 'manual' ? (await db.getAll('textChunks')).flat() : [];
 
   const now = Date.now();
   const archive: BackupArchive = {
@@ -430,7 +433,7 @@ export async function extractCoverFromBuffer(
       let doc: Awaited<ReturnType<typeof openDjvuDocument>> | null = null;
       try {
         doc = await openDjvuDocument(buffer);
-        return extractDjvuCoverThumbnail(doc, title);
+        return await extractDjvuCoverThumbnail(doc, title);
       } finally {
         closeDjvuDocument(doc);
       }
@@ -518,8 +521,8 @@ export async function ingestImportedBuffer(
         doc = await openDjvuDocument(buffer);
         pageCount = Math.max(1, doc.page_count());
         const sampleLimit = Math.min(pageCount, targetSampleLimit);
-        const pageTexts = extractDjvuPageTextRange(doc, 1, sampleLimit);
-        coverDataUrl = extractDjvuCoverThumbnail(doc, title);
+        const pageTexts = await extractDjvuPageTextRange(doc, 1, sampleLimit);
+        coverDataUrl = await extractDjvuCoverThumbnail(doc, title);
         chunks = pageTexts.map((p) => ({
           bookId: id,
           bookTitle: title,
@@ -648,7 +651,7 @@ export async function indexRemainingBookChunks(
       let doc: Awaited<ReturnType<typeof openDjvuDocument>> | null = null;
       try {
         doc = await openDjvuDocument(buffer);
-        const batch = extractDjvuPageTextRange(doc, startFrom, doc.page_count());
+        const batch = await extractDjvuPageTextRange(doc, startFrom, doc.page_count());
         for (const p of batch) {
           if (!indexedPages.has(p.page)) {
             indexedPages.add(p.page);

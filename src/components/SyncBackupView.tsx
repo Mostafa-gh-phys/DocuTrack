@@ -8,6 +8,7 @@ import {
   Laptop,
   LogOut,
   RefreshCw,
+  Server,
   ShieldCheck,
   Upload,
 } from 'lucide-react';
@@ -17,6 +18,7 @@ import type {
   BookMetadata,
   ReaderPreferences,
 } from '../types/library';
+import type {CustomCloudAuthType, CustomCloudConfig, CustomCloudProvider} from '../utils/customCloudSync';
 import {formatBytes} from '../utils/libraryLogic';
 
 interface SyncBackupViewProps {
@@ -27,6 +29,9 @@ interface SyncBackupViewProps {
   backups: BackupSnapshotRecord[];
   preferences: ReaderPreferences;
   linkedBackupDirName: string | null;
+  customCloudConfig: CustomCloudConfig;
+  customCloudStatus: string | null;
+  customCloudBusy: boolean;
   onSignIn: () => void;
   onSignOut: () => void;
   onSyncAllToCloud: () => void;
@@ -38,6 +43,10 @@ interface SyncBackupViewProps {
   onRestoreBackupFile: (file: File) => void;
   onRestoreSnapshot: (backupId: string) => void;
   onLinkLocalBackupFolder: () => void;
+  onUpdateCustomCloudConfig: (next: CustomCloudConfig, persistSecret: boolean) => void;
+  onTestCustomCloud: () => Promise<{ok: boolean; message: string}>;
+  onSyncCustomCloud: () => Promise<void>;
+  onPullCustomCloud: () => Promise<void>;
 }
 
 export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
@@ -48,6 +57,9 @@ export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
   backups,
   preferences,
   linkedBackupDirName,
+  customCloudConfig,
+  customCloudStatus,
+  customCloudBusy,
   onSignIn,
   onSignOut,
   onSyncAllToCloud,
@@ -59,9 +71,15 @@ export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
   onRestoreBackupFile,
   onRestoreSnapshot,
   onLinkLocalBackupFolder,
+  onUpdateCustomCloudConfig,
+  onTestCustomCloud,
+  onSyncCustomCloud,
+  onPullCustomCloud,
 }) => {
   const restoreInputRef = useRef<HTMLInputElement | null>(null);
   const [restoreFeedback, setRestoreFeedback] = useState<string | null>(null);
+  const [persistSecret, setPersistSecret] = useState(Boolean(customCloudConfig.secret));
+  const [customTestResult, setCustomTestResult] = useState<{ok: boolean; message: string} | null>(null);
 
   const supportsDirectoryPicker =
     typeof window !== 'undefined' && 'showDirectoryPicker' in window;
@@ -137,6 +155,223 @@ export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
         {syncStatus && (
           <div className="text-xs text-slate-600 dark:text-slate-300 pt-2 border-t border-slate-100 dark:border-slate-800">
             Sync status: {syncStatus}
+          </div>
+        )}
+      </section>
+
+      {/* 1b. Custom Cloud Storage Sync (WebDAV / Nextcloud / ownCloud / Custom HTTPS) */}
+      <section
+        aria-label="Custom cloud storage sync"
+        className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-5"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <Server className="w-5 h-5 accent-text" aria-hidden="true" />
+            <div>
+              <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                Custom Cloud Storage Sync (WebDAV / Custom HTTPS)
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Synchronize your library catalog, bookmarks, annotations, and courses to Nextcloud, ownCloud, Synology WebDAV, or your own HTTPS storage endpoint.
+              </p>
+            </div>
+          </div>
+
+          <label className="flex items-center gap-2 text-xs font-medium cursor-pointer">
+            <input
+              type="checkbox"
+              checked={customCloudConfig.enabled}
+              onChange={(e) =>
+                onUpdateCustomCloudConfig({...customCloudConfig, enabled: e.target.checked}, persistSecret)
+              }
+            />
+            <span>Enable Custom Sync</span>
+          </label>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+          <div className="space-y-1.5">
+            <label htmlFor="custom-cloud-provider" className="block font-medium opacity-80">
+              Storage Protocol
+            </label>
+            <select
+              id="custom-cloud-provider"
+              value={customCloudConfig.provider}
+              onChange={(e) =>
+                onUpdateCustomCloudConfig(
+                  {...customCloudConfig, provider: e.target.value as CustomCloudProvider},
+                  persistSecret,
+                )
+              }
+              className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100"
+            >
+              <option value="webdav">WebDAV Folder (Nextcloud / ownCloud / NAS)</option>
+              <option value="custom-json">Custom HTTPS JSON Endpoint (GET / PUT)</option>
+            </select>
+          </div>
+
+          <div className="space-y-1.5">
+            <label htmlFor="custom-cloud-auth" className="block font-medium opacity-80">
+              Authentication Method
+            </label>
+            <select
+              id="custom-cloud-auth"
+              value={customCloudConfig.authType}
+              onChange={(e) =>
+                onUpdateCustomCloudConfig(
+                  {...customCloudConfig, authType: e.target.value as CustomCloudAuthType},
+                  persistSecret,
+                )
+              }
+              className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100"
+            >
+              <option value="basic">Basic Auth (Username + App Password)</option>
+              <option value="bearer">Bearer API Token</option>
+              <option value="none">No Auth Header</option>
+            </select>
+          </div>
+
+          <div className="space-y-1.5 md:col-span-2">
+            <label htmlFor="custom-cloud-url" className="block font-medium opacity-80">
+              {customCloudConfig.provider === 'webdav' ? 'WebDAV Folder URL' : 'HTTPS Endpoint URL'}
+            </label>
+            <input
+              id="custom-cloud-url"
+              type="url"
+              value={customCloudConfig.endpointUrl}
+              onChange={(e) => {
+                setCustomTestResult(null);
+                onUpdateCustomCloudConfig({...customCloudConfig, endpointUrl: e.target.value}, persistSecret);
+              }}
+              placeholder={
+                customCloudConfig.provider === 'webdav'
+                  ? 'https://cloud.example.com/remote.php/dav/files/username/DocuTrack'
+                  : 'https://storage.example.com/api/docutrack-sync'
+              }
+              className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"
+            />
+          </div>
+
+          {customCloudConfig.provider === 'webdav' && (
+            <div className="space-y-1.5">
+              <label htmlFor="custom-cloud-filename" className="block font-medium opacity-80">
+                Remote Archive Filename
+              </label>
+              <input
+                id="custom-cloud-filename"
+                type="text"
+                value={customCloudConfig.remoteFileName}
+                onChange={(e) =>
+                  onUpdateCustomCloudConfig({...customCloudConfig, remoteFileName: e.target.value}, persistSecret)
+                }
+                placeholder="docutrack-library-sync.json"
+                className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"
+              />
+            </div>
+          )}
+
+          {customCloudConfig.authType === 'basic' && (
+            <div className="space-y-1.5">
+              <label htmlFor="custom-cloud-user" className="block font-medium opacity-80">
+                Username
+              </label>
+              <input
+                id="custom-cloud-user"
+                type="text"
+                autoComplete="username"
+                value={customCloudConfig.username}
+                onChange={(e) =>
+                  onUpdateCustomCloudConfig({...customCloudConfig, username: e.target.value}, persistSecret)
+                }
+                placeholder="nextcloud-user"
+                className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent text-xs"
+              />
+            </div>
+          )}
+
+          {customCloudConfig.authType !== 'none' && (
+            <div className={`space-y-1.5 ${customCloudConfig.provider === 'custom-json' && customCloudConfig.authType === 'bearer' ? 'md:col-span-2' : ''}`}>
+              <label htmlFor="custom-cloud-secret" className="block font-medium opacity-80">
+                {customCloudConfig.authType === 'bearer' ? 'Bearer Token' : 'App Password / Secret'}
+              </label>
+              <input
+                id="custom-cloud-secret"
+                type="password"
+                autoComplete="current-password"
+                value={customCloudConfig.secret}
+                onChange={(e) =>
+                  onUpdateCustomCloudConfig({...customCloudConfig, secret: e.target.value}, persistSecret)
+                }
+                placeholder="••••••••••••"
+                className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"
+              />
+            </div>
+          )}
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+          <label className="flex items-center gap-2 text-xs opacity-75 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={persistSecret}
+              onChange={(e) => {
+                const nextPersist = e.target.checked;
+                setPersistSecret(nextPersist);
+                onUpdateCustomCloudConfig(customCloudConfig, nextPersist);
+              }}
+            />
+            <span>Remember password/token on this browser</span>
+          </label>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={customCloudBusy}
+              onClick={() => {
+                void (async () => {
+                  const res = await onTestCustomCloud();
+                  setCustomTestResult(res);
+                })();
+              }}
+              className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-45"
+            >
+              Test Connection
+            </button>
+            <button
+              type="button"
+              disabled={customCloudBusy || !customCloudConfig.endpointUrl.trim()}
+              onClick={() => void onPullCustomCloud()}
+              className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-45"
+            >
+              Pull Remote
+            </button>
+            <button
+              type="button"
+              disabled={customCloudBusy || !customCloudConfig.endpointUrl.trim()}
+              onClick={() => void onSyncCustomCloud()}
+              className="px-3.5 py-2 rounded-lg accent-btn text-xs font-medium flex items-center gap-1.5 disabled:opacity-45"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${customCloudBusy ? 'animate-spin' : ''}`} aria-hidden="true" />
+              Sync (Merge &amp; Push)
+            </button>
+          </div>
+        </div>
+
+        {(customTestResult || customCloudStatus || customCloudConfig.lastSyncedAtMs) && (
+          <div className="pt-2 border-t border-slate-100 dark:border-slate-800 text-xs space-y-1">
+            {customTestResult && (
+              <p className={customTestResult.ok ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}>
+                {customTestResult.message}
+              </p>
+            )}
+            {customCloudStatus && (
+              <p className="text-slate-600 dark:text-slate-300">{customCloudStatus}</p>
+            )}
+            {customCloudConfig.lastSyncedAtMs && (
+              <p className="text-slate-500 dark:text-slate-400 tabular-nums">
+                Last custom sync: {new Date(customCloudConfig.lastSyncedAtMs).toLocaleString()}
+              </p>
+            )}
           </div>
         )}
       </section>

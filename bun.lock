@@ -11,6 +11,7 @@
         "@vitejs/plugin-react": "^6.1.1",
         "djvu": "^1.0.1",
         "djvu-rs": "^0.46.0",
+        "djvujs-dist": "^0.5.4",
         "dotenv": "^17.2.3",
         "eslint": "^10.15.0",
         "express": "^4.21.2",
@@ -871,6 +872,8 @@
     "djvu": ["djvu@1.0.1", "", { "dependencies": { "djv": "^0.1.2" } }, "sha512-tFSsoWle2wO2f6XbnsDqZjdgQO1JcDBj0dLQpDa/caqNukjFXuOxdokY0CSk7K11D6EdX3DKwceNHENz419CUw=="],
 
     "djvu-rs": ["djvu-rs@0.46.0", "", {}, "sha512-ngVO2NXNx3h0CDMbC44qW+gDzFMAwRrku9+zmAwObeJmIQUAAkhmpUF6rQwRCdnho4uGr6HHjFmOGGB9EuUrqw=="],
+
+    "djvujs-dist": ["djvujs-dist@0.5.4", "", { "hasInstallScript": true }, "sha512-zEKOeiXlQ81mxWXhlZ0qnjSr1WBB9dWa8BhhlJjc4e+h9SVHsTl0Sz2IuMrkwDM/ZMn0aUeZQG+J7ODiTAtDpQ=="],
 
     "dotenv": ["dotenv@17.4.2", "", {}, "sha512-nI4U3TottKAcAD9LLud4Cb7b2QztQMUEfHbvhTH09bqXTxnSie8WnjPALV/WMCrJZ6UV/qHJ6L03OqO3LcdYZw=="],
 

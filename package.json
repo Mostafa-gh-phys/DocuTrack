@@ -20,6 +20,7 @@
     "@vitejs/plugin-react": "^6.1.1",
     "djvu": "^1.0.1",
     "djvu-rs": "^0.46.0",
+    "djvujs-dist": "^0.5.4",
     "dotenv": "^17.2.3",
     "eslint": "^10.15.0",
     "express": "^4.21.2",

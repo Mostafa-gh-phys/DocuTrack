@@ -1,9 +1,10 @@
 import JSZip from 'jszip';
 import {PDFDocument, StandardFonts, rgb} from 'pdf-lib';
 import type {BookFormat, ScanEnhanceSettings} from '../types/library';
-import {openDjvuDocument, renderDjvuPageToCanvas} from './parsers/djvuParser';
+import {releaseCanvasMemory, yieldToMain} from './batchYield';
+import {closeDjvuDocument, openDjvuDocument, renderDjvuPageToCanvas} from './parsers/djvuParser';
 import {parseEpubDocument} from './parsers/epubParser';
-import {extractPdfOutlineAndMeta, extractPdfPageTextRange, loadPdfDocument} from './parsers/pdfParser';
+import {closePdfDocument, extractPdfOutlineAndMeta, extractPdfPageTextRange, loadPdfDocument} from './parsers/pdfParser';
 import {applyScanEnhancementToCanvas, getScanPresetSettings} from './scanEnhance';
 
 export type ConvertibleSourceFormat = BookFormat | 'txt' | 'md' | 'html';
@@ -405,6 +406,7 @@ export async function convertDocumentLocally(options: {
   author: string;
   baseFilename: string;
   cleanScannedImages?: boolean;
+  signal?: AbortSignal;
   onProgress?: (status: string) => void;
 }): Promise<LocalConversionResult> {
   const {
@@ -415,74 +417,101 @@ export async function convertDocumentLocally(options: {
     author,
     baseFilename,
     cleanScannedImages = true,
+    signal,
     onProgress,
   } = options;
 
+  const checkAborted = () => {
+    if (signal?.aborted) {
+      throw new DOMException('Conversion cancelled by user.', 'AbortError');
+    }
+  };
+
+  checkAborted();
   const cleanStem = baseFilename.replace(/\.(pdf|epub|djvu|txt|md|markdown|html|htm)$/i, '') || 'converted';
   const outExt = targetFormat;
   const outFilename = `${cleanStem}.${outExt}`;
 
-  // Special high-fidelity raster/hybrid DjVu -> PDF converter path
+  // Special high-fidelity raster/hybrid DjVu -> PDF converter path (bounded canvas + cooperative yields)
   if (sourceFormat === 'djvu' && targetFormat === 'pdf') {
     onProgress?.('Decoding DjVu pages & optimizing bitmaps...');
-    const djvuDoc = await openDjvuDocument(sourceBuffer);
-    const total = Math.max(1, djvuDoc.page_count());
-    const pdfDoc = await PDFDocument.create();
-    pdfDoc.setTitle(toAsciiSafePdfText(title));
-    pdfDoc.setAuthor(toAsciiSafePdfText(author));
-    pdfDoc.setCreator('DocuTrack DjVu->PDF Converter');
+    let djvuDoc: Awaited<ReturnType<typeof openDjvuDocument>> | null = null;
+    const sharedCanvas = document.createElement('canvas');
 
-    const textSections: DocumentSection[] = [];
-    const scanPreset: ScanEnhanceSettings = cleanScannedImages
-      ? getScanPresetSettings('clean-scan')
-      : getScanPresetSettings('original');
+    try {
+      djvuDoc = await openDjvuDocument(sourceBuffer);
+      const total = Math.max(1, djvuDoc.page_count());
+      const pdfDoc = await PDFDocument.create();
+      pdfDoc.setTitle(toAsciiSafePdfText(title));
+      pdfDoc.setAuthor(toAsciiSafePdfText(author));
+      pdfDoc.setCreator('DocuTrack DjVu->PDF Converter');
 
-    for (let p = 1; p <= total; p++) {
-      onProgress?.(`Rendering page ${p} of ${total}...`);
-      const canvas = document.createElement('canvas');
-      const rendered = renderDjvuPageToCanvas(djvuDoc, p, canvas, 175);
+      const textSections: DocumentSection[] = [];
+      const scanPreset: ScanEnhanceSettings = cleanScannedImages
+        ? getScanPresetSettings('clean-scan')
+        : getScanPresetSettings('original');
 
-      if (!rendered.isBlankBitmap) {
-        if (cleanScannedImages) {
-          applyScanEnhancementToCanvas(canvas, scanPreset);
+      for (let p = 1; p <= total; p++) {
+        checkAborted();
+        onProgress?.(`Rendering page ${p} of ${total}...`);
+        const native = await djvuDoc.getPageNativeSize(p);
+        const maxWidth = 1500;
+        const desiredScale = Math.min(1, maxWidth / Math.max(1, native.width));
+        const targetDpi = Math.max(72, Math.min(175, Math.round(native.dpi * desiredScale)));
+
+        const rendered = await renderDjvuPageToCanvas(djvuDoc, p, sharedCanvas, targetDpi);
+        checkAborted();
+
+        if (!rendered.isBlankBitmap) {
+          if (cleanScannedImages) {
+            applyScanEnhancementToCanvas(sharedCanvas, scanPreset);
+          }
+          const jpgDataUrl = sharedCanvas.toDataURL('image/jpeg', 0.85);
+          const base64 = jpgDataUrl.split(',')[1] || '';
+          const binStr = atob(base64);
+          const jpgBytes = new Uint8Array(binStr.length);
+          for (let i = 0; i < binStr.length; i++) jpgBytes[i] = binStr.charCodeAt(i);
+          const img = await pdfDoc.embedJpg(jpgBytes);
+          const page = pdfDoc.addPage([rendered.width, rendered.height]);
+          page.drawImage(img, {x: 0, y: 0, width: rendered.width, height: rendered.height});
+        } else {
+          textSections.push({
+            title: `Page ${p}`,
+            paragraphs: splitLongTextToParagraphs(rendered.text || `${title} — Page ${p}`),
+          });
         }
-        const jpgDataUrl = canvas.toDataURL('image/jpeg', 0.88);
-        const base64 = jpgDataUrl.split(',')[1] || '';
-        const binStr = atob(base64);
-        const jpgBytes = new Uint8Array(binStr.length);
-        for (let i = 0; i < binStr.length; i++) jpgBytes[i] = binStr.charCodeAt(i);
-        const img = await pdfDoc.embedJpg(jpgBytes);
-        const page = pdfDoc.addPage([rendered.width, rendered.height]);
-        page.drawImage(img, {x: 0, y: 0, width: rendered.width, height: rendered.height});
-      } else {
-        textSections.push({
-          title: `Page ${p}`,
-          paragraphs: splitLongTextToParagraphs(rendered.text || `${title} — Page ${p}`),
-        });
-      }
-    }
 
-    if (pdfDoc.getPageCount() === 0 && textSections.length > 0) {
-      const built = await buildPdfFromSections(title, author, textSections);
+        if (p < total) {
+          await yieldToMain(8);
+        }
+      }
+
+      checkAborted();
+      if (pdfDoc.getPageCount() === 0 && textSections.length > 0) {
+        const built = await buildPdfFromSections(title, author, textSections);
+        return {
+          filename: outFilename,
+          targetFormat,
+          mimeType: 'application/pdf',
+          bytes: built.bytes,
+          pageOrChapterCount: built.pageCount,
+          summaryNote: `Converted archival DjVu text (${total} pages) to clean vector PDF (${built.pageCount} pages).`,
+        };
+      }
+
+      const bytes = await pdfDoc.save();
       return {
         filename: outFilename,
         targetFormat,
         mimeType: 'application/pdf',
-        bytes: built.bytes,
-        pageOrChapterCount: built.pageCount,
-        summaryNote: `Converted archival DjVu text (${total} pages) to clean vector PDF (${built.pageCount} pages).`,
+        bytes,
+        pageOrChapterCount: pdfDoc.getPageCount(),
+        summaryNote: `Converted ${pdfDoc.getPageCount()} DjVu pages to PDF${cleanScannedImages ? ' with Clean Scan enhancement' : ''}.`,
       };
+    } finally {
+      closeDjvuDocument(djvuDoc);
+      releaseCanvasMemory(sharedCanvas);
     }
-
-    const bytes = await pdfDoc.save();
-    return {
-      filename: outFilename,
-      targetFormat,
-      mimeType: 'application/pdf',
-      bytes,
-      pageOrChapterCount: pdfDoc.getPageCount(),
-      summaryNote: `Converted ${pdfDoc.getPageCount()} DjVu pages to PDF${cleanScannedImages ? ' with Clean Scan enhancement' : ''}.`,
-    };
   }
 
   // Extract normalized DocumentSections from any source format
@@ -492,38 +521,61 @@ export async function convertDocumentLocally(options: {
   let sections: DocumentSection[] = [];
 
   if (sourceFormat === 'pdf') {
-    const doc = await loadPdfDocument(sourceBuffer);
-    const [meta, pageTexts] = await Promise.all([
-      extractPdfOutlineAndMeta(doc),
-      extractPdfPageTextRange(doc, 1, doc.numPages),
-    ]);
-    if (meta.title) resolvedTitle = meta.title;
-    if (meta.author) resolvedAuthor = meta.author;
-    const outlineByPage = new Map(meta.outline.map((o) => [o.page, o.title]));
-    sections = pageTexts.map((pt) => ({
-      title: outlineByPage.get(pt.page) || `Page ${pt.page}`,
-      paragraphs: splitLongTextToParagraphs(pt.text || `[Page ${pt.page} contains scanned artwork without OCR text]`),
-    }));
+    let doc: Awaited<ReturnType<typeof loadPdfDocument>> | null = null;
+    try {
+      doc = await loadPdfDocument(sourceBuffer);
+      checkAborted();
+      const [meta, pageTexts] = await Promise.all([
+        extractPdfOutlineAndMeta(doc),
+        extractPdfPageTextRange(doc, 1, doc.numPages),
+      ]);
+      checkAborted();
+      if (meta.title) resolvedTitle = meta.title;
+      if (meta.author) resolvedAuthor = meta.author;
+      const outlineByPage = new Map(meta.outline.map((o) => [o.page, o.title]));
+      sections = pageTexts.map((pt) => ({
+        title: outlineByPage.get(pt.page) || `Page ${pt.page}`,
+        paragraphs: splitLongTextToParagraphs(pt.text || `[Page ${pt.page} contains scanned artwork without OCR text]`),
+      }));
+    } finally {
+      await closePdfDocument(doc);
+    }
   } else if (sourceFormat === 'epub') {
     const parsed = await parseEpubDocument(sourceBuffer);
-    if (parsed.title) resolvedTitle = parsed.title;
-    if (parsed.author) resolvedAuthor = parsed.author;
-    sections = parsed.chapters.map((ch) => {
-      const extracted = stripHtmlToParagraphs(ch.html);
-      return {
-        title: ch.title,
-        paragraphs: extracted.paragraphs.length > 0 ? extracted.paragraphs : splitLongTextToParagraphs(ch.plainText),
-      };
-    });
+    try {
+      checkAborted();
+      if (parsed.title) resolvedTitle = parsed.title;
+      if (parsed.author) resolvedAuthor = parsed.author;
+      for (let i = 0; i < parsed.chapters.length; i++) {
+        checkAborted();
+        const ch = parsed.chapters[i];
+        const extracted = stripHtmlToParagraphs(ch.html);
+        sections.push({
+          title: ch.title,
+          paragraphs: extracted.paragraphs.length > 0 ? extracted.paragraphs : splitLongTextToParagraphs(ch.plainText),
+        });
+        if (i % 10 === 9) await yieldToMain(4);
+      }
+    } finally {
+      parsed.dispose();
+    }
   } else if (sourceFormat === 'djvu') {
-    const doc = await openDjvuDocument(sourceBuffer);
-    const count = Math.max(1, doc.page_count());
-    for (let p = 1; p <= count; p++) {
-      const text = doc.page(p - 1).text() || '';
-      sections.push({
-        title: `Page ${p}`,
-        paragraphs: splitLongTextToParagraphs(text || `[DjVu page ${p} image layer]`),
-      });
+    let doc: Awaited<ReturnType<typeof openDjvuDocument>> | null = null;
+    try {
+      doc = await openDjvuDocument(sourceBuffer);
+      const count = Math.max(1, doc.page_count());
+      for (let p = 1; p <= count; p++) {
+        checkAborted();
+        onProgress?.(`Extracting DjVu text page ${p} of ${count}...`);
+        const text = (await doc.getPageText(p)) || '';
+        sections.push({
+          title: `Page ${p}`,
+          paragraphs: splitLongTextToParagraphs(text || `[DjVu page ${p} image layer]`),
+        });
+        if (p % 6 === 0) await yieldToMain(4);
+      }
+    } finally {
+      closeDjvuDocument(doc);
     }
   } else {
     const raw = new TextDecoder('utf-8').decode(sourceBuffer);
@@ -536,6 +588,7 @@ export async function convertDocumentLocally(options: {
     }
   }
 
+  checkAborted();
   onProgress?.(`Building ${targetFormat.toUpperCase()} output...`);
 
   if (targetFormat === 'pdf') {

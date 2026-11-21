@@ -318,11 +318,11 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           </div>
         </div>
 
-        {/* Folder Structure Browser (Mirrors Sidebar Drive Tree in Main Library) */}
+        {/* Readest-inspired Folder Shelf Browser */}
         {showFolderBrowser && folderContents.childFolders.length > 0 && (
           <section aria-label="Folder structure" className="space-y-2.5">
             <div className="flex items-center justify-between">
-              <h2 className="text-xs font-semibold uppercase tracking-wide opacity-60">
+              <h2 className="text-[11px] font-semibold uppercase tracking-wider opacity-55">
                 {activeFolder ? 'Subfolders' : 'Folders'}
               </h2>
               <span className="text-xs tabular-nums opacity-55">
@@ -330,21 +330,19 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 {folderContents.childFolders.length === 1 ? 'folder' : 'folders'}
               </span>
             </div>
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-2.5">
               {folderContents.childFolders.map((folder) => (
                 <button
                   key={folder.path}
                   type="button"
                   data-testid="main-folder-card"
                   onClick={() => onSelectFolder(folder.path)}
-                  className="group text-left rounded-xl border app-border app-surface px-3.5 py-3 hover:border-current transition-colors flex items-center gap-3 min-w-0"
+                  className="group text-left rounded-lg border app-border app-surface px-3 py-2.5 hover:border-current transition-colors flex items-center gap-2.5 min-w-0"
                 >
-                  <div className="w-8 h-8 rounded-lg accent-soft flex items-center justify-center shrink-0">
-                    <Folder className="w-4 h-4 accent-text" aria-hidden="true" />
-                  </div>
+                  <Folder className="w-4 h-4 accent-text shrink-0" aria-hidden="true" />
                   <div className="min-w-0 flex-1">
-                    <p className="text-sm font-medium truncate group-hover:underline">{folder.name}</p>
-                    <p className="text-xs opacity-60 tabular-nums truncate">
+                    <p className="text-[13px] font-medium truncate group-hover:underline">{folder.name}</p>
+                    <p className="text-[11px] opacity-60 tabular-nums truncate">
                       {folder.count} {folder.count === 1 ? 'book' : 'books'}
                       {folder.children.length > 0 ? ` · ${folder.children.length} sub` : ''}
                     </p>
@@ -430,90 +428,90 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             </button>
           </div>
         ) : viewMode === 'grid' ? (
-          /* Editorial Grid View with Uncropped Real Book Cover Framing */
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
+          /* Readest-Inspired Bookshelf Grid: Upright 2:3 Covers + Uncluttered Metadata Below */
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-x-5 gap-y-7">
             {books.map((book) => {
               const bookAnnCount = annotations.filter((a) => a.bookId === book.id).length;
               const hasCourse = courses.some((c) => c.bookId === book.id);
               const resolvedCover = bookCovers[book.id] || book.coverUrl;
               const showFallbackCover = !resolvedCover || failedCovers[book.id];
-              const isDataCover = Boolean(resolvedCover && resolvedCover.startsWith('data:'));
 
               return (
                 <article
                   key={book.id}
-                  className="group rounded-xl border app-border app-surface overflow-hidden flex flex-col transition-colors hover:shadow-sm"
+                  data-testid="book-shelf-card"
+                  className="group flex flex-col min-w-0"
                 >
                   <button
                     type="button"
                     onClick={() => onOpenBook(book)}
-                    className="text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-700"
+                    className="text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-700 rounded-lg"
                   >
-                    <div
-                      className={`h-48 w-full app-surface-muted overflow-hidden relative flex items-center justify-center ${
-                        isDataCover ? 'p-3' : ''
-                      }`}
-                    >
+                    {/* Upright Book Cover Frame */}
+                    <div className="relative aspect-[2/3] w-full rounded-lg border app-border app-surface overflow-hidden shadow-xs group-hover:shadow-md transition-all">
                       {!showFallbackCover ? (
                         <img
                           src={resolvedCover}
                           alt={`Cover for ${book.title}`}
                           referrerPolicy="no-referrer"
                           onError={() => setFailedCovers((prev) => ({...prev, [book.id]: true}))}
-                          className={
-                            isDataCover
-                              ? 'max-h-full max-w-full w-auto h-full object-contain rounded shadow-sm border border-black/10 bg-white transition-transform duration-200 group-hover:scale-[1.03]'
-                              : 'w-full h-full object-cover transition-transform duration-200 group-hover:scale-[1.02]'
-                          }
+                          className="w-full h-full object-cover bg-white transition-transform duration-200 group-hover:scale-[1.02]"
                         />
                       ) : (
-                        <div className="w-full h-full flex flex-col justify-between p-5">
-                          <span className="font-mono text-xs uppercase tracking-wider opacity-60">
-                            {book.format}
-                          </span>
-                          <div>
-                            <p className="font-serif-reader text-base font-semibold line-clamp-2">{book.title}</p>
-                            <p className="mt-1 text-xs opacity-65 truncate">{book.author}</p>
+                        <div className="w-full h-full p-4 flex flex-col justify-between app-surface-muted">
+                          <div className="flex items-center justify-between text-[10px] font-mono uppercase tracking-wider opacity-60">
+                            <span>{book.format}</span>
+                            <span className="tabular-nums">{book.pageCount}p</span>
                           </div>
+                          <div className="my-auto py-2">
+                            <p className="font-serif-reader text-sm font-semibold leading-snug line-clamp-4">
+                              {book.title}
+                            </p>
+                          </div>
+                          <p className="text-[11px] opacity-65 truncate border-t app-border pt-2">
+                            {book.author}
+                          </p>
                         </div>
                       )}
+                      {/* Subtle book spine crease on left edge */}
+                      <div
+                        aria-hidden="true"
+                        className="pointer-events-none absolute inset-y-0 left-0 w-2 bg-gradient-to-r from-black/15 to-transparent"
+                      />
                     </div>
 
-                    <div className="p-4 pb-2 space-y-1.5">
-                      <div className="text-xs opacity-65 flex items-center gap-1.5 truncate">
-                        <span className="font-mono uppercase font-medium">{book.format}</span>
-                        <span aria-hidden="true">·</span>
-                        <span className="truncate">{book.folderPath}</span>
+                    {/* Clean Unboxed Title & Metadata Below Cover */}
+                    <div className="pt-2.5 space-y-0.5">
+                      <h3 className="text-sm font-semibold leading-snug line-clamp-2 group-hover:underline">
+                        {book.title}
+                      </h3>
+                      <p className="text-xs opacity-65 truncate">{book.author}</p>
+                      <div className="text-[11px] opacity-55 flex items-center justify-between gap-2 tabular-nums pt-0.5">
+                        <span className="font-mono uppercase">{book.format}</span>
+                        <span>
+                          {book.progress}% · {book.pageCount}p
+                        </span>
                       </div>
-                      <h3 className="text-base font-semibold leading-snug line-clamp-2">{book.title}</h3>
-                      <p className="text-xs opacity-70 truncate">{book.author}</p>
                     </div>
                   </button>
 
-                  <div className="px-4 pt-2 pb-4 mt-auto space-y-3">
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between text-xs opacity-65 tabular-nums">
-                        <span>
-                          Page {book.currentPage} of {book.pageCount} · {formatBytes(book.fileSize)}
-                        </span>
-                        <span className="font-medium opacity-100">{book.progress}%</span>
-                      </div>
-                      <div className="h-1 w-full rounded-full app-surface-muted overflow-hidden">
-                        <div
-                          className="h-full"
-                          style={{width: `${book.progress}%`, backgroundColor: 'var(--accent)'}}
-                        />
-                      </div>
+                  {/* Slim Reading Progress Track & Compact Action Strip */}
+                  <div className="mt-2 space-y-2">
+                    <div className="h-[3px] w-full rounded-full app-surface-muted overflow-hidden">
+                      <div
+                        className="h-full transition-[width] duration-200"
+                        style={{width: `${book.progress}%`, backgroundColor: 'var(--accent)'}}
+                      />
                     </div>
 
-                    <div className="pt-2 border-t app-border flex items-center justify-between gap-2">
+                    <div className="flex items-center justify-between gap-1">
                       <div className="flex items-center gap-0.5">
                         <button
                           type="button"
                           onClick={() => onToggleFavorite(book)}
                           aria-label={book.isFavorite ? `Remove ${book.title} from favorites` : `Favorite ${book.title}`}
                           aria-pressed={book.isFavorite}
-                          className={`p-1.5 rounded-md transition-colors ${
+                          className={`p-1 rounded transition-colors ${
                             book.isFavorite
                               ? 'text-rose-600 bg-rose-50 dark:bg-rose-950/40'
                               : 'opacity-45 hover:opacity-100'
@@ -530,7 +528,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                               : `Pin ${book.title} for offline reading`
                           }
                           aria-pressed={book.offlinePinned}
-                          className={`p-1.5 rounded-md transition-colors ${
+                          className={`p-1 rounded transition-colors ${
                             book.offlinePinned
                               ? 'text-emerald-700 bg-emerald-50 dark:text-emerald-400 dark:bg-emerald-950/40'
                               : 'opacity-45 hover:opacity-100'
@@ -542,7 +540,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                           type="button"
                           onClick={() => onOpenCourseModal(book)}
                           aria-label={`AI summary and lecture course for ${book.title}`}
-                          className={`p-1.5 rounded-md transition-colors ${
+                          className={`p-1 rounded transition-colors ${
                             hasCourse ? 'accent-soft' : 'opacity-45 hover:opacity-100'
                           }`}
                         >
@@ -553,7 +551,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                           onClick={() => onConvertBook(book)}
                           aria-label={`Convert ${book.title} format`}
                           title="Convert format"
-                          className="p-1.5 rounded-md opacity-45 hover:opacity-100 transition-colors"
+                          className="p-1 rounded opacity-45 hover:opacity-100 transition-colors"
                         >
                           <RefreshCw className="w-3.5 h-3.5" />
                         </button>
@@ -561,7 +559,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                           type="button"
                           onClick={() => onDeleteBook(book)}
                           aria-label={`Delete ${book.title}`}
-                          className="p-1.5 rounded-md opacity-45 hover:opacity-100 hover:text-red-600 transition-colors"
+                          className="p-1 rounded opacity-45 hover:opacity-100 hover:text-red-600 transition-colors"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -570,9 +568,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       <button
                         type="button"
                         onClick={() => onOpenBook(book)}
-                        className="px-3 py-1.5 rounded-md text-xs font-medium accent-soft hover:opacity-90 flex items-center gap-1.5 whitespace-nowrap"
+                        className="px-2 py-1 rounded text-[11px] font-medium accent-soft hover:opacity-90 flex items-center gap-1 whitespace-nowrap"
                       >
-                        <BookOpen className="w-3.5 h-3.5" aria-hidden="true" />
+                        <BookOpen className="w-3 h-3" aria-hidden="true" />
                         Read {bookAnnCount > 0 ? `(${bookAnnCount})` : ''}
                       </button>
                     </div>

@@ -1,15 +1,60 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <rect width="64" height="64" rx="14" fill="#0F172A"/>
-  <rect x="4" y="4" width="56" height="56" rx="11" stroke="#334155" stroke-width="1.5"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="dt-bg" x1="64" y1="32" x2="448" y2="480" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0F172A" />
+      <stop offset="55%" stop-color="#142038" />
+      <stop offset="100%" stop-color="#090D18" />
+    </linearGradient>
+    <linearGradient id="dt-paper" x1="128" y1="92" x2="386" y2="424" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFDF8" />
+      <stop offset="100%" stop-color="#F1EAD8" />
+    </linearGradient>
+    <linearGradient id="dt-fold" x1="312" y1="92" x2="388" y2="168" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#E2D7C0" />
+      <stop offset="100%" stop-color="#C9BDA4" />
+    </linearGradient>
+    <linearGradient id="dt-ribbon" x1="168" y1="212" x2="168" y2="438" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2563EB" />
+      <stop offset="100%" stop-color="#1D4ED8" />
+    </linearGradient>
+    <filter id="dt-shadow" x="104" y="76" width="308" height="368" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#020617" flood-opacity="0.55" />
+    </filter>
+  </defs>
+
+  <!-- Modern squircle chassis -->
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#dt-bg)" />
+  <rect x="25.5" y="25.5" width="461" height="461" rx="106.5" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="3" />
+
+  <!-- Architectural paper leaf with folded corner -->
+  <g filter="url(#dt-shadow)">
+    <path d="M128 96C128 87.163 135.163 80 144 80H312L388 156V404C388 412.837 380.837 420 372 420H144C135.163 420 128 412.837 128 404V96Z" fill="url(#dt-paper)" />
+    <!-- Subtle right spine edge -->
+    <rect x="366" y="156" width="22" height="264" rx="2" fill="#E6DEC8" fill-opacity="0.55" />
+    <!-- Corner dog-ear fold -->
+    <path d="M312 80L388 156H328C319.163 156 312 148.837 312 140V80Z" fill="url(#dt-fold)" />
+  </g>
+
+  <!-- Crisp geometric black cadre block (echoing "Docu" frame) -->
+  <rect x="154" y="114" width="128" height="58" rx="7" fill="#090D16" />
   <text
-    x="32"
-    y="42"
+    x="218"
+    y="153"
     text-anchor="middle"
-    font-family="'Computer Modern Serif', 'CMU Serif', 'Latin Modern Roman', Georgia, serif"
-    font-size="30"
+    fill="#FFFFFF"
+    font-family="Georgia, 'Times New Roman', serif"
     font-weight="700"
-    letter-spacing="-2"
-    fill="#F8FAFC"
-  >DT</text>
-  <rect x="14" y="48" width="36" height="3.5" rx="1.75" fill="#1D4ED8"/>
+    font-size="33"
+    letter-spacing="-0.5"
+  >Docu</text>
+
+  <!-- Cobalt vertical reading ribbon -->
+  <path d="M158 202H214V438L186 416L158 438V202Z" fill="url(#dt-ribbon)" />
+  <path d="M158 202H214V208H158V202Z" fill="#60A5FA" fill-opacity="0.45" />
+
+  <!-- Clean editorial ruled lines -->
+  <rect x="240" y="216" width="112" height="12" rx="6" fill="#0F172A" fill-opacity="0.16" />
+  <rect x="240" y="250" width="94" height="10" rx="5" fill="#0F172A" fill-opacity="0.12" />
+  <rect x="240" y="282" width="106" height="10" rx="5" fill="#0F172A" fill-opacity="0.12" />
+  <rect x="240" y="314" width="78" height="10" rx="5" fill="#0F172A" fill-opacity="0.12" />
 </svg>
