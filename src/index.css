@@ -265,8 +265,13 @@
 }
 
 .scroll-smooth-reader {
-  scroll-behavior: smooth;
   overscroll-behavior: contain;
+  will-change: scroll-position;
+  -webkit-overflow-scrolling: touch;
+}
+
+.evince-page-sheet {
+  contain: layout style;
 }
 
 /* Book spread central gutter */

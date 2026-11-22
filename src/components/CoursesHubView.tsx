@@ -1,6 +1,11 @@
 import React, {useState} from 'react';
-import {BookOpen, Download, GraduationCap} from 'lucide-react';
+import {BookOpen, Cpu, Download, GraduationCap, RefreshCw} from 'lucide-react';
 import type {BookMetadata, StudyCourse} from '../types/library';
+import {
+  type AiCourseProvider,
+  fetchLocalAiModels,
+  type LocalAiConfig,
+} from '../utils/localAiClient';
 import {getBookTextChunks} from '../utils/offlineStorage';
 
 interface CoursesHubViewProps {
@@ -8,6 +13,8 @@ interface CoursesHubViewProps {
   courses: StudyCourse[];
   isOnline: boolean;
   simulatedOffline: boolean;
+  localAiConfig: LocalAiConfig;
+  onUpdateLocalAiConfig: (next: LocalAiConfig) => void;
   onOpenBook: (book: BookMetadata) => void;
   onGenerateCourse: (book: BookMetadata, mode: 'course' | 'summary', textContent: string) => Promise<StudyCourse | null>;
 }
@@ -17,6 +24,8 @@ export const CoursesHubView: React.FC<CoursesHubViewProps> = ({
   courses,
   isOnline,
   simulatedOffline,
+  localAiConfig,
+  onUpdateLocalAiConfig,
   onOpenBook,
   onGenerateCourse,
 }) => {
@@ -25,14 +34,85 @@ export const CoursesHubView: React.FC<CoursesHubViewProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [activeCourseId, setActiveCourseId] = useState<string | null>(courses[0]?.id || null);
   const [revealedAnswers, setRevealedAnswers] = useState<Record<string, boolean>>({});
+  const [detectingModels, setDetectingModels] = useState(false);
+  const [detectedModels, setDetectedModels] = useState<string[]>([]);
+  const [detectFeedback, setDetectFeedback] = useState<{ok: boolean; message: string} | null>(null);
 
   const activeCourse = courses.find((c) => c.id === activeCourseId) || courses[0] || null;
+  const isLocalProvider = localAiConfig.provider !== 'gemini';
+
+  const activeUrl =
+    localAiConfig.provider === 'ollama'
+      ? localAiConfig.ollamaUrl
+      : localAiConfig.provider === 'lmstudio'
+        ? localAiConfig.lmStudioUrl
+        : localAiConfig.customBaseUrl;
+
+  const activeModel =
+    localAiConfig.provider === 'ollama'
+      ? localAiConfig.ollamaModel
+      : localAiConfig.provider === 'lmstudio'
+        ? localAiConfig.lmStudioModel
+        : localAiConfig.customModel;
+
+  const handleUrlChange = (val: string) => {
+    setDetectFeedback(null);
+    if (localAiConfig.provider === 'ollama') {
+      onUpdateLocalAiConfig({...localAiConfig, ollamaUrl: val});
+    } else if (localAiConfig.provider === 'lmstudio') {
+      onUpdateLocalAiConfig({...localAiConfig, lmStudioUrl: val});
+    } else {
+      onUpdateLocalAiConfig({...localAiConfig, customBaseUrl: val});
+    }
+  };
+
+  const handleModelChange = (val: string) => {
+    if (localAiConfig.provider === 'ollama') {
+      onUpdateLocalAiConfig({...localAiConfig, ollamaModel: val});
+    } else if (localAiConfig.provider === 'lmstudio') {
+      onUpdateLocalAiConfig({...localAiConfig, lmStudioModel: val});
+    } else {
+      onUpdateLocalAiConfig({...localAiConfig, customModel: val});
+    }
+  };
+
+  const handleDetectModels = async () => {
+    setDetectingModels(true);
+    setDetectFeedback(null);
+    try {
+      const models = await fetchLocalAiModels(localAiConfig);
+      setDetectedModels(models);
+      if (models.length === 0) {
+        setDetectFeedback({
+          ok: false,
+          message: 'Connected, but no models were returned. Load or pull a model in your local runtime first.',
+        });
+      } else {
+        if (!activeModel.trim() || !models.includes(activeModel.trim())) {
+          handleModelChange(models[0]);
+        }
+        setDetectFeedback({
+          ok: true,
+          message: `Found ${models.length} local model${models.length === 1 ? '' : 's'} ready.`,
+        });
+      }
+    } catch (err) {
+      setDetectFeedback({
+        ok: false,
+        message: err instanceof Error ? err.message : 'Unable to reach local AI server.',
+      });
+    } finally {
+      setDetectingModels(false);
+    }
+  };
 
   const handleGenerate = async (mode: 'course' | 'summary') => {
     const targetBook = books.find((b) => b.id === selectedBookId);
     if (!targetBook) return;
-    if (!isOnline || simulatedOffline) {
-      setError('Generating new AI courses requires an online connection. Existing courses remain readable offline.');
+    if (!isLocalProvider && (!isOnline || simulatedOffline)) {
+      setError(
+        'Cloud Gemini requires an online connection. Switch AI Provider to Ollama or LM Studio to generate courses offline.',
+      );
       return;
     }
 
@@ -130,6 +210,152 @@ export const CoursesHubView: React.FC<CoursesHubViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Local & Cloud AI Model Configuration */}
+      <section
+        aria-label="AI course model engine"
+        className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 space-y-3"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-xs font-semibold text-slate-800 dark:text-slate-100">
+            <Cpu className="w-4 h-4 accent-text" aria-hidden="true" />
+            <span>Study Course AI Engine</span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="AI provider">
+            {(
+              [
+                {id: 'gemini', label: 'Cloud Gemini'},
+                {id: 'ollama', label: 'Ollama (Local)'},
+                {id: 'lmstudio', label: 'LM Studio (Local)'},
+                {id: 'openai-compat', label: 'Custom Local / OpenAI-API'},
+              ] as {id: AiCourseProvider; label: string}[]
+            ).map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                aria-pressed={localAiConfig.provider === opt.id}
+                onClick={() => {
+                  setDetectedModels([]);
+                  setDetectFeedback(null);
+                  onUpdateLocalAiConfig({...localAiConfig, provider: opt.id});
+                }}
+                className={`px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
+                  localAiConfig.provider === opt.id
+                    ? 'accent-btn border-transparent'
+                    : 'border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {isLocalProvider && (
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-3 pt-2 border-t border-slate-100 dark:border-slate-800 text-xs items-end">
+            <div className="md:col-span-5 space-y-1">
+              <label htmlFor="local-ai-url" className="block font-medium text-slate-600 dark:text-slate-400">
+                {localAiConfig.provider === 'ollama'
+                  ? 'Ollama Server URL'
+                  : localAiConfig.provider === 'lmstudio'
+                    ? 'LM Studio Server URL'
+                    : 'Base Endpoint URL (/v1)'}
+              </label>
+              <input
+                id="local-ai-url"
+                type="url"
+                value={activeUrl}
+                onChange={(e) => handleUrlChange(e.target.value)}
+                placeholder={localAiConfig.provider === 'ollama' ? 'http://localhost:11434' : 'http://localhost:1234'}
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"
+              />
+            </div>
+
+            <div className="md:col-span-4 space-y-1">
+              <label htmlFor="local-ai-model" className="block font-medium text-slate-600 dark:text-slate-400">
+                Model Name
+              </label>
+              <input
+                id="local-ai-model"
+                type="text"
+                list="local-ai-detected-models"
+                value={activeModel}
+                onChange={(e) => handleModelChange(e.target.value)}
+                placeholder={
+                  localAiConfig.provider === 'ollama'
+                    ? 'llama3.2, qwen2.5, mistral...'
+                    : 'loaded-model-id'
+                }
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"
+              />
+              <datalist id="local-ai-detected-models">
+                {detectedModels.map((m) => (
+                  <option key={m} value={m} />
+                ))}
+              </datalist>
+            </div>
+
+            <div className="md:col-span-3 flex items-center gap-2">
+              <button
+                type="button"
+                disabled={detectingModels}
+                onClick={() => void handleDetectModels()}
+                className="w-full px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 font-medium hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-center gap-1.5 disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${detectingModels ? 'animate-spin' : ''}`} aria-hidden="true" />
+                {detectingModels ? 'Detecting...' : 'Detect Models'}
+              </button>
+            </div>
+
+            {localAiConfig.provider === 'openai-compat' && (
+              <div className="md:col-span-5 space-y-1">
+                <label htmlFor="local-ai-key" className="block font-medium text-slate-600 dark:text-slate-400">
+                  Optional Bearer Key (session-only)
+                </label>
+                <input
+                  id="local-ai-key"
+                  type="password"
+                  value={localAiConfig.customApiKey}
+                  onChange={(e) => onUpdateLocalAiConfig({...localAiConfig, customApiKey: e.target.value})}
+                  placeholder="Optional token for custom local gateway"
+                  className="w-full px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"
+                />
+              </div>
+            )}
+
+            {detectedModels.length > 0 && (
+              <div className="md:col-span-12 flex flex-wrap items-center gap-1.5">
+                <span className="text-[11px] text-slate-500 dark:text-slate-400 mr-1">Available:</span>
+                {detectedModels.slice(0, 10).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => handleModelChange(m)}
+                    className={`px-2 py-0.5 rounded border text-[11px] font-mono ${
+                      activeModel === m
+                        ? 'accent-soft accent-border font-semibold'
+                        : 'border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800'
+                    }`}
+                  >
+                    {m}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {detectFeedback && (
+              <p
+                className={`md:col-span-12 text-xs ${
+                  detectFeedback.ok ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'
+                }`}
+              >
+                {detectFeedback.message}
+              </p>
+            )}
+          </div>
+        )}
+      </section>
 
       {error && (
         <div className="p-3.5 rounded-xl border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/40 text-xs text-red-700 dark:text-red-300">

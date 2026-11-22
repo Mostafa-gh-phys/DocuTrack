@@ -4,7 +4,6 @@ import {
   Cloud,
   Download,
   FolderSync,
-  HardDrive,
   Laptop,
   LogOut,
   RefreshCw,
@@ -15,7 +14,6 @@ import {
 import type {
   BackupFrequency,
   BackupSnapshotRecord,
-  BookMetadata,
   ReaderPreferences,
 } from '../types/library';
 import type {CustomCloudAuthType, CustomCloudConfig, CustomCloudProvider} from '../utils/customCloudSync';
@@ -24,8 +22,6 @@ import {formatBytes} from '../utils/libraryLogic';
 interface SyncBackupViewProps {
   user: User | null;
   syncStatus: string;
-  books: BookMetadata[];
-  offlineBytes: number;
   backups: BackupSnapshotRecord[];
   preferences: ReaderPreferences;
   linkedBackupDirName: string | null;
@@ -35,8 +31,6 @@ interface SyncBackupViewProps {
   onSignIn: () => void;
   onSignOut: () => void;
   onSyncAllToCloud: () => void;
-  onToggleOfflinePin: (book: BookMetadata) => void;
-  onPinAllOffline: () => void;
   onChangeBackupFrequency: (freq: BackupFrequency) => void;
   onTriggerManualBackup: () => void;
   onDownloadBackupFile: (backupId?: string) => void;
@@ -52,8 +46,6 @@ interface SyncBackupViewProps {
 export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
   user,
   syncStatus,
-  books,
-  offlineBytes,
   backups,
   preferences,
   linkedBackupDirName,
@@ -63,8 +55,6 @@ export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
   onSignIn,
   onSignOut,
   onSyncAllToCloud,
-  onToggleOfflinePin,
-  onPinAllOffline,
   onChangeBackupFrequency,
   onTriggerManualBackup,
   onDownloadBackupFile,
@@ -97,10 +87,10 @@ export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
     <div className="flex-1 p-6 max-w-5xl mx-auto w-full space-y-8">
       <div className="pb-4 border-b border-slate-200 dark:border-slate-800">
         <h1 className="text-xl font-semibold text-slate-900 dark:text-slate-100 tracking-tight">
-          Cross-Device Cloud Sync, Offline Vault & Automated Backups
+          Cross-Device Cloud Sync &amp; Automated Backups
         </h1>
         <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-          Keep reading progress, highlights, AI lecture courses, and reader preferences synchronized across devices while storing offline binaries and automated local backups.
+          Keep reading progress, highlights, AI lecture courses, and reader preferences synchronized across devices with cloud sync and automated local backups.
         </p>
       </div>
 
@@ -376,56 +366,7 @@ export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
         )}
       </section>
 
-      {/* 2. Offline Reading Cache Section */}
-      <section className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <HardDrive className="w-5 h-5 text-emerald-700 dark:text-emerald-400" aria-hidden="true" />
-            <div>
-              <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-                Offline Reading Vault
-              </h2>
-              <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-                {books.filter((b) => b.offlinePinned).length} of {books.length} documents pinned offline ·{' '}
-                {formatBytes(offlineBytes)} cached in local IndexedDB
-              </p>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={onPinAllOffline}
-            className="px-3.5 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
-          >
-            Pin All Synchronized Books Offline
-          </button>
-        </div>
-
-        <div className="divide-y divide-slate-100 dark:divide-slate-800">
-          {books.map((b) => (
-            <div key={b.id} className="py-2.5 flex items-center justify-between gap-4 text-sm">
-              <div className="min-w-0">
-                <p className="font-medium text-slate-900 dark:text-slate-100 truncate">{b.title}</p>
-                <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-                  {b.format.toUpperCase()} · {formatBytes(b.fileSize)} · {b.folderPath}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => onToggleOfflinePin(b)}
-                className={`px-3 py-1.5 rounded-lg text-xs font-medium border whitespace-nowrap shrink-0 ${
-                  b.offlinePinned
-                    ? 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300'
-                    : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
-                }`}
-              >
-                {b.offlinePinned ? 'Available Offline' : 'Pin Offline'}
-              </button>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {/* 3. Automated Local Storage Backups */}
+      {/* 2. Automated Local Storage Backups */}
       <section className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">

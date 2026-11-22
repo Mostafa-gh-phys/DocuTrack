@@ -5,6 +5,7 @@ import {AppearanceDialog} from './components/AppearanceDialog';
 import {ConverterView} from './components/ConverterView';
 import {CoursesHubView} from './components/CoursesHubView';
 import {DocuTrackLogo} from './components/DocuTrackLogo';
+import {DownloadFilesView} from './components/DownloadFilesView';
 import {DuplicatesModal} from './components/DuplicatesModal';
 import {ImportModal} from './components/ImportModal';
 import {LibrarySidebar} from './components/LibrarySidebar';
@@ -67,11 +68,16 @@ import {
   type CustomCloudConfig,
 } from './utils/customCloudSync';
 import {
+  generateCourseWithProvider,
+  loadLocalAiConfig,
+  saveLocalAiConfig,
+  type LocalAiConfig,
+} from './utils/localAiClient';
+import {
   createLocalBackupSnapshot,
   DEFAULT_PREFERENCES,
   deleteAnnotationLocal,
   deleteBookLocal,
-  estimateOfflineStorageBytes,
   extractCoverFromBuffer,
   getBackupArchiveById,
   getBookBinary,
@@ -90,7 +96,7 @@ import {
 } from './utils/offlineStorage';
 import {isDarkUiTheme} from './utils/themeTokens';
 
-type WorkspaceTab = 'library' | 'goals' | 'courses' | 'convert' | 'sync';
+type WorkspaceTab = 'library' | 'downloads' | 'goals' | 'courses' | 'convert' | 'sync';
 
 interface DirectoryHandleLike {
   name: string;
@@ -124,7 +130,7 @@ export default function App() {
   const [preferences, setPreferences] = useState<ReaderPreferences>(DEFAULT_PREFERENCES);
   const [readingGoal, setReadingGoal] = useState<ReadingGoal>(() => createDefaultReadingGoal('local'));
   const [backups, setBackups] = useState<BackupSnapshotRecord[]>([]);
-  const [offlineBytes, setOfflineBytes] = useState(0);
+  const [localAiConfig, setLocalAiConfig] = useState<LocalAiConfig>(() => loadLocalAiConfig());
 
   // Unified modals & converter selection
   const [importModalOpen, setImportModalOpen] = useState(false);
@@ -193,7 +199,6 @@ export default function App() {
       setReadingGoal(store.readingGoal);
       setTextChunks(store.textChunks);
       setBackups(store.backups);
-      setOfflineBytes(await estimateOfflineStorageBytes());
       setInitialized(true);
 
       // Generate cover thumbnails locally for any books missing cached covers
@@ -515,7 +520,6 @@ export default function App() {
     }
 
     if (allSuccessful.length > 0) {
-      setOfflineBytes(await estimateOfflineStorageBytes());
       const wasCancelled = cancelImportRef.current;
       setImportNotice(
         wasCancelled
@@ -600,7 +604,6 @@ export default function App() {
       setBookCovers((prev) => ({...prev, [res.book.id]: res.coverDataUrl!}));
     }
     setTextChunks((prev) => [...res.chunks, ...prev]);
-    setOfflineBytes(await estimateOfflineStorageBytes());
     if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
       void syncBookToCloud(user.uid, res.book);
     }
@@ -668,7 +671,6 @@ export default function App() {
     const updated = {...book, offlinePinned: !book.offlinePinned, updatedAtMs: Date.now()};
     setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)));
     await saveBookLocal(updated);
-    setOfflineBytes(await estimateOfflineStorageBytes());
     if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
       void syncBookToCloud(user.uid, updated);
     }
@@ -686,7 +688,6 @@ export default function App() {
     setCourses((prev) => prev.filter((c) => c.bookId !== book.id));
     setTextChunks((prev) => prev.filter((t) => t.bookId !== book.id));
     await deleteBookLocal(book.id);
-    setOfflineBytes(await estimateOfflineStorageBytes());
     if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
       void deleteBookFromCloud(user.uid, book.id);
     }
@@ -873,23 +874,22 @@ export default function App() {
     }
   };
 
+  const handleUpdateLocalAiConfig = (next: LocalAiConfig) => {
+    setLocalAiConfig(next);
+    saveLocalAiConfig(next);
+  };
+
   const handleGenerateCourse = async (
     book: BookMetadata,
     mode: 'course' | 'summary',
     textContent: string,
   ): Promise<StudyCourse | null> => {
-    const res = await fetch('/api/ai/course', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        title: book.title,
-        author: book.author,
-        content: textContent,
-        mode,
-      }),
+    const data = await generateCourseWithProvider(localAiConfig, {
+      title: book.title,
+      author: book.author,
+      content: textContent,
+      mode,
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to generate AI course.');
 
     const now = Date.now();
     const course: StudyCourse = {
@@ -1129,6 +1129,7 @@ export default function App() {
         preferences={preferences}
         isOnline={isOnline}
         simulatedOffline={simulatedOffline}
+        allowLocalOffline={localAiConfig.provider !== 'gemini'}
         initialRightTab={readerInitialRightTab}
         onBack={() => setOpenBookId(null)}
         onUpdateProgress={handleUpdateProgress}
@@ -1222,10 +1223,11 @@ export default function App() {
         </a>
 
         {/* Zone 2: Clean Single-Line Navigation Links */}
-        <nav aria-label="Primary workspace" className="hidden md:flex items-center gap-6 text-sm font-medium">
+        <nav aria-label="Primary workspace" className="hidden md:flex items-center gap-5 text-sm font-medium">
           {(
             [
               {id: 'library', label: 'Library'},
+              {id: 'downloads', label: 'Download Files'},
               {id: 'goals', label: 'Goals'},
               {id: 'courses', label: 'Study Courses'},
               {id: 'convert', label: 'Convert'},
@@ -1268,6 +1270,7 @@ export default function App() {
         {(
           [
             {id: 'library', label: 'Library'},
+            {id: 'downloads', label: 'Downloads'},
             {id: 'goals', label: 'Goals'},
             {id: 'courses', label: 'Courses'},
             {id: 'convert', label: 'Convert'},
@@ -1398,13 +1401,22 @@ export default function App() {
           </>
         )}
 
+        {activeTab === 'downloads' && (
+          <DownloadFilesView
+            isOnline={isOnline}
+            simulatedOffline={simulatedOffline}
+            onImportDownloadedFile={async (buffer, filename, targetFolder) => {
+              await handleAddConvertedToLibrary(buffer, filename, targetFolder);
+            }}
+          />
+        )}
+
         {activeTab === 'goals' && (
           <ReadingGoalsView
             goal={readingGoal}
             books={books}
             onLogActivity={handleRecordReadingActivity}
             onUpdateTargets={handleUpdateGoalTargets}
-            onOpenBook={(b) => handleOpenBook(b)}
           />
         )}
 
@@ -1414,6 +1426,8 @@ export default function App() {
             courses={courses}
             isOnline={isOnline}
             simulatedOffline={simulatedOffline}
+            localAiConfig={localAiConfig}
+            onUpdateLocalAiConfig={handleUpdateLocalAiConfig}
             onOpenBook={(b) => handleOpenBook(b)}
             onGenerateCourse={handleGenerateCourse}
           />
@@ -1432,8 +1446,6 @@ export default function App() {
           <SyncBackupView
             user={user}
             syncStatus={syncStatus}
-            books={books}
-            offlineBytes={offlineBytes}
             backups={backups}
             preferences={preferences}
             linkedBackupDirName={linkedBackupDirName}
@@ -1443,12 +1455,6 @@ export default function App() {
             onSignIn={() => void signInWithGoogle()}
             onSignOut={() => void signOutUser()}
             onSyncAllToCloud={() => void handleSyncAllToCloud()}
-            onToggleOfflinePin={(b) => void handleToggleOfflinePin(b)}
-            onPinAllOffline={() => {
-              books.forEach((b) => {
-                if (!b.offlinePinned) void handleToggleOfflinePin(b);
-              });
-            }}
             onChangeBackupFrequency={(freq: BackupFrequency) =>
               handleUpdatePreferences({...preferences, backupFrequency: freq, updatedAtMs: Date.now()})
             }

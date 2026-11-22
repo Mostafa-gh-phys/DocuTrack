@@ -12,6 +12,7 @@ import {
   Download,
   FileText,
   GraduationCap,
+  Hand,
   Highlighter,
   Languages,
   ListTree,
@@ -49,7 +50,7 @@ import type {
   ScanPreset,
   StudyCourse,
 } from '../types/library';
-import {BoundedTaskQueue, computeAutofitZoom, type DocumentFitMode} from '../utils/batchYield';
+import {BoundedTaskQueue, computeAutofitZoom, globalCanvasGovernor, RESOURCE_LIMITS, type DocumentFitMode} from '../utils/batchYield';
 import {renderEpubChapterWithAnnotations} from '../utils/epubHighlighter';
 import {
   calculateProgress,
@@ -78,7 +79,7 @@ import {FONT_OPTIONS, getReaderFontClass, READER_THEMES} from '../utils/themeTok
 import {AnnotationPopover} from './AnnotationPopover';
 import {DocumentPageSheet, type PageMetricsInfo} from './DocumentPageSheet';
 
-export type ZoteroTool = 'select' | 'highlight' | 'underline' | 'note' | 'area' | 'ink';
+export type ZoteroTool = 'select' | 'pan' | 'highlight' | 'underline' | 'note' | 'area' | 'ink';
 
 interface ReaderViewProps {
   book: BookMetadata;
@@ -87,6 +88,7 @@ interface ReaderViewProps {
   preferences: ReaderPreferences;
   isOnline: boolean;
   simulatedOffline: boolean;
+  allowLocalOffline?: boolean;
   initialRightTab?: 'typography' | 'translate' | 'course' | null;
   onBack: () => void;
   onUpdateProgress: (bookId: string, page: number, pageCount: number) => void;
@@ -161,6 +163,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   preferences,
   isOnline,
   simulatedOffline,
+  allowLocalOffline = false,
   initialRightTab = null,
   onBack,
   onUpdateProgress,
@@ -230,6 +233,19 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const epubSpreadViewportRef = useRef<HTMLDivElement | null>(null);
   const visitedPagesRef = useRef<Set<number>>(new Set([book.currentPage || 1]));
   const suppressAutoScrollRef = useRef(false);
+  const manualZoomRef = useRef(zoomScale);
+  manualZoomRef.current = zoomScale;
+
+  // Evince-style hand pan & drag state
+  const [spacePanHeld, setSpacePanHeld] = useState(false);
+  const [isDraggingPan, setIsDraggingPan] = useState(false);
+  const panStateRef = useRef<{
+    active: boolean;
+    startX: number;
+    startY: number;
+    scrollLeft: number;
+    scrollTop: number;
+  }>({active: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0});
 
   // Zotero Tooling & Selection Composer state
   const [activeTool, setActiveTool] = useState<ZoteroTool>('select');
@@ -396,6 +412,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       void closePdfDocument(loadedPdfDoc);
       closeDjvuDocument(loadedDjvuDoc);
       loadedEpubDoc?.dispose();
+      globalCanvasGovernor.clearAll();
     };
   }, [book.id, book.format, book.title]);
 
@@ -416,7 +433,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     return () => ro.disconnect();
   }, [distractionFree, leftTab, rightTab, scanOpen]);
 
-  // Responsive Fit Width / Fit Page zoom calculation shared cleanly across PDF & DjVu
+  // Responsive Fit Width / Fit Page zoom calculation (stabilized against continuous scroll page churn!)
+  const continuousScrollMode = pageLayoutMode === 'vertical' || pageLayoutMode === 'horizontal';
+  const refFitPage = continuousScrollMode ? 1 : currentPage;
+  const refMetrics = pageMetrics[refFitPage];
+
   useEffect(() => {
     if (fitMode === 'manual' || book.format === 'epub') return;
     let cancelled = false;
@@ -425,7 +446,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       if (cancelled) return;
       const computed = computeAutofitZoom({
         fitMode,
-        manualZoom: zoomScale,
+        manualZoom: manualZoomRef.current,
         pageWidth,
         pageHeight,
         viewportWidth: viewportSize.width,
@@ -435,16 +456,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       setZoomScale((prev) => (Math.abs(prev - computed) < 0.01 ? prev : computed));
     };
 
-    const cached = pageMetrics[currentPage];
-    if (cached) {
-      applyComputedZoom(cached.nativeWidth, cached.nativeHeight);
+    if (refMetrics) {
+      applyComputedZoom(refMetrics.nativeWidth, refMetrics.nativeHeight);
       return;
     }
 
     if (book.format === 'pdf' && pdfDoc) {
       void (async () => {
         try {
-          const page = await pdfDoc.getPage(Math.max(1, Math.min(currentPage, pdfDoc.numPages)));
+          const page = await pdfDoc.getPage(Math.max(1, Math.min(refFitPage, pdfDoc.numPages)));
           if (cancelled) return;
           const baseViewport = page.getViewport({scale: 1});
           applyComputedZoom(baseViewport.width, baseViewport.height);
@@ -455,7 +475,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     } else if (book.format === 'djvu' && djvuDoc) {
       void (async () => {
         try {
-          const native = await djvuDoc.getPageNativeSize(currentPage);
+          const native = await djvuDoc.getPageNativeSize(refFitPage);
           if (cancelled) return;
           const aspect = native.width / Math.max(1, native.height);
           applyComputedZoom(612, Math.round(612 / Math.max(0.25, aspect)));
@@ -473,13 +493,31 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     book.format,
     pdfDoc,
     djvuDoc,
-    currentPage,
+    refFitPage,
     pageLayoutMode,
     viewportSize.width,
     viewportSize.height,
-    pageMetrics,
-    zoomScale,
+    refMetrics?.nativeWidth,
+    refMetrics?.nativeHeight,
   ]);
+
+  // Evince-style Ctrl+Wheel / pinch zoom on the PDF & DjVu reading viewport
+  useEffect(() => {
+    const el = readerViewportRef.current;
+    if (!el || book.format === 'epub') return;
+    const onNativeWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      setFitMode('manual');
+      setZoomScale((prev) => {
+        const factor = Math.exp(-e.deltaY * 0.0022);
+        const next = Math.max(0.45, Math.min(2.6, prev * factor));
+        return Number(next.toFixed(2));
+      });
+    };
+    el.addEventListener('wheel', onNativeWheel, {passive: false});
+    return () => el.removeEventListener('wheel', onNativeWheel);
+  }, [book.format, loadingDoc]);
 
   const epubSpreadHeightPx = useMemo(
     () => Math.max(380, Math.min(780, viewportSize.height - 175)),
@@ -605,7 +643,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     });
   }, [onUpdatePreferences, preferences, readingDirection]);
 
-  // Keyboard navigation (Esc, ArrowLeft, ArrowRight respecting readingDirection & double spreads)
+  // Keyboard navigation + Spacebar Hand-Pan + PageUp/PageDown Evince ergonomics
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -618,10 +656,39 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         if (focusedAnnotationId) setFocusedAnnotationId(null);
         setScanOpen(false);
         setActiveTool('select');
+        setSpacePanHeld(false);
         return;
       }
 
       if (isEditingText) return;
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        setSpacePanHeld(true);
+        return;
+      }
+
+      const viewport = readerViewportRef.current;
+      if (e.key === 'PageDown' && viewport && book.format !== 'epub' && (pageLayoutMode === 'vertical' || pageLayoutMode === 'horizontal')) {
+        e.preventDefault();
+        if (pageLayoutMode === 'horizontal') {
+          const dir = readingDirection === 'rtl' ? -1 : 1;
+          viewport.scrollBy({left: dir * Math.round(viewport.clientWidth * 0.8), behavior: 'smooth'});
+        } else {
+          viewport.scrollBy({top: Math.round(viewport.clientHeight * 0.85), behavior: 'smooth'});
+        }
+        return;
+      }
+      if (e.key === 'PageUp' && viewport && book.format !== 'epub' && (pageLayoutMode === 'vertical' || pageLayoutMode === 'horizontal')) {
+        e.preventDefault();
+        if (pageLayoutMode === 'horizontal') {
+          const dir = readingDirection === 'rtl' ? 1 : -1;
+          viewport.scrollBy({left: dir * Math.round(viewport.clientWidth * 0.8), behavior: 'smooth'});
+        } else {
+          viewport.scrollBy({top: -Math.round(viewport.clientHeight * 0.85), behavior: 'smooth'});
+        }
+        return;
+      }
 
       const forwardKey = readingDirection === 'rtl' ? 'ArrowLeft' : 'ArrowRight';
       const backKey = readingDirection === 'rtl' ? 'ArrowRight' : 'ArrowLeft';
@@ -640,13 +707,29 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         }
       }
     };
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'Space') {
+        setSpacePanHeld(false);
+      }
+    };
+
+    const onBlur = () => setSpacePanHeld(false);
+
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', onBlur);
+    };
   }, [
     distractionFree,
     composerOpen,
     focusedAnnotationId,
     book.format,
+    pageLayoutMode,
     epubViewMode,
     epubSubPage,
     epubSubPageCount,
@@ -952,8 +1035,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   };
 
   const handleTriggerCourse = async (mode: 'course' | 'summary') => {
-    if (!isOnline || simulatedOffline) {
-      setCourseError('AI course generation requires an active network connection.');
+    if ((!isOnline || simulatedOffline) && !allowLocalOffline) {
+      setCourseError('Cloud Gemini requires an active network connection. Switch to Ollama or LM Studio in Study Courses to run locally offline.');
       return;
     }
     const fullText =
@@ -1331,6 +1414,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             {(
               [
                 {id: 'select', label: 'Select', icon: <MousePointer className="w-3.5 h-3.5" />},
+                {id: 'pan', label: 'Hand Pan', icon: <Hand className="w-3.5 h-3.5" />},
                 {id: 'highlight', label: 'Highlight', icon: <Highlighter className="w-3.5 h-3.5" />},
                 {id: 'underline', label: 'Underline', icon: <Underline className="w-3.5 h-3.5" />},
                 {id: 'note', label: 'Add Note', icon: <StickyNote className="w-3.5 h-3.5" />},
@@ -1856,7 +1940,41 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           data-layout-mode={pageLayoutMode}
           data-reading-dir={readingDirection}
           onMouseUp={handleMouseUpSelection}
+          onPointerDown={(e) => {
+            const el = readerViewportRef.current;
+            if (!el) return;
+            if (activeTool === 'pan' || spacePanHeld || e.button === 1) {
+              if (e.button === 1) e.preventDefault();
+              panStateRef.current = {
+                active: true,
+                startX: e.clientX,
+                startY: e.clientY,
+                scrollLeft: el.scrollLeft,
+                scrollTop: el.scrollTop,
+              };
+              setIsDraggingPan(true);
+            }
+          }}
+          onPointerMove={(e) => {
+            const el = readerViewportRef.current;
+            if (!el || !panStateRef.current.active) return;
+            const dx = e.clientX - panStateRef.current.startX;
+            const dy = e.clientY - panStateRef.current.startY;
+            el.scrollLeft = panStateRef.current.scrollLeft - dx;
+            el.scrollTop = panStateRef.current.scrollTop - dy;
+          }}
+          onPointerUp={() => {
+            if (panStateRef.current.active) {
+              panStateRef.current.active = false;
+              setIsDraggingPan(false);
+            }
+          }}
+          onPointerCancel={() => {
+            panStateRef.current.active = false;
+            setIsDraggingPan(false);
+          }}
           onWheel={(e) => {
+            if (e.ctrlKey || e.metaKey) return;
             if (book.format !== 'epub' && pageLayoutMode === 'horizontal' && readerViewportRef.current) {
               const el = readerViewportRef.current;
               if (el.scrollWidth > el.clientWidth && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
@@ -1880,6 +1998,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           }}
           className={`flex-1 min-w-0 overflow-x-auto overflow-y-auto scroll-smooth-reader px-4 sm:px-8 py-6 flex flex-col relative ${
             spatialToolActive ? 'select-none' : ''
+          } ${
+            activeTool === 'pan' || spacePanHeld
+              ? isDraggingPan
+                ? 'cursor-grabbing select-none'
+                : 'cursor-grab select-none'
+              : ''
           }`}
         >
           {/* Quick Floating Selection Action Bar (when using Select cursor) */}
@@ -2270,11 +2394,16 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                         isDarkTheme={theme.isDark}
                         themeId={preferences.theme}
                         fontClass={fontClass}
-                        activeTool={activeTool}
+                        activeTool={spacePanHeld ? 'pan' : activeTool}
                         selectedColor={selectedColor}
                         pageAnnotations={bookAnnotations.filter((a) => a.page === pageNum)}
                         focusedAnnotationId={focusedAnnotationId}
                         lazy={pageLayoutMode === 'vertical' || pageLayoutMode === 'horizontal'}
+                        withinWindow={
+                          pageLayoutMode === 'vertical' || pageLayoutMode === 'horizontal'
+                            ? Math.abs(pageNum - currentPage) <= RESOURCE_LIMITS.continuousPageWindow
+                            : true
+                        }
                         pageBadgeLabel={pageLayoutMode !== 'single' ? `p.${pageNum}` : undefined}
                         onFocusAnnotation={setFocusedAnnotationId}
                         onTextSelection={handleTextSelectionFromSheet}

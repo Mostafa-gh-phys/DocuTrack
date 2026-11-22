@@ -1,5 +1,5 @@
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
-import {releaseCanvasMemory, yieldToMain} from '../batchYield';
+import {RESOURCE_LIMITS, releaseCanvasMemory, yieldToMain} from '../batchYield';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/workers/pdf.worker.min.mjs';
 
@@ -198,28 +198,54 @@ export async function renderPdfPageToCanvas(
     throw cancelledErr;
   }
 
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const rawDpr = Math.min(window.devicePixelRatio || 1, RESOURCE_LIMITS.maxRenderDpr);
   const viewport = page.getViewport({scale});
+  const maxDprForWidth = Math.max(
+    0.75,
+    RESOURCE_LIMITS.maxSheetPixelWidth / Math.max(1, viewport.width),
+  );
+  const dpr = Math.min(rawDpr, maxDprForWidth);
 
-  canvas.width = Math.floor(viewport.width * dpr);
-  canvas.height = Math.floor(viewport.height * dpr);
-  canvas.style.width = `${Math.floor(viewport.width)}px`;
-  canvas.style.height = `${Math.floor(viewport.height)}px`;
+  const targetPixelW = Math.max(1, Math.floor(viewport.width * dpr));
+  const targetPixelH = Math.max(1, Math.floor(viewport.height * dpr));
 
-  const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('Canvas 2D context unavailable');
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // Render onto an offscreen swap canvas so the visible sheet never flashes white during zoom/scroll re-renders
+  const swapCanvas = document.createElement('canvas');
+  swapCanvas.width = targetPixelW;
+  swapCanvas.height = targetPixelH;
+  const swapCtx = swapCanvas.getContext('2d');
+  if (!swapCtx) {
+    releaseCanvasMemory(swapCanvas);
+    throw new Error('Canvas 2D context unavailable');
+  }
+  swapCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
   const renderTask = page.render({
-    canvasContext: ctx,
+    canvasContext: swapCtx,
     viewport,
-    canvas,
+    canvas: swapCanvas,
   });
   activeCanvasRenderTasks.set(canvas, renderTask);
 
   try {
     await renderTask.promise;
+    if (canvasRenderSeq.get(canvas) !== seq) {
+      const cancelledErr = new Error('Rendering cancelled');
+      cancelledErr.name = 'RenderingCancelledException';
+      throw cancelledErr;
+    }
+
+    canvas.width = targetPixelW;
+    canvas.height = targetPixelH;
+    canvas.style.width = `${Math.floor(viewport.width)}px`;
+    canvas.style.height = `${Math.floor(viewport.height)}px`;
+    const visibleCtx = canvas.getContext('2d');
+    if (visibleCtx) {
+      visibleCtx.setTransform(1, 0, 0, 1, 0, 0);
+      visibleCtx.drawImage(swapCanvas, 0, 0);
+    }
   } finally {
+    releaseCanvasMemory(swapCanvas);
     if (activeCanvasRenderTasks.get(canvas) === renderTask) {
       activeCanvasRenderTasks.delete(canvas);
     }

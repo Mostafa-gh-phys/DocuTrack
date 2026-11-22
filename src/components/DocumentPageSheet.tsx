@@ -9,12 +9,12 @@ import type {
   ReaderTheme,
   ScanEnhanceSettings,
 } from '../types/library';
-import {BoundedTaskQueue, releaseCanvasMemory} from '../utils/batchYield';
+import {BoundedTaskQueue, globalCanvasGovernor} from '../utils/batchYield';
 import {renderDjvuPageToCanvas, type UnifiedDjvuDocument} from '../utils/parsers/djvuParser';
 import {renderPdfPageToCanvas, type PdfRenderTextItem} from '../utils/parsers/pdfParser';
 import {applyScanEnhancementToCanvas, isScanEnhancementActive} from '../utils/scanEnhance';
 
-export type PageZoteroTool = 'select' | 'highlight' | 'underline' | 'note' | 'area' | 'ink';
+export type PageZoteroTool = 'select' | 'pan' | 'highlight' | 'underline' | 'note' | 'area' | 'ink';
 
 interface HighlightColorStyle {
   hex: string;
@@ -59,6 +59,7 @@ interface DocumentPageSheetProps {
   pageAnnotations: Annotation[];
   focusedAnnotationId: string | null;
   lazy?: boolean;
+  withinWindow?: boolean;
   pageBadgeLabel?: string;
   onFocusAnnotation: (id: string) => void;
   onTextSelection: (pageNumber: number, quote: string, rects: AnnotationPosition[] | undefined) => void;
@@ -100,6 +101,7 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
   pageAnnotations,
   focusedAnnotationId,
   lazy = false,
+  withinWindow = true,
   pageBadgeLabel,
   onFocusAnnotation,
   onTextSelection,
@@ -130,9 +132,22 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
   const [dragBoxCurrent, setDragBoxCurrent] = useState<{x: number; y: number} | null>(null);
   const [drawingStroke, setDrawingStroke] = useState<{x: number; y: number}[] | null>(null);
 
+  const governorKey = `sheet_${pageNumber}`;
+
+  useEffect(() => {
+    return () => {
+      globalCanvasGovernor.release(governorKey);
+    };
+  }, [governorKey]);
+
   useEffect(() => {
     if (!lazy) {
       setInViewport(true);
+      return;
+    }
+    if (!withinWindow) {
+      setInViewport(false);
+      globalCanvasGovernor.release(governorKey);
       return;
     }
     const el = containerRef.current;
@@ -146,25 +161,25 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
         for (const entry of entries) {
           if (entry.isIntersecting) {
             setInViewport(true);
-            if (entry.intersectionRatio >= 0.55) {
+            if (entry.intersectionRatio >= 0.45) {
               onVisibleRef.current?.(pageNumber);
             }
           } else if (totalPages > 8) {
             setInViewport(false);
-            releaseCanvasMemory(canvasRef.current);
+            globalCanvasGovernor.release(governorKey);
           }
         }
       },
-      {rootMargin: '520px', threshold: [0.02, 0.55]},
+      {rootMargin: '640px', threshold: [0.02, 0.45]},
     );
     observer.observe(el);
     return () => observer.disconnect();
-  }, [lazy, pageNumber, totalPages]);
+  }, [lazy, withinWindow, pageNumber, totalPages, governorKey]);
 
   useEffect(() => {
-    if (!inViewport) {
-      if (lazy && totalPages > 8) {
-        releaseCanvasMemory(canvasRef.current);
+    if (!inViewport || !withinWindow) {
+      if (lazy && (totalPages > 8 || !withinWindow)) {
+        globalCanvasGovernor.release(governorKey);
       }
       return;
     }
@@ -181,6 +196,7 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
           const res = await renderPdfPageToCanvas(pdfDoc, clampedPage, canvas, zoomScale);
           if (cancelled) return;
           applyScanEnhancementToCanvas(canvas, scanSettings);
+          globalCanvasGovernor.register(governorKey, canvas);
           const safeW = Math.max(1, res.width);
           const safeH = Math.max(1, res.height);
           const baseW = Math.max(120, Math.round(safeW / Math.max(0.1, zoomScale)));
@@ -208,14 +224,15 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
           const aspect = native.width / Math.max(1, native.height);
           const displayH = Math.max(160, Math.round(displayW / aspect));
 
-          const baseDpi = isScanEnhancementActive(scanSettings) ? 132 : 112;
-          const dpi = Math.min(190, Math.max(65, Math.round(baseDpi * zoomScale)));
+          const baseDpi = isScanEnhancementActive(scanSettings) ? 128 : 108;
+          const dpi = Math.min(165, Math.max(65, Math.round(baseDpi * zoomScale)));
           const res = await renderDjvuPageToCanvas(djvuDoc, pageNumber, canvas, dpi);
           if (cancelled) return;
 
           if (!res.isBlankBitmap) {
             applyScanEnhancementToCanvas(canvas, scanSettings);
           }
+          globalCanvasGovernor.register(governorKey, canvas);
 
           const finalAspect = res.width / Math.max(1, res.height);
           const metrics: PageMetricsInfo = {
@@ -250,6 +267,7 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
     };
   }, [
     inViewport,
+    withinWindow,
     lazy,
     totalPages,
     format,
@@ -257,6 +275,7 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
     djvuDoc,
     renderQueue,
     pageNumber,
+    governorKey,
     zoomScale,
     scanSettings,
     fallbackText,
@@ -290,7 +309,7 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
   };
 
   const handleMouseUpOnSheet = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (activeTool === 'note' || activeTool === 'area' || activeTool === 'ink') return;
+    if (activeTool === 'pan' || activeTool === 'note' || activeTool === 'area' || activeTool === 'ink') return;
     const selObj = window.getSelection();
     const sel = selObj?.toString().trim() || '';
     if (sel.length < 3) return;
@@ -413,7 +432,7 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
 
   return (
     <div
-      className={`shrink-0 border ${themeBorder} shadow-sm ${
+      className={`evince-page-sheet shrink-0 border ${themeBorder} shadow-[0_2px_10px_rgba(15,23,42,0.10)] dark:shadow-[0_2px_14px_rgba(0,0,0,0.45)] ${
         !isDarkTheme ? themeBgSurface : 'bg-white'
       } flex flex-col`}
       style={{width: `${stageWidth}px`}}
@@ -431,20 +450,30 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
           </div>
         )}
 
-        <canvas
-          ref={canvasRef}
-          data-testid="document-canvas"
-          className={`block max-w-full ${
-            isDarkTheme
-              ? 'invert-[0.88] hue-rotate-180'
-              : themeId !== 'paper'
-                ? 'mix-blend-multiply'
-                : ''
-          }`}
-        />
+        {withinWindow ? (
+          <canvas
+            ref={canvasRef}
+            data-testid="document-canvas"
+            className={`block max-w-full ${
+              isDarkTheme
+                ? 'invert-[0.88] hue-rotate-180'
+                : themeId !== 'paper'
+                  ? 'mix-blend-multiply'
+                  : ''
+            }`}
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center text-xs font-mono opacity-40 select-none">
+            Page {pageNumber}
+          </div>
+        )}
 
-        {format === 'pdf' && pdfTextItems.length > 0 && (
-          <div className="pdf-text-layer absolute inset-0 select-text overflow-hidden pointer-events-auto z-10">
+        {withinWindow && format === 'pdf' && pdfTextItems.length > 0 && (
+          <div
+            className={`pdf-text-layer absolute inset-0 overflow-hidden z-10 ${
+              activeTool === 'pan' ? 'select-none pointer-events-none' : 'select-text pointer-events-auto'
+            }`}
+          >
             {pdfTextItems.map((item, idx) => (
               <span
                 key={idx}

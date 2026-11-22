@@ -1,7 +1,8 @@
 import React, {useMemo, useState} from 'react';
-import {BookCheck, BookOpen, Clock, Flame, Plus, Target} from 'lucide-react';
+import {BookCheck, Clock, Flame, Plus, Target} from 'lucide-react';
 import type {BookMetadata, ReadingGoal} from '../types/library';
 import {getReadingGoalStats} from '../utils/libraryLogic';
+import {PomodoroFocusTimer} from './PomodoroFocusTimer';
 
 interface ReadingGoalsViewProps {
   goal: ReadingGoal;
@@ -12,7 +13,6 @@ interface ReadingGoalsViewProps {
     weeklyMinutesTarget: number;
     yearlyBooksTarget: number;
   }) => void;
-  onOpenBook: (book: BookMetadata) => void;
 }
 
 export const ReadingGoalsView: React.FC<ReadingGoalsViewProps> = ({
@@ -20,7 +20,6 @@ export const ReadingGoalsView: React.FC<ReadingGoalsViewProps> = ({
   books,
   onLogActivity,
   onUpdateTargets,
-  onOpenBook,
 }) => {
   const stats = useMemo(() => getReadingGoalStats(goal, books), [goal, books]);
 
@@ -59,10 +58,6 @@ export const ReadingGoalsView: React.FC<ReadingGoalsViewProps> = ({
     setTargetSaved(true);
     window.setTimeout(() => setTargetSaved(false), 3000);
   };
-
-  const activeBooks = books
-    .filter((b) => b.progress > 0 && b.progress < 100)
-    .sort((a, b) => (b.lastOpenedAt || 0) - (a.lastOpenedAt || 0));
 
   return (
     <div className="flex-1 p-6 max-w-6xl mx-auto w-full space-y-6">
@@ -355,51 +350,11 @@ export const ReadingGoalsView: React.FC<ReadingGoalsViewProps> = ({
         </div>
       </div>
 
-      {/* Currently Reading Queue */}
-      <section className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4">
-        <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-          In-Progress Documents
-        </h2>
-        {activeBooks.length === 0 ? (
-          <p className="text-xs text-slate-500 dark:text-slate-400">
-            Open any document in your library to begin tracking page-by-page completion toward your annual goal.
-          </p>
-        ) : (
-          <div className="divide-y divide-slate-100 dark:divide-slate-800">
-            {activeBooks.map((book) => (
-              <div key={book.id} className="py-3 flex items-center justify-between gap-4">
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium text-slate-900 dark:text-slate-100 truncate">
-                    {book.title}
-                  </p>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-                    {book.author} · {book.format.toUpperCase()} · Page {book.currentPage} of {book.pageCount}
-                  </p>
-                </div>
-                <div className="hidden sm:flex items-center gap-3 w-44">
-                  <div className="flex-1 h-1.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
-                    <div
-                      className="h-full bg-blue-700 dark:bg-blue-500"
-                      style={{width: `${book.progress}%`}}
-                    />
-                  </div>
-                  <span className="text-xs tabular-nums text-slate-600 dark:text-slate-300 w-9 text-right">
-                    {book.progress}%
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => onOpenBook(book)}
-                  className="px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-medium hover:opacity-90 flex items-center gap-1.5 shrink-0"
-                >
-                  <BookOpen className="w-3.5 h-3.5" aria-hidden="true" />
-                  Continue
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
+      {/* Internal Pomodoro Focus Timer (inspired by Linux Focus Timer) */}
+      <PomodoroFocusTimer
+        books={books}
+        onCompleteFocusBlock={(mins) => onLogActivity(0, mins)}
+      />
     </div>
   );
 };

@@ -1,7 +1,11 @@
-const {app, BrowserWindow, shell} = require('electron');
+const {app, BrowserWindow, Menu, shell} = require('electron');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
+
+// Restrict renderer JS heap and background CPU usage without impairing document decoding
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=512');
+app.commandLine.appendSwitch('renderer-process-limit', '2');
 
 let mainWindow = null;
 let serverInstance = null;
@@ -94,13 +98,20 @@ async function createWindow() {
     minWidth: 920,
     minHeight: 620,
     title: 'DocuTrack',
+    autoHideMenuBar: true,
     ...(resolvedIcon ? {icon: resolvedIcon} : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: true,
     },
   });
+
+  if (typeof mainWindow.removeMenu === 'function') {
+    mainWindow.removeMenu();
+  }
+  mainWindow.setMenuBarVisibility(false);
 
   mainWindow.webContents.setWindowOpenHandler(({url}) => {
     if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -117,6 +128,7 @@ async function createWindow() {
 }
 
 app.whenReady().then(() => {
+  Menu.setApplicationMenu(null);
   void createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

@@ -99,3 +99,71 @@ export class BoundedTaskQueue {
     });
   }
 }
+
+export const RESOURCE_LIMITS = {
+  maxRenderDpr: 1.5,
+  maxCanvasCount: 10,
+  maxCanvasBytes: 48 * 1024 * 1024, // 48 MB total decoded bitmap ceiling
+  maxSheetPixelWidth: 1600,
+  continuousPageWindow: 12,
+} as const;
+
+/**
+ * Global LRU canvas memory governor: ensures decoded page bitmaps never exhaust system RAM
+ * when browsing or fast-scrolling multi-hundred-page PDF/DjVu documents.
+ */
+export class CanvasMemoryGovernor {
+  private entries = new Map<string, {canvas: HTMLCanvasElement; bytes: number}>();
+  private maxEntries: number;
+  private maxBytes: number;
+
+  constructor(maxEntries: number = RESOURCE_LIMITS.maxCanvasCount, maxBytes: number = RESOURCE_LIMITS.maxCanvasBytes) {
+    this.maxEntries = Math.max(2, maxEntries);
+    this.maxBytes = Math.max(4 * 1024 * 1024, maxBytes);
+  }
+
+  getTotalBytes(): number {
+    let total = 0;
+    for (const item of this.entries.values()) total += item.bytes;
+    return total;
+  }
+
+  getEntryCount(): number {
+    return this.entries.size;
+  }
+
+  register(key: string, canvas: HTMLCanvasElement, protectedKeys?: Set<string>): void {
+    const bytes = Math.max(0, canvas.width * canvas.height * 4);
+    if (this.entries.has(key)) {
+      this.entries.delete(key);
+    }
+    this.entries.set(key, {canvas, bytes});
+    this.evictIfOverBudget(key, protectedKeys);
+  }
+
+  release(key: string): void {
+    const item = this.entries.get(key);
+    if (!item) return;
+    this.entries.delete(key);
+    releaseCanvasMemory(item.canvas);
+  }
+
+  clearAll(): void {
+    for (const item of this.entries.values()) {
+      releaseCanvasMemory(item.canvas);
+    }
+    this.entries.clear();
+  }
+
+  private evictIfOverBudget(keepKey: string, protectedKeys?: Set<string>): void {
+    for (const [k, item] of this.entries) {
+      if (this.entries.size <= this.maxEntries && this.getTotalBytes() <= this.maxBytes) break;
+      if (k === keepKey || protectedKeys?.has(k)) continue;
+      this.entries.delete(k);
+      releaseCanvasMemory(item.canvas);
+    }
+  }
+}
+
+export const globalCanvasGovernor = new CanvasMemoryGovernor();
+

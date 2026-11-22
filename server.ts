@@ -7,6 +7,16 @@ import http from 'http';
 import path from 'path';
 import {fileURLToPath} from 'url';
 import {GoogleGenAI, ThinkingLevel, Type} from '@google/genai';
+import {
+  buildLibgenSearchUrl,
+  DEFAULT_LIBGEN_MIRRORS,
+  extractDiscoveredMirrorsFromHtml,
+  extractLibgenDirectUrls,
+  inferMirrorEngine,
+  parseLibgenSearchHtml,
+  type LibgenMirrorCandidate,
+  type LibgenMirrorStatus,
+} from './src/utils/libgenParser';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -546,6 +556,252 @@ async function startServer() {
       const msg = err instanceof Error ? err.message : 'Custom cloud sync request failed.';
       const status = /blocked|invalid|required/i.test(msg) ? 400 : 502;
       res.status(status).json({error: msg});
+    }
+  });
+
+  // 5. LibGen Mirror Auto-Discovery, Search & Verified File Fetch
+  app.post('/api/libgen/mirrors', async (req, res) => {
+    const {customMirror} = (req.body || {}) as {customMirror?: string};
+    const candidates: LibgenMirrorCandidate[] = [...DEFAULT_LIBGEN_MIRRORS];
+
+    if (customMirror && typeof customMirror === 'string' && customMirror.trim()) {
+      try {
+        const safeCustom = await assertSafeExternalUrl(customMirror.trim());
+        const normalized = safeCustom.origin;
+        if (!candidates.some((c) => c.url.toLowerCase() === normalized.toLowerCase())) {
+          candidates.unshift({
+            url: normalized,
+            label: `${safeCustom.hostname} (Custom)`,
+            engine: inferMirrorEngine(normalized),
+          });
+        }
+      } catch (err) {
+        res.status(400).json({
+          error: err instanceof Error ? err.message : 'Invalid custom mirror URL.',
+        });
+        return;
+      }
+    }
+
+    // Attempt lightweight auto-discovery of any newly listed mirrors from Wikipedia mirror table if reachable
+    let discoveredCount = 0;
+    try {
+      const wikiRes = await fetchExternalChecked(
+        'https://en.wikipedia.org/wiki/Library_Genesis',
+        {method: 'GET', headers: {'User-Agent': 'DocuTrack/1.0'}},
+        1,
+      );
+      if (wikiRes.ok) {
+        const wikiHtml = await wikiRes.text();
+        const extra = extractDiscoveredMirrorsFromHtml(wikiHtml);
+        for (const item of extra) {
+          if (!candidates.some((c) => c.url.toLowerCase() === item.url.toLowerCase())) {
+            candidates.push(item);
+            discoveredCount++;
+          }
+        }
+      }
+    } catch {
+      // Optional discovery fallback
+    }
+
+    const probeOne = async (candidate: LibgenMirrorCandidate): Promise<LibgenMirrorStatus> => {
+      const started = Date.now();
+      try {
+        const validated = await assertSafeExternalUrl(candidate.url);
+        const probeRes = await fetch(validated.toString(), {
+          method: 'GET',
+          headers: {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) DocuTrack/1.0'},
+          redirect: 'follow',
+          signal: AbortSignal.timeout(4500),
+        });
+        const latencyMs = Date.now() - started;
+        if (!probeRes.ok) {
+          return {...candidate, open: false, latencyMs, statusCode: probeRes.status, error: `HTTP ${probeRes.status}`};
+        }
+        const snippet = (await probeRes.text()).slice(0, 14000);
+        const looksLikeLibgen = /libgen|library genesis|search\.php|index\.php|<form/i.test(snippet);
+        return {
+          ...candidate,
+          open: looksLikeLibgen,
+          latencyMs,
+          statusCode: probeRes.status,
+          error: looksLikeLibgen ? undefined : 'Unexpected response page',
+        };
+      } catch (err) {
+        return {
+          ...candidate,
+          open: false,
+          latencyMs: null,
+          error: err instanceof Error ? err.message : 'Unreachable',
+        };
+      }
+    };
+
+    const probed = await Promise.all(candidates.slice(0, 10).map(probeOne));
+    probed.sort((a, b) => {
+      if (a.open !== b.open) return a.open ? -1 : 1;
+      return (a.latencyMs ?? 99999) - (b.latencyMs ?? 99999);
+    });
+    const bestMirror = probed.find((m) => m.open)?.url || null;
+    res.json({mirrors: probed, bestMirror, discoveredCount});
+  });
+
+  app.get('/api/libgen/search', async (req, res) => {
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const requestedMirror = typeof req.query.mirror === 'string' ? req.query.mirror.trim() : '';
+    const column = (typeof req.query.column === 'string' ? req.query.column : 'def') as
+      | 'def'
+      | 'title'
+      | 'author'
+      | 'identifier'
+      | 'publisher';
+    const limit = Number(req.query.limit) || 50;
+
+    if (!q || q.length < 2) {
+      res.status(400).json({error: 'Search query must be at least 2 characters.'});
+      return;
+    }
+
+    const mirrorList: string[] = [];
+    if (requestedMirror) {
+      try {
+        const parsed = await assertSafeExternalUrl(requestedMirror);
+        mirrorList.push(parsed.origin);
+      } catch (err) {
+        res.status(400).json({error: err instanceof Error ? err.message : 'Invalid mirror URL.'});
+        return;
+      }
+    }
+    for (const def of DEFAULT_LIBGEN_MIRRORS) {
+      if (!mirrorList.includes(def.url)) mirrorList.push(def.url);
+    }
+
+    let lastError = 'All probed LibGen mirrors failed to respond.';
+    for (const mirrorOrigin of mirrorList.slice(0, 4)) {
+      try {
+        const searchUrl = buildLibgenSearchUrl(mirrorOrigin, q, column, limit);
+        const searchRes = await fetchExternalChecked(
+          searchUrl,
+          {
+            method: 'GET',
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) DocuTrack/1.0',
+              Accept: 'text/html,application/xhtml+xml',
+            },
+          },
+          2,
+        );
+        if (!searchRes.ok) {
+          lastError = `${mirrorOrigin} returned HTTP ${searchRes.status}`;
+          continue;
+        }
+        const html = await searchRes.text();
+        const results = parseLibgenSearchHtml(html, mirrorOrigin);
+        res.json({usedMirror: mirrorOrigin, results});
+        return;
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : `Failed querying ${mirrorOrigin}`;
+      }
+    }
+
+    res.status(502).json({error: lastError});
+  });
+
+  app.post('/api/libgen/download', async (req, res) => {
+    const {downloadPageUrl, mirrorOrigin, title, extension} = (req.body || {}) as {
+      md5?: string;
+      downloadPageUrl?: string;
+      mirrorOrigin?: string;
+      title?: string;
+      extension?: string;
+    };
+
+    if (!downloadPageUrl || typeof downloadPageUrl !== 'string') {
+      res.status(400).json({error: 'Download page URL is required.'});
+      return;
+    }
+
+    const MAX_DOWNLOAD_BYTES = 120 * 1024 * 1024;
+    try {
+      await assertSafeExternalUrl(downloadPageUrl);
+      const landingRes = await fetchExternalChecked(
+        downloadPageUrl,
+        {
+          method: 'GET',
+          headers: {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) DocuTrack/1.0'},
+        },
+        2,
+      );
+      if (!landingRes.ok) {
+        res.status(502).json({error: `Download mirror returned HTTP ${landingRes.status}.`});
+        return;
+      }
+
+      const contentType = (landingRes.headers.get('content-type') || '').toLowerCase();
+      let fileRes: Response = landingRes;
+
+      // If landing URL returned HTML (library.lol / ads.php), extract the direct GET binary link
+      if (contentType.includes('text/html')) {
+        const html = await landingRes.text();
+        const directUrls = extractLibgenDirectUrls(html, landingRes.url || downloadPageUrl);
+        if (directUrls.length === 0) {
+          res.status(502).json({
+            error: `No direct file link found on ${mirrorOrigin || 'mirror'} download page. Open the mirror link externally.`,
+          });
+          return;
+        }
+
+        let fetchedFile: Response | null = null;
+        for (const candidateUrl of directUrls.slice(0, 4)) {
+          try {
+            await assertSafeExternalUrl(candidateUrl);
+            const attempt = await fetchExternalChecked(
+              candidateUrl,
+              {
+                method: 'GET',
+                headers: {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) DocuTrack/1.0'},
+              },
+              3,
+            );
+            const ct = (attempt.headers.get('content-type') || '').toLowerCase();
+            if (attempt.ok && !ct.includes('text/html')) {
+              fetchedFile = attempt;
+              break;
+            }
+          } catch {
+            // Try next candidate mirror link
+          }
+        }
+        if (!fetchedFile) {
+          res.status(502).json({error: 'Direct file mirrors rejected the download request.'});
+          return;
+        }
+        fileRes = fetchedFile;
+      }
+
+      const contentLen = Number(fileRes.headers.get('content-length') || 0);
+      if (contentLen > MAX_DOWNLOAD_BYTES) {
+        res.status(413).json({error: 'File exceeds DocuTrack 120 MB direct download safety cap.'});
+        return;
+      }
+
+      const arrayBuf = await fileRes.arrayBuffer();
+      if (arrayBuf.byteLength > MAX_DOWNLOAD_BYTES) {
+        res.status(413).json({error: 'Downloaded file exceeds 120 MB safety cap.'});
+        return;
+      }
+
+      const cleanTitle = (title || 'document').replace(/[\\/:*?"<>|]+/g, ' ').trim().slice(0, 80) || 'document';
+      const cleanExt = (extension || 'pdf').toLowerCase().replace(/[^a-z0-9]/g, '') || 'pdf';
+      const filename = `${cleanTitle}.${cleanExt}`;
+
+      res.setHeader('Content-Type', fileRes.headers.get('content-type') || 'application/octet-stream');
+      res.setHeader('X-Filename', encodeURIComponent(filename));
+      res.send(Buffer.from(arrayBuf));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Download failed.';
+      res.status(/blocked|invalid|required/i.test(msg) ? 400 : 502).json({error: msg});
     }
   });
 
