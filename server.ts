@@ -17,6 +17,7 @@ import {
   type LibgenMirrorCandidate,
   type LibgenMirrorStatus,
 } from './src/utils/libgenParser';
+import {parseAiCoursePayload} from './src/utils/localAiClient';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,6 +35,78 @@ function createGeminiClient(): GoogleGenAI | null {
       },
     },
   });
+}
+
+function extractReadableGeminiError(err: unknown): {status: number; message: string; retryable: boolean} {
+  const raw = err instanceof Error ? err.message : String(err || 'Gemini request failed');
+  const isTimeout =
+    (err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError')) ||
+    /timed out|aborted|ETIMEDOUT/i.test(raw);
+  let status = isTimeout ? 504 : 502;
+  let message = isTimeout ? 'Cloud Gemini request timed out under heavy load.' : raw;
+  try {
+    const parsed = JSON.parse(raw) as {error?: {code?: number; message?: string; status?: string}};
+    if (parsed?.error) {
+      if (typeof parsed.error.code === 'number') status = parsed.error.code;
+      if (typeof parsed.error.message === 'string' && parsed.error.message.trim()) {
+        message = parsed.error.message.trim();
+      }
+    }
+  } catch {
+    if (!isTimeout) {
+      const statusMatch = raw.match(/\b(400|403|404|429|500|502|503|504)\b/);
+      if (statusMatch) status = Number(statusMatch[1]);
+    }
+  }
+  const retryable =
+    isTimeout ||
+    status === 503 ||
+    status === 429 ||
+    status === 504 ||
+    /UNAVAILABLE|high demand|RESOURCE_EXHAUSTED|timeout|fetch failed/i.test(raw);
+  return {status, message, retryable};
+}
+
+async function generateTextWithRetry(
+  ai: GoogleGenAI,
+  buildRequest: (model: string, abortSignal: AbortSignal) => Parameters<GoogleGenAI['models']['generateContent']>[0],
+) {
+  const models = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+  let lastError: unknown;
+
+  for (let mIdx = 0; mIdx < models.length; mIdx++) {
+    const model = models[mIdx];
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('Gemini upstream call timed out')), 14000);
+    try {
+      const req = buildRequest(model, controller.signal);
+      const result = await Promise.race([
+        ai.models.generateContent(req),
+        new Promise<never>((_, reject) => {
+          controller.signal.addEventListener(
+            'abort',
+            () => reject(new Error('Gemini upstream call timed out')),
+            {once: true},
+          );
+        }),
+      ]);
+      return result;
+    } catch (err) {
+      lastError = err;
+      const info = extractReadableGeminiError(err);
+      if (!info.retryable) throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastError;
+}
+
+function isLoopbackIp(rawIp: string | undefined): boolean {
+  if (!rawIp) return false;
+  let ip = rawIp.trim().toLowerCase();
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  return ip === '127.0.0.1' || ip === '::1';
 }
 
 function cosineSimilarity(a: number[], b: number[]): number {
@@ -199,13 +272,14 @@ async function startServer() {
         : `Transform the document "${title || 'Untitled'}" by ${author || 'Unknown'} into a comprehensive, well-paced lecture course with an executive summary, core concepts, and 4 progressive lecture modules. Each module should have clear learning objectives, detailed lecture notes grounded in the source text, key takeaways, and a comprehension check question with its answer.\n\nDocument text:\n${clippedContent}`;
 
     try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+      const response = await generateTextWithRetry(ai, (model, abortSignal) => ({
+        model,
         contents: prompt,
         config: {
+          abortSignal,
           systemInstruction:
             'You are an expert academic curriculum designer and research synthesizer. Ground every module, summary, and quiz in the provided document text or metadata. Write clear, structured, scholarly prose.',
-          thinkingConfig: {thinkingLevel: ThinkingLevel.LOW},
+          ...(model === 'gemini-4-hydrogen' ? {thinkingConfig: {thinkingLevel: ThinkingLevel.LOW}} : {}),
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
@@ -248,17 +322,87 @@ async function startServer() {
             required: ['title', 'summary', 'keyConcepts', 'modules'],
           },
         },
-      });
+      }));
 
-      let rawJson = (response.text ?? '{}').trim();
-      const fence = rawJson.match(/```(?:json)?\s*([\s\S]*?)```/i);
-      if (fence) rawJson = fence[1].trim();
-      const parsed = JSON.parse(rawJson);
+      const rawText = (response.text ?? '').trim();
+      const parsed = parseAiCoursePayload(rawText || '{}', title || 'Study Course');
       res.json(parsed);
     } catch (error) {
-      console.error('Gemini course generation error:', error);
-      const message = error instanceof Error ? error.message : 'Failed to generate AI course.';
-      res.status(502).json({error: message});
+      const info = extractReadableGeminiError(error);
+      console.error('Gemini course generation error:', info.message);
+      res.status(info.status >= 400 && info.status < 600 ? info.status : 502).json({
+        error: `${info.message} You can also switch Study Course AI Engine to Ollama or LM Studio to run offline with local models.`,
+      });
+    }
+  });
+
+  // 1b. Strict Loopback-Only Proxy for Local Ollama / LM Studio (avoids browser CORS failures on localhost)
+  app.post('/api/ai/local-proxy', async (req, res) => {
+    const reqHost = String(req.headers.host || '').split(':')[0].toLowerCase();
+    if (!isLoopbackIp(req.socket.remoteAddress) || (reqHost !== 'localhost' && reqHost !== '127.0.0.1')) {
+      res.status(403).json({error: 'Local AI proxy is restricted to loopback desktop sessions.'});
+      return;
+    }
+
+    const {targetUrl, method, headers, body} = (req.body || {}) as {
+      targetUrl?: string;
+      method?: string;
+      headers?: Record<string, string>;
+      body?: unknown;
+    };
+    if (!targetUrl || typeof targetUrl !== 'string') {
+      res.status(400).json({error: 'Missing local target URL.'});
+      return;
+    }
+    const upperMethod = (method || 'GET').toUpperCase();
+    if (upperMethod !== 'GET' && upperMethod !== 'POST') {
+      res.status(400).json({error: 'Unsupported HTTP method.'});
+      return;
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(targetUrl.trim());
+    } catch {
+      res.status(400).json({error: 'Invalid local AI endpoint URL.'});
+      return;
+    }
+
+    const host = parsed.hostname.toLowerCase();
+    const isTargetLoopback = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
+    if (!isTargetLoopback || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+      res.status(400).json({error: 'Local proxy only permits loopback Ollama/LM Studio endpoints.'});
+      return;
+    }
+    const cleanPath = parsed.pathname.replace(/\/+$/, '');
+    const allowedPaths = new Set(['/api/tags', '/api/chat', '/v1/models', '/v1/chat/completions']);
+    if (!allowedPaths.has(cleanPath)) {
+      res.status(400).json({error: 'Unsupported local AI endpoint path.'});
+      return;
+    }
+
+    const forwardedHeaders: Record<string, string> = {};
+    if (upperMethod === 'POST') {
+      forwardedHeaders['Content-Type'] = 'application/json';
+    }
+    if (headers && typeof headers.Authorization === 'string' && headers.Authorization.startsWith('Bearer ')) {
+      forwardedHeaders.Authorization = headers.Authorization.slice(0, 512);
+    }
+
+    try {
+      const upstream = await fetch(parsed.toString(), {
+        method: upperMethod,
+        headers: forwardedHeaders,
+        body: upperMethod === 'POST' && body !== undefined ? JSON.stringify(body) : undefined,
+        redirect: 'manual',
+        signal: AbortSignal.timeout(120000),
+      });
+      const text = await upstream.text();
+      res.status(upstream.status).type(upstream.headers.get('content-type') || 'application/json').send(text);
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Local AI runtime unreachable on loopback.',
+      });
     }
   });
 
@@ -288,13 +432,14 @@ async function startServer() {
     }
 
     try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+      const response = await generateTextWithRetry(ai, (model, abortSignal) => ({
+        model,
         contents: `Translate the following passage from "${contextTitle || 'Document'}" into ${targetLanguage}. Preserve technical accuracy, tone, and paragraph structure.\n\nPassage:\n${text.slice(0, 8000)}`,
         config: {
+          abortSignal,
           systemInstruction:
             'You are a literary and technical translator. Return accurate, natural translation along with detected source language and up to 4 brief domain-term notes if helpful.',
-          thinkingConfig: {thinkingLevel: ThinkingLevel.LOW},
+          ...(model === 'gemini-4-hydrogen' ? {thinkingConfig: {thinkingLevel: ThinkingLevel.LOW}} : {}),
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
@@ -309,14 +454,14 @@ async function startServer() {
             required: ['detectedLanguage', 'translatedText', 'glossaryNotes'],
           },
         },
-      });
+      }));
 
       const parsed = JSON.parse((response.text ?? '{}').trim());
       res.json(parsed);
     } catch (error) {
-      console.error('Gemini translation error:', error);
-      const message = error instanceof Error ? error.message : 'Failed to translate passage.';
-      res.status(502).json({error: message});
+      const info = extractReadableGeminiError(error);
+      console.error('Gemini translation error:', info.message);
+      res.status(info.status >= 400 && info.status < 600 ? info.status : 502).json({error: info.message});
     }
   });
 

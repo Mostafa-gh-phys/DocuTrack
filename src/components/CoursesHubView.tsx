@@ -297,6 +297,7 @@ export const CoursesHubView: React.FC<CoursesHubViewProps> = ({
                 onClick={() => {
                   setDetectedModels([]);
                   setDetectFeedback(null);
+                  setError(null);
                   onUpdateLocalAiConfig({...localAiConfig, provider: opt.id});
                 }}
                 className={`px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors ${

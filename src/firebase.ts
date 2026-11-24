@@ -348,6 +348,14 @@ export async function syncReadingGoalToCloud(uid: string, goal: ReadingGoal): Pr
   }
 }
 
+export interface CloudInitialSnapshotSummary {
+  booksById: Map<string, number>;
+  annsById: Map<string, number>;
+  coursesById: Map<string, number>;
+  prefsUpdatedAtMs: number | null;
+  goalUpdatedAtMs: number | null;
+}
+
 export function subscribeToCloudLibrary(
   uid: string,
   callbacks: {
@@ -356,6 +364,7 @@ export function subscribeToCloudLibrary(
     onCourses: (courses: StudyCourse[]) => void;
     onPreferences?: (prefs: ReaderPreferences) => void;
     onGoal?: (goal: ReadingGoal) => void;
+    onInitialSnapshotReady?: (summary: CloudInitialSnapshotSummary) => void;
     onError: (err: Error) => void;
   },
 ): Unsubscribe {
@@ -364,6 +373,24 @@ export function subscribeToCloudLibrary(
   const coursesPath = `users/${uid}/courses`;
   const prefsPath = `users/${uid}/preferences/reader`;
   const goalsPath = `users/${uid}/goals`;
+
+  const loaded = {books: false, anns: false, courses: false, prefs: false, goals: false};
+  let emittedReady = false;
+  const summary: CloudInitialSnapshotSummary = {
+    booksById: new Map<string, number>(),
+    annsById: new Map<string, number>(),
+    coursesById: new Map<string, number>(),
+    prefsUpdatedAtMs: null,
+    goalUpdatedAtMs: null,
+  };
+
+  const maybeEmitReady = () => {
+    if (emittedReady) return;
+    if (loaded.books && loaded.anns && loaded.courses && loaded.prefs && loaded.goals) {
+      emittedReady = true;
+      callbacks.onInitialSnapshotReady?.(summary);
+    }
+  };
 
   const unsubBooks = onSnapshot(
     collection(db, 'users', uid, 'books'),
@@ -392,7 +419,12 @@ export function subscribeToCloudLibrary(
           updatedAtMs: timestampToMs(data.updatedAt),
         };
       });
+      if (!loaded.books) {
+        loaded.books = true;
+        for (const item of items) summary.booksById.set(item.id, item.updatedAtMs || 0);
+      }
       callbacks.onBooks(items);
+      maybeEmitReady();
     },
     (error) => {
       try {
@@ -443,7 +475,12 @@ export function subscribeToCloudLibrary(
           updatedAtMs: timestampToMs(data.updatedAt),
         };
       });
+      if (!loaded.anns) {
+        loaded.anns = true;
+        for (const item of items) summary.annsById.set(item.id, item.updatedAtMs || 0);
+      }
       callbacks.onAnnotations(items);
+      maybeEmitReady();
     },
     (error) => {
       try {
@@ -471,7 +508,12 @@ export function subscribeToCloudLibrary(
           updatedAtMs: timestampToMs(data.updatedAt),
         };
       });
+      if (!loaded.courses) {
+        loaded.courses = true;
+        for (const item of items) summary.coursesById.set(item.id, item.updatedAtMs || 0);
+      }
       callbacks.onCourses(items);
+      maybeEmitReady();
     },
     (error) => {
       try {
@@ -485,26 +527,33 @@ export function subscribeToCloudLibrary(
   const unsubPrefs = onSnapshot(
     doc(db, 'users', uid, 'preferences', 'reader'),
     (snap) => {
-      if (!snap.exists() || !callbacks.onPreferences) return;
-      const data = snap.data();
-      callbacks.onPreferences({
-        theme: (data.theme as ReaderPreferences['theme']) || 'paper',
-        uiTheme: (data.uiTheme as ReaderPreferences['uiTheme']) || 'light',
-        accentColor: (data.accentColor as ReaderPreferences['accentColor']) || 'cobalt',
-        fontFamily: (data.fontFamily as ReaderPreferences['fontFamily']) || 'serif',
-        fontSize: Number(data.fontSize || 18),
-        lineHeight: Number(data.lineHeight || 1.7),
-        maxWidth: Number(data.maxWidth || 740),
-        columnCount: data.columnCount === 2 ? 2 : 1,
-        epubViewMode: (data.epubViewMode as ReaderPreferences['epubViewMode']) || 'scroll',
-        novelIndent: typeof data.novelIndent === 'boolean' ? data.novelIndent : true,
-        novelJustify: typeof data.novelJustify === 'boolean' ? data.novelJustify : true,
-        novelDropCap: typeof data.novelDropCap === 'boolean' ? data.novelDropCap : true,
-        applyThemeToDocument:
-          typeof data.applyThemeToDocument === 'boolean' ? data.applyThemeToDocument : true,
-        backupFrequency: (data.backupFrequency as ReaderPreferences['backupFrequency']) || 'onChange',
-        updatedAtMs: timestampToMs(data.updatedAt),
-      });
+      const ts = snap.exists() ? timestampToMs(snap.data().updatedAt) : null;
+      if (!loaded.prefs) {
+        loaded.prefs = true;
+        summary.prefsUpdatedAtMs = ts;
+      }
+      if (snap.exists() && callbacks.onPreferences) {
+        const data = snap.data();
+        callbacks.onPreferences({
+          theme: (data.theme as ReaderPreferences['theme']) || 'paper',
+          uiTheme: (data.uiTheme as ReaderPreferences['uiTheme']) || 'light',
+          accentColor: (data.accentColor as ReaderPreferences['accentColor']) || 'cobalt',
+          fontFamily: (data.fontFamily as ReaderPreferences['fontFamily']) || 'serif',
+          fontSize: Number(data.fontSize || 18),
+          lineHeight: Number(data.lineHeight || 1.7),
+          maxWidth: Number(data.maxWidth || 740),
+          columnCount: data.columnCount === 2 ? 2 : 1,
+          epubViewMode: (data.epubViewMode as ReaderPreferences['epubViewMode']) || 'scroll',
+          novelIndent: typeof data.novelIndent === 'boolean' ? data.novelIndent : true,
+          novelJustify: typeof data.novelJustify === 'boolean' ? data.novelJustify : true,
+          novelDropCap: typeof data.novelDropCap === 'boolean' ? data.novelDropCap : true,
+          applyThemeToDocument:
+            typeof data.applyThemeToDocument === 'boolean' ? data.applyThemeToDocument : true,
+          backupFrequency: (data.backupFrequency as ReaderPreferences['backupFrequency']) || 'onChange',
+          updatedAtMs: ts || Date.now(),
+        });
+      }
+      maybeEmitReady();
     },
     (error) => {
       try {
@@ -519,21 +568,28 @@ export function subscribeToCloudLibrary(
     collection(db, 'users', uid, 'goals'),
     (snap) => {
       const first = snap.docs[0];
-      if (!first || !callbacks.onGoal) return;
-      const data = first.data();
-      callbacks.onGoal({
-        id: String(data.id || first.id || 'default'),
-        ownerId: String(data.ownerId || uid),
-        dailyPagesTarget: Number(data.dailyPagesTarget || 25),
-        weeklyMinutesTarget: Number(data.weeklyMinutesTarget || 180),
-        yearlyBooksTarget: Number(data.yearlyBooksTarget || 24),
-        currentStreakDays: Number(data.currentStreakDays || 0),
-        longestStreakDays: Number(data.longestStreakDays || 0),
-        totalPagesRead: Number(data.totalPagesRead || 0),
-        totalMinutesRead: Number(data.totalMinutesRead || 0),
-        dailyHistory: Array.isArray(data.dailyHistory) ? data.dailyHistory.map(String) : [],
-        updatedAtMs: timestampToMs(data.updatedAt),
-      });
+      const ts = first ? timestampToMs(first.data().updatedAt) : null;
+      if (!loaded.goals) {
+        loaded.goals = true;
+        summary.goalUpdatedAtMs = ts;
+      }
+      if (first && callbacks.onGoal) {
+        const data = first.data();
+        callbacks.onGoal({
+          id: String(data.id || first.id || 'default'),
+          ownerId: String(data.ownerId || uid),
+          dailyPagesTarget: Number(data.dailyPagesTarget || 25),
+          weeklyMinutesTarget: Number(data.weeklyMinutesTarget || 180),
+          yearlyBooksTarget: Number(data.yearlyBooksTarget || 24),
+          currentStreakDays: Number(data.currentStreakDays || 0),
+          longestStreakDays: Number(data.longestStreakDays || 0),
+          totalPagesRead: Number(data.totalPagesRead || 0),
+          totalMinutesRead: Number(data.totalMinutesRead || 0),
+          dailyHistory: Array.isArray(data.dailyHistory) ? data.dailyHistory.map(String) : [],
+          updatedAtMs: ts || Date.now(),
+        });
+      }
+      maybeEmitReady();
     },
     (error) => {
       try {

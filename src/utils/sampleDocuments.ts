@@ -237,7 +237,8 @@ export interface SeedLibraryBundle {
 }
 
 export async function createSeedLibraryBundle(): Promise<SeedLibraryBundle> {
-  const now = Date.now();
+  // Fixed baseline timestamp so fresh device seeds yield to real cross-device sync state
+  const now = 1700000000000;
 
   // 1. PDF Seed Book
   const pdfPages = [

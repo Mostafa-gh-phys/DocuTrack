@@ -18,7 +18,7 @@ import type {
   ReaderPreferences,
 } from '../types/library';
 import type {CustomCloudAuthType, CustomCloudConfig, CustomCloudProvider} from '../utils/customCloudSync';
-import type {GitHubSyncConfig} from '../utils/githubSync';
+import {normalizeGitHubRepoInputs, type GitHubSyncConfig} from '../utils/githubSync';
 import {formatBytes} from '../utils/libraryLogic';
 
 interface SyncBackupViewProps {
@@ -208,9 +208,18 @@ export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
               value={githubConfig.owner}
               onChange={(e) => {
                 setGitHubTestResult(null);
-                onUpdateGitHubConfig({...githubConfig, owner: e.target.value}, persistGitHubToken);
+                const val = e.target.value;
+                if (val.includes('github.com') || val.includes('/')) {
+                  const normalized = normalizeGitHubRepoInputs(val, githubConfig.repo);
+                  onUpdateGitHubConfig(
+                    {...githubConfig, owner: normalized.owner, repo: normalized.repo || githubConfig.repo},
+                    persistGitHubToken,
+                  );
+                } else {
+                  onUpdateGitHubConfig({...githubConfig, owner: val}, persistGitHubToken);
+                }
               }}
-              placeholder="octocat"
+              placeholder="octocat or https://github.com/octocat/repo"
               className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"
             />
           </div>
@@ -225,7 +234,16 @@ export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
               value={githubConfig.repo}
               onChange={(e) => {
                 setGitHubTestResult(null);
-                onUpdateGitHubConfig({...githubConfig, repo: e.target.value}, persistGitHubToken);
+                const val = e.target.value;
+                if (val.includes('github.com') || val.includes('/')) {
+                  const normalized = normalizeGitHubRepoInputs(githubConfig.owner, val);
+                  onUpdateGitHubConfig(
+                    {...githubConfig, owner: normalized.owner || githubConfig.owner, repo: normalized.repo},
+                    persistGitHubToken,
+                  );
+                } else {
+                  onUpdateGitHubConfig({...githubConfig, repo: val}, persistGitHubToken);
+                }
               }}
               placeholder="docutrack-library"
               className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"

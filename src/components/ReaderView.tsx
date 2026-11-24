@@ -55,7 +55,12 @@ import type {
 } from '../types/library';
 import {BoundedTaskQueue, computeAutofitZoom, globalCanvasGovernor, RESOURCE_LIMITS, type DocumentFitMode} from '../utils/batchYield';
 import {renderEpubChapterWithAnnotations} from '../utils/epubHighlighter';
-import {translateWithSystemOrWeb, type InlineTranslationOutcome} from '../utils/inlineTranslator';
+import {
+  buildWebTranslatorLinks,
+  resolveTranslatorLanguageCode,
+  translateWithSystemOrWeb,
+  type InlineTranslationOutcome,
+} from '../utils/inlineTranslator';
 import {
   calculateProgress,
   exportAnnotationsToMarkdown,
@@ -1243,6 +1248,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
     if (textToTranslate) {
       setTranslationSource(textToTranslate);
+      setTranslationOutcome({
+        method: 'web-links',
+        targetLanguageLabel: targetLang,
+        targetLangCode: resolveTranslatorLanguageCode(targetLang),
+        note: 'Direct web translation links ready below (no AI or JSON required). Checking system translator...',
+        links: buildWebTranslatorLinks(textToTranslate, targetLang),
+      });
     }
     setTranslating(true);
     setRightTab('translate');

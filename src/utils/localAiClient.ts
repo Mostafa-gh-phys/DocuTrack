@@ -94,6 +94,58 @@ function buildLocalNetworkHelpHint(providerLabel: string, baseUrl: string): stri
   return `Could not reach ${providerLabel} at ${baseUrl}. Ensure the local server is running and CORS is enabled (${providerLabel === 'Ollama' ? 'OLLAMA_ORIGINS="*"' : 'Enable CORS in Server Settings'}).`;
 }
 
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
+}
+
+async function fetchLocalOrProxy(
+  targetUrl: string,
+  init: {method?: 'GET' | 'POST'; headers?: Record<string, string>; body?: string; timeoutMs: number},
+): Promise<Response> {
+  try {
+    return await fetch(targetUrl, {
+      method: init.method || 'GET',
+      headers: init.headers,
+      body: init.body,
+      signal: AbortSignal.timeout(init.timeoutMs),
+    });
+  } catch (directErr) {
+    // If direct browser CORS fails against a loopback Ollama/LM Studio daemon while DocuTrack
+    // itself is running locally on localhost/127.0.0.1, retry safely through the local loopback proxy.
+    const canTryLocalProxy =
+      typeof window !== 'undefined' &&
+      isLoopbackHost(window.location.hostname) &&
+      (() => {
+        try {
+          return isLoopbackHost(new URL(targetUrl).hostname);
+        } catch {
+          return false;
+        }
+      })();
+
+    if (!canTryLocalProxy) {
+      throw directErr;
+    }
+
+    const proxyRes = await fetch('/api/ai/local-proxy', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        targetUrl,
+        method: init.method || 'GET',
+        headers: init.headers || {},
+        body: init.body ? JSON.parse(init.body) : undefined,
+      }),
+      signal: AbortSignal.timeout(init.timeoutMs),
+    });
+    if (proxyRes.status === 502 || proxyRes.status === 403 || proxyRes.status === 404) {
+      throw directErr;
+    }
+    return proxyRes;
+  }
+}
+
 export interface GeneratedCoursePayload {
   title: string;
   summary: string;
@@ -102,10 +154,12 @@ export interface GeneratedCoursePayload {
 }
 
 /**
- * Extracts and normalizes structured course JSON from either strict JSON or markdown-fenced LLM output.
+ * Extracts and normalizes structured course JSON from strict JSON, <think>-prefixed reasoning output,
+ * markdown-fenced LLM output, or prose responses.
  */
 export function parseAiCoursePayload(rawText: string, fallbackTitle: string): GeneratedCoursePayload {
-  let cleaned = (rawText || '').trim();
+  const withoutThink = (rawText || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  let cleaned = withoutThink;
 
   // Strip ```json ... ``` fences if present
   const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -135,7 +189,7 @@ export function parseAiCoursePayload(rawText: string, fallbackTitle: string): Ge
     const summary =
       typeof parsed.summary === 'string' && parsed.summary.trim()
         ? parsed.summary.trim()
-        : rawText.slice(0, 800).trim();
+        : withoutThink.slice(0, 800).trim();
     const keyConcepts = Array.isArray(parsed.keyConcepts)
       ? parsed.keyConcepts.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).slice(0, 12)
       : [];
@@ -165,9 +219,9 @@ export function parseAiCoursePayload(rawText: string, fallbackTitle: string): Ge
   }
 
   // Fallback structured conversion if a small local model responded in prose
-  const cleanProse = (rawText || '').trim();
+  const cleanProse = withoutThink.trim();
   if (!cleanProse) {
-    throw new Error('Local model returned an empty response.');
+    throw new Error('Model returned an empty response.');
   }
   const paragraphs = cleanProse.split(/\n{2,}/).filter((p) => p.trim().length > 20);
   return {
@@ -205,8 +259,9 @@ export async function fetchLocalAiModels(config: LocalAiConfig): Promise<string[
     const root = getOllamaRoot(check.baseUrl);
     let res: Response;
     try {
-      res = await fetch(`${root}/api/tags`, {
-        signal: AbortSignal.timeout(5000),
+      res = await fetchLocalOrProxy(`${root}/api/tags`, {
+        method: 'GET',
+        timeoutMs: 5000,
       });
     } catch {
       throw new Error(buildLocalNetworkHelpHint('Ollama', root));
@@ -226,9 +281,10 @@ export async function fetchLocalAiModels(config: LocalAiConfig): Promise<string[
   }
   let res: Response;
   try {
-    res = await fetch(`${v1Base}/models`, {
+    res = await fetchLocalOrProxy(`${v1Base}/models`, {
+      method: 'GET',
       headers,
-      signal: AbortSignal.timeout(5000),
+      timeoutMs: 5000,
     });
   } catch {
     throw new Error(
@@ -302,6 +358,7 @@ export async function generateCourseWithProvider(
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({...params, content: normalizedContent}),
+      signal: AbortSignal.timeout(45000),
     });
     const raw = await res.text();
     let data: Record<string, unknown> = {};
@@ -331,7 +388,7 @@ export async function generateCourseWithProvider(
 
     const callOllama = async (useJsonFormat: boolean): Promise<Response> => {
       try {
-        return await fetch(`${root}/api/chat`, {
+        return await fetchLocalOrProxy(`${root}/api/chat`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
@@ -344,7 +401,7 @@ export async function generateCourseWithProvider(
             ],
             options: {temperature: 0.3},
           }),
-          signal: AbortSignal.timeout(120000),
+          timeoutMs: 120000,
         });
       } catch {
         throw new Error(buildLocalNetworkHelpHint('Ollama', root));
@@ -386,7 +443,7 @@ export async function generateCourseWithProvider(
 
   let res: Response;
   try {
-    res = await fetch(`${v1Base}/chat/completions`, {
+    res = await fetchLocalOrProxy(`${v1Base}/chat/completions`, {
       method: 'POST',
       headers,
       body: JSON.stringify({
@@ -397,7 +454,7 @@ export async function generateCourseWithProvider(
           {role: 'user', content: prompt.user},
         ],
       }),
-      signal: AbortSignal.timeout(120000),
+      timeoutMs: 120000,
     });
   } catch {
     throw new Error(

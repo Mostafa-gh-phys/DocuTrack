@@ -5,7 +5,7 @@ import {
   computeAutofitZoom,
 } from './batchYield';
 import {filterNewDiskFilesForBookshelf} from './diskFolderWatch';
-import {validateGitHubSyncConfig} from './githubSync';
+import {normalizeGitHubRepoInputs, validateGitHubSyncConfig} from './githubSync';
 import {buildWebTranslatorLinks} from './inlineTranslator';
 import {
   buildLibgenSearchUrl,
@@ -353,5 +353,23 @@ test('filterNewDiskFilesForBookshelf pushes newly added disk files and skips alr
   assert.equal(allSignatures.length, 2);
   assert.equal(newFiles.length, 1);
   assert.equal(newFiles[0].name, 'Topology Notes.epub');
+});
+
+test('parseAiCoursePayload strips <think> blocks with braces and normalizeGitHubRepoInputs parses URLs', () => {
+  const withThink =
+    '<think>Let me outline {internal scratch} reasoning first.</think>\n```json\n{"title":"Category Theory","summary":"Functors and natural transformations.","keyConcepts":["Functors"],"modules":[{"moduleNumber":1,"title":"Categories","durationMinutes":25,"objectives":["Define morphisms"],"lectureNotes":"Objects and arrows.","quizQuestion":"What is identity?","quizAnswer":"f o id = f"}]}\n```';
+  const parsed = parseAiCoursePayload(withThink, 'Categories');
+  assert.equal(parsed.title, 'Category Theory');
+  assert.equal(parsed.modules.length, 1);
+  assert.equal(parsed.modules[0].title, 'Categories');
+
+  assert.deepEqual(normalizeGitHubRepoInputs('https://github.com/octocat/docutrack-sync.git', ''), {
+    owner: 'octocat',
+    repo: 'docutrack-sync',
+  });
+  assert.deepEqual(normalizeGitHubRepoInputs('alice/library-backup', ''), {
+    owner: 'alice',
+    repo: 'library-backup',
+  });
 });
 

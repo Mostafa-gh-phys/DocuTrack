@@ -128,7 +128,7 @@ export async function translateWithSystemOrWeb(
             sourceLanguage: src,
             targetLanguage: targetLangCode,
           }),
-          1500,
+          600,
         );
         if (status !== 'available' && status !== 'readily' && status !== 'yes') {
           allowed = false;

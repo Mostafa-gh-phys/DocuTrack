@@ -38,6 +38,7 @@ interface LibrarySidebarProps {
   collapsed: boolean;
   watchedFolderMeta?: WatchedFolderSnapshotMeta | null;
   watchedFolderBusy?: boolean;
+  watchedFolderNeedsPermission?: boolean;
   onToggleCollapse: () => void;
   onSelectCollection: (c: LibraryCollection) => void;
   onSelectFolder: (path: string | null) => void;
@@ -126,6 +127,7 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
   collapsed,
   watchedFolderMeta,
   watchedFolderBusy,
+  watchedFolderNeedsPermission,
   onToggleCollapse,
   onSelectCollection,
   onSelectFolder,
@@ -422,7 +424,11 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
                 </div>
 
                 <div className="flex items-center justify-between gap-2 text-[11px] opacity-75">
-                  <span className="tabular-nums">{watchedFolderMeta.knownSignatures.length} tracked</span>
+                  <span className="tabular-nums">
+                    {watchedFolderNeedsPermission
+                      ? 'Click Resume to grant access'
+                      : `${watchedFolderMeta.knownSignatures.length} tracked`}
+                  </span>
                   {onScanWatchedFolder && (
                     <button
                       type="button"
@@ -431,7 +437,11 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
                       className="inline-flex items-center gap-1 accent-text font-medium hover:underline disabled:opacity-50"
                     >
                       <RefreshCw className={`w-3 h-3 ${watchedFolderBusy ? 'animate-spin' : ''}`} aria-hidden="true" />
-                      {watchedFolderBusy ? 'Scanning...' : 'Push New Books'}
+                      {watchedFolderBusy
+                        ? 'Scanning...'
+                        : watchedFolderNeedsPermission
+                          ? 'Resume Watch'
+                          : 'Push New Books'}
                     </button>
                   )}
                 </div>

@@ -52,6 +52,43 @@ export function saveGitHubSyncConfig(config: GitHubSyncConfig, persistToken: boo
   }
 }
 
+export function normalizeGitHubRepoInputs(ownerInput: string, repoInput: string): {owner: string; repo: string} {
+  let owner = (ownerInput || '').trim();
+  let repo = (repoInput || '').trim();
+
+  const tryParseFullRepo = (raw: string): {o: string; r: string} | null => {
+    const cleaned = raw
+      .replace(/^https?:\/\/(www\.)?github\.com\//i, '')
+      .replace(/^git@github\.com:/i, '')
+      .replace(/\.git$/i, '')
+      .replace(/^\/+|\/+$/g, '');
+    const parts = cleaned.split('/').filter(Boolean);
+    if (parts.length >= 2) {
+      return {o: parts[0], r: parts[1]};
+    }
+    return null;
+  };
+
+  if (owner.includes('github.com') || (owner.includes('/') && !repo)) {
+    const parsed = tryParseFullRepo(owner);
+    if (parsed) {
+      owner = parsed.o;
+      repo = parsed.r;
+    }
+  } else if (repo.includes('github.com') || repo.includes('/')) {
+    const parsed = tryParseFullRepo(repo);
+    if (parsed) {
+      if (!owner) owner = parsed.o;
+      repo = parsed.r;
+    }
+  }
+
+  return {
+    owner: owner.replace(/^@/, '').trim(),
+    repo: repo.replace(/\.git$/i, '').trim(),
+  };
+}
+
 export function validateGitHubSyncConfig(config: GitHubSyncConfig): {
   valid: boolean;
   owner?: string;
@@ -147,12 +184,26 @@ export async function testGitHubRepoConnection(
   if (!res.ok) {
     return {ok: false, message: `GitHub API returned HTTP ${res.status}.`};
   }
-  const info = (await res.json()) as {full_name?: string; private?: boolean; permissions?: {push?: boolean}};
+  const info = (await res.json()) as {
+    full_name?: string;
+    default_branch?: string;
+    private?: boolean;
+    permissions?: {push?: boolean};
+  };
   const canPush = info.permissions?.push;
-  const accessNote = canPush === true ? 'read/write access verified' : canPush === false ? 'read-only access (add write PAT to push)' : 'repository reachable';
+  const accessNote =
+    canPush === true
+      ? 'read/write access verified'
+      : canPush === false
+        ? 'read-only access (add write PAT to push)'
+        : 'repository reachable';
+  const branchNote =
+    info.default_branch && info.default_branch !== check.branch
+      ? ` · default branch is "${info.default_branch}"`
+      : '';
   return {
     ok: true,
-    message: `Connected to ${info.full_name || `${check.owner}/${check.repo}`} (${accessNote}).`,
+    message: `Connected to ${info.full_name || `${check.owner}/${check.repo}`} (${accessNote}${branchNote}).`,
   };
 }
 
@@ -223,50 +274,69 @@ export async function syncWithGitHubRepo(
     throw new Error('A GitHub Personal Access Token (with Contents read/write scope) is required to push changes.');
   }
 
-  let mergedArchive = localArchive;
-  let existingSha: string | undefined;
-
-  const remote = await pullFromGitHubRepo(config);
-  if (remote.found) {
-    existingSha = remote.sha;
-    if (remote.archive) {
-      mergedArchive = mergeLibraryArchives(localArchive, remote.archive);
-    }
-  }
-
-  const serialized = JSON.stringify(mergedArchive, null, 2);
   const putUrl = `https://api.github.com/repos/${encodeURIComponent(check.owner)}/${encodeURIComponent(
     check.repo,
   )}/contents/${check.encodedPath}`;
 
-  const body: Record<string, unknown> = {
-    message: `DocuTrack library sync (${mergedArchive.books.length} books, ${mergedArchive.annotations.length} notes)`,
-    content: encodeBase64Utf8(serialized),
-    branch: check.branch,
-  };
-  if (existingSha) {
-    body.sha = existingSha;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let mergedArchive = localArchive;
+    let existingSha: string | undefined;
+
+    const remote = await pullFromGitHubRepo(config);
+    if (remote.found) {
+      existingSha = remote.sha;
+      if (remote.archive) {
+        mergedArchive = mergeLibraryArchives(localArchive, remote.archive);
+      }
+    }
+
+    const serialized = JSON.stringify(mergedArchive, null, 2);
+    const body: Record<string, unknown> = {
+      message: `DocuTrack library sync (${mergedArchive.books.length} books, ${mergedArchive.annotations.length} notes)`,
+      content: encodeBase64Utf8(serialized),
+      branch: check.branch,
+    };
+    if (existingSha) {
+      body.sha = existingSha;
+    }
+
+    const putRes = await fetch(putUrl, {
+      method: 'PUT',
+      headers: {
+        ...buildGitHubHeaders(config.token),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(20000),
+    });
+
+    if (putRes.status === 409 && attempt === 0) {
+      // Retry once after re-pulling if another device committed concurrently
+      continue;
+    }
+
+    if (!putRes.ok) {
+      const errText = await putRes.text().catch(() => '');
+      if (putRes.status === 404 || (putRes.status === 422 && /branch/i.test(errText))) {
+        throw new Error(
+          `Branch "${check.branch}" was not found in ${check.owner}/${check.repo}. Initialize the repo with an initial README or verify the branch name.`,
+        );
+      }
+      if (putRes.status === 409) {
+        throw new Error(
+          `GitHub conflict on ${check.owner}/${check.repo}: ensure the repository is initialized with a first commit on "${check.branch}".`,
+        );
+      }
+      throw new Error(`GitHub push failed (HTTP ${putRes.status}): ${errText.slice(0, 160)}`);
+    }
+
+    const result = (await putRes.json()) as {commit?: {sha?: string}};
+    return {
+      mergedArchive,
+      uploadedBytes: new TextEncoder().encode(serialized).byteLength,
+      commitSha: result.commit?.sha,
+    };
   }
 
-  const putRes = await fetch(putUrl, {
-    method: 'PUT',
-    headers: {
-      ...buildGitHubHeaders(config.token),
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(20000),
-  });
-
-  if (!putRes.ok) {
-    const errText = await putRes.text().catch(() => '');
-    throw new Error(`GitHub push failed (HTTP ${putRes.status}): ${errText.slice(0, 160)}`);
-  }
-
-  const result = (await putRes.json()) as {commit?: {sha?: string}};
-  return {
-    mergedArchive,
-    uploadedBytes: new TextEncoder().encode(serialized).byteLength,
-    commitSha: result.commit?.sha,
-  };
+  throw new Error('GitHub push failed after conflict retry.');
 }

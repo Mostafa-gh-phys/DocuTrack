@@ -29,6 +29,7 @@ import {
   syncPreferencesToCloud,
   syncReadingGoalToCloud,
   testConnection,
+  type CloudInitialSnapshotSummary,
 } from './firebase';
 import {useOnlineStatus} from './hooks/useOnlineStatus';
 import type {
@@ -192,6 +193,8 @@ export default function App() {
   const [githubConfig, setGithubConfig] = useState<GitHubSyncConfig>(() => loadGitHubSyncConfig());
   const [githubStatus, setGithubStatus] = useState<string | null>(null);
   const [githubBusy, setGithubBusy] = useState(false);
+  const githubAutoTimerRef = useRef<number | null>(null);
+  const githubSyncLockRef = useRef(false);
 
   const watchedDirHandleRef = useRef<WatchedDirectoryHandleLike | null>(null);
   const watchedScanLockRef = useRef(false);
@@ -199,6 +202,14 @@ export default function App() {
     loadWatchedFolderMeta(),
   );
   const [watchedFolderBusy, setWatchedFolderBusy] = useState(false);
+  const [watchedFolderNeedsPermission, setWatchedFolderNeedsPermission] = useState(false);
+
+  const cloudWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const cloudPushedBookIdsRef = useRef<Set<string>>(new Set());
+  const userRef = useRef(user);
+  userRef.current = user;
+  const cloudReachableRef = useRef(cloudReachable);
+  cloudReachableRef.current = cloudReachable;
 
   const booksRef = useRef(books);
   booksRef.current = books;
@@ -273,156 +284,48 @@ export default function App() {
     };
   }, []);
 
-  // Firebase Auth Listener & Cross-Device Cloud Subscription
+  const enqueueCloudSync = useCallback((task: (uid: string) => Promise<void>) => {
+    cloudWriteQueueRef.current = cloudWriteQueueRef.current
+      .then(async () => {
+        const activeUser = userRef.current;
+        if (!activeUser || !isOnlineRef.current || simulatedOfflineRef.current || !cloudReachableRef.current) {
+          return;
+        }
+        await task(activeUser.uid);
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('unavailable') || msg.includes('offline')) {
+          setCloudReachable(false);
+          setSyncStatus('Cloud Firestore temporarily unreachable — changes saved locally');
+        } else {
+          console.warn('Background cloud sync warning:', msg);
+          setSyncStatus(`Sync warning: ${msg.slice(0, 120)}`);
+        }
+      });
+  }, []);
+
+  const ensureParentBookSynced = useCallback(async (uid: string, bookId: string) => {
+    if (cloudPushedBookIdsRef.current.has(bookId)) return;
+    const book = booksRef.current.find((b) => b.id === bookId);
+    if (!book) return;
+    await syncBookToCloud(uid, book);
+    cloudPushedBookIdsRef.current.add(book.id);
+  }, []);
+
+  // Firebase Auth Listener (tracks signed-in user cleanly)
   useEffect(() => {
-    let unsubCloud: (() => void) | null = null;
-    let activeAuthGeneration = 0;
-
-    const pushLocalStateSequentially = async (targetUser: User, gen: number) => {
-      try {
-        await ensureUserProfile(targetUser);
-        if (gen !== activeAuthGeneration) return;
-        for (const b of booksRef.current) {
-          if (gen !== activeAuthGeneration) return;
-          await syncBookToCloud(targetUser.uid, b);
-        }
-        for (const a of annotationsRef.current) {
-          if (gen !== activeAuthGeneration) return;
-          await syncAnnotationToCloud(targetUser.uid, a);
-        }
-        for (const c of coursesRef.current) {
-          if (gen !== activeAuthGeneration) return;
-          await syncCourseToCloud(targetUser.uid, c);
-        }
-        if (gen !== activeAuthGeneration) return;
-        await syncPreferencesToCloud(targetUser.uid, preferencesRef.current);
-        await syncReadingGoalToCloud(targetUser.uid, readingGoalRef.current);
-      } catch (pushErr) {
-        console.warn('Initial cross-device push deferred:', pushErr);
-      }
-    };
-
-    const unsubAuth = onAuthStateChanged(auth, async (nextUser) => {
-      const generation = ++activeAuthGeneration;
+    const unsubAuth = onAuthStateChanged(auth, (nextUser) => {
       setUser(nextUser);
-      if (unsubCloud) {
-        unsubCloud();
-        unsubCloud = null;
-      }
-
-      if (nextUser) {
-        if ((typeof navigator !== 'undefined' && navigator.onLine === false) || simulatedOfflineRef.current) {
-          setCloudReachable(false);
-          await disableCloudNetwork();
-          setSyncStatus('Offline — changes saved locally in IndexedDB');
-          return;
-        }
-
-        await enableCloudNetwork();
-        const reachable = await testConnection();
-        if (generation !== activeAuthGeneration) return;
-
-        if (!reachable) {
-          setCloudReachable(false);
-          setSyncStatus('Cloud Firestore unreachable — operating in local-first mode');
-          return;
-        }
-
-        setCloudReachable(true);
-        setSyncStatus('Connected to Cross-Device Cloud Sync');
-        try {
-          await ensureUserProfile(nextUser);
-          if (generation !== activeAuthGeneration) return;
-          unsubCloud = subscribeToCloudLibrary(nextUser.uid, {
-            onBooks: (cloudBooks) => {
-              if (cloudBooks.length > 0) {
-                setBooks((prev) => {
-                  const merged = new Map<string, BookMetadata>();
-                  for (const local of prev) merged.set(local.id, local);
-                  for (const cloud of cloudBooks) {
-                    const existing = merged.get(cloud.id);
-                    if (!existing) {
-                      merged.set(cloud.id, cloud);
-                      void saveBookLocal(cloud);
-                    } else if ((cloud.updatedAtMs || 0) >= (existing.updatedAtMs || 0)) {
-                      const nextBook = {...existing, ...cloud};
-                      merged.set(cloud.id, nextBook);
-                      void saveBookLocal(nextBook);
-                    }
-                  }
-                  return Array.from(merged.values());
-                });
-              }
-            },
-            onAnnotations: (cloudAnns) => {
-              if (cloudAnns.length > 0) {
-                setAnnotations((prev) => {
-                  const merged = new Map<string, Annotation>();
-                  for (const a of prev) merged.set(a.id, a);
-                  for (const cloud of cloudAnns) {
-                    const existing = merged.get(cloud.id);
-                    if (!existing || (cloud.updatedAtMs || 0) >= (existing.updatedAtMs || 0)) {
-                      merged.set(cloud.id, cloud);
-                      void saveAnnotationLocal(cloud);
-                    }
-                  }
-                  return Array.from(merged.values());
-                });
-              }
-            },
-            onCourses: (cloudCourses) => {
-              if (cloudCourses.length > 0) {
-                setCourses((prev) => {
-                  const merged = new Map<string, StudyCourse>();
-                  for (const c of prev) merged.set(c.id, c);
-                  for (const cloud of cloudCourses) {
-                    const existing = merged.get(cloud.id);
-                    if (!existing || (cloud.updatedAtMs || 0) >= (existing.updatedAtMs || 0)) {
-                      merged.set(cloud.id, cloud);
-                      void saveCourseLocal(cloud);
-                    }
-                  }
-                  return Array.from(merged.values());
-                });
-              }
-            },
-            onPreferences: (cloudPrefs) => {
-              if ((cloudPrefs.updatedAtMs || 0) >= (preferencesRef.current.updatedAtMs || 0)) {
-                setPreferences(cloudPrefs);
-                void savePreferencesLocal(cloudPrefs);
-              }
-            },
-            onGoal: (cloudGoal) => {
-              if ((cloudGoal.updatedAtMs || 0) >= (readingGoalRef.current.updatedAtMs || 0)) {
-                setReadingGoal(cloudGoal);
-                void saveReadingGoalLocal(cloudGoal);
-              }
-            },
-            onError: (err) => {
-              if (err.message.includes('unavailable') || err.message.includes('offline')) {
-                setCloudReachable(false);
-                setSyncStatus('Cloud Firestore temporarily unreachable — local-first mode active');
-              } else {
-                setSyncStatus(`Sync warning: ${err.message}`);
-              }
-            },
-          });
-
-          void pushLocalStateSequentially(nextUser, generation);
-        } catch (err) {
-          setSyncStatus(err instanceof Error ? err.message : 'Cloud initialization warning');
-        }
-      } else {
+      cloudPushedBookIdsRef.current.clear();
+      if (!nextUser) {
         setCloudReachable(false);
         void disableCloudNetwork();
         setSyncStatus('Local-first mode (sign in for cross-device sync)');
       }
     });
-
     return () => {
-      activeAuthGeneration++;
       unsubAuth();
-      if (unsubCloud) unsubCloud();
     };
   }, []);
 
@@ -441,6 +344,7 @@ export default function App() {
       return;
     }
     void (async () => {
+      setSyncStatus('Connecting to Cross-Device Cloud Sync...');
       await enableCloudNetwork();
       const reachable = await testConnection();
       if (cancelled) return;
@@ -455,6 +359,171 @@ export default function App() {
       cancelled = true;
     };
   }, [user, isOnline, simulatedOffline]);
+
+  // Real-time Cross-Device Cloud Subscription (only after IndexedDB boot & reachable auth session)
+  useEffect(() => {
+    if (!initialized || !user || !cloudReachable || !isOnline || simulatedOffline) {
+      return;
+    }
+
+    let cancelled = false;
+    const activeUser = user;
+
+    const reconcileLocalDeltasToCloud = async (summary: CloudInitialSnapshotSummary) => {
+      try {
+        await ensureUserProfile(activeUser);
+        if (cancelled) return;
+
+        for (const [id] of summary.booksById.entries()) {
+          cloudPushedBookIdsRef.current.add(id);
+        }
+
+        for (const localBook of booksRef.current) {
+          if (cancelled) return;
+          const cloudTs = summary.booksById.get(localBook.id);
+          if (cloudTs === undefined || (localBook.updatedAtMs || 0) > cloudTs) {
+            await syncBookToCloud(activeUser.uid, localBook);
+            cloudPushedBookIdsRef.current.add(localBook.id);
+          }
+        }
+
+        for (const localAnn of annotationsRef.current) {
+          if (cancelled) return;
+          const cloudTs = summary.annsById.get(localAnn.id);
+          if (cloudTs === undefined || (localAnn.updatedAtMs || 0) > cloudTs) {
+            await ensureParentBookSynced(activeUser.uid, localAnn.bookId);
+            await syncAnnotationToCloud(activeUser.uid, localAnn);
+          }
+        }
+
+        for (const localCourse of coursesRef.current) {
+          if (cancelled) return;
+          const cloudTs = summary.coursesById.get(localCourse.id);
+          if (cloudTs === undefined || (localCourse.updatedAtMs || 0) > cloudTs) {
+            await ensureParentBookSynced(activeUser.uid, localCourse.bookId);
+            await syncCourseToCloud(activeUser.uid, localCourse);
+          }
+        }
+
+        if (cancelled) return;
+        const localPrefsTs = preferencesRef.current.updatedAtMs || 0;
+        if (
+          (summary.prefsUpdatedAtMs === null && localPrefsTs > 0) ||
+          (summary.prefsUpdatedAtMs !== null && localPrefsTs > summary.prefsUpdatedAtMs)
+        ) {
+          await syncPreferencesToCloud(activeUser.uid, preferencesRef.current);
+        }
+
+        const localGoalTs = readingGoalRef.current.updatedAtMs || 0;
+        if (
+          (summary.goalUpdatedAtMs === null && localGoalTs > 0) ||
+          (summary.goalUpdatedAtMs !== null && localGoalTs > summary.goalUpdatedAtMs)
+        ) {
+          await syncReadingGoalToCloud(activeUser.uid, readingGoalRef.current);
+        }
+
+        if (!cancelled) {
+          setSyncStatus(`Cross-device sync active (${booksRef.current.length} books in library)`);
+        }
+      } catch (pushErr) {
+        if (!cancelled) {
+          console.warn('Cross-device reconciliation warning:', pushErr);
+          setSyncStatus(
+            `Sync warning: ${pushErr instanceof Error ? pushErr.message.slice(0, 120) : 'Deferred push'}`,
+          );
+        }
+      }
+    };
+
+    const unsubCloud = subscribeToCloudLibrary(activeUser.uid, {
+      onBooks: (cloudBooks) => {
+        if (cloudBooks.length > 0) {
+          for (const b of cloudBooks) cloudPushedBookIdsRef.current.add(b.id);
+          setBooks((prev) => {
+            const merged = new Map<string, BookMetadata>();
+            for (const local of prev) merged.set(local.id, local);
+            for (const cloud of cloudBooks) {
+              const existing = merged.get(cloud.id);
+              if (!existing) {
+                merged.set(cloud.id, cloud);
+                void saveBookLocal(cloud);
+              } else if ((cloud.updatedAtMs || 0) >= (existing.updatedAtMs || 0)) {
+                const nextBook = {...existing, ...cloud};
+                merged.set(cloud.id, nextBook);
+                void saveBookLocal(nextBook);
+              }
+            }
+            return Array.from(merged.values());
+          });
+        }
+      },
+      onAnnotations: (cloudAnns) => {
+        if (cloudAnns.length > 0) {
+          setAnnotations((prev) => {
+            const merged = new Map<string, Annotation>();
+            for (const a of prev) merged.set(a.id, a);
+            for (const cloud of cloudAnns) {
+              const existing = merged.get(cloud.id);
+              if (!existing || (cloud.updatedAtMs || 0) >= (existing.updatedAtMs || 0)) {
+                merged.set(cloud.id, cloud);
+                void saveAnnotationLocal(cloud);
+              }
+            }
+            return Array.from(merged.values());
+          });
+        }
+      },
+      onCourses: (cloudCourses) => {
+        if (cloudCourses.length > 0) {
+          setCourses((prev) => {
+            const merged = new Map<string, StudyCourse>();
+            for (const c of prev) merged.set(c.id, c);
+            for (const cloud of cloudCourses) {
+              const existing = merged.get(cloud.id);
+              if (!existing || (cloud.updatedAtMs || 0) >= (existing.updatedAtMs || 0)) {
+                merged.set(cloud.id, cloud);
+                void saveCourseLocal(cloud);
+              }
+            }
+            return Array.from(merged.values());
+          });
+        }
+      },
+      onPreferences: (cloudPrefs) => {
+        if ((cloudPrefs.updatedAtMs || 0) >= (preferencesRef.current.updatedAtMs || 0)) {
+          setPreferences((prev) => {
+            const mergedPrefs: ReaderPreferences = {...prev, ...cloudPrefs};
+            void savePreferencesLocal(mergedPrefs);
+            return mergedPrefs;
+          });
+        }
+      },
+      onGoal: (cloudGoal) => {
+        if ((cloudGoal.updatedAtMs || 0) >= (readingGoalRef.current.updatedAtMs || 0)) {
+          setReadingGoal(cloudGoal);
+          void saveReadingGoalLocal(cloudGoal);
+        }
+      },
+      onInitialSnapshotReady: (summary) => {
+        if (!cancelled) {
+          void reconcileLocalDeltasToCloud(summary);
+        }
+      },
+      onError: (err) => {
+        if (err.message.includes('unavailable') || err.message.includes('offline')) {
+          setCloudReachable(false);
+          setSyncStatus('Cloud Firestore temporarily unreachable — local-first mode active');
+        } else {
+          setSyncStatus(`Sync warning: ${err.message}`);
+        }
+      },
+    });
+
+    return () => {
+      cancelled = true;
+      unsubCloud();
+    };
+  }, [initialized, user, cloudReachable, isOnline, simulatedOffline, ensureParentBookSynced]);
 
   // Automated Local Storage Backup Runner
   const runBackupSnapshot = useCallback(
@@ -482,14 +551,51 @@ export default function App() {
   );
 
   const scheduleAutoBackup = useCallback(() => {
-    if (preferences.backupFrequency !== 'onChange') return;
-    if (autoBackupTimerRef.current) {
-      window.clearTimeout(autoBackupTimerRef.current);
+    if (preferences.backupFrequency === 'onChange') {
+      if (autoBackupTimerRef.current) {
+        window.clearTimeout(autoBackupTimerRef.current);
+      }
+      autoBackupTimerRef.current = window.setTimeout(() => {
+        void runBackupSnapshot('auto');
+      }, 4000);
     }
-    autoBackupTimerRef.current = window.setTimeout(() => {
-      void runBackupSnapshot('auto');
-    }, 4000);
-  }, [preferences.backupFrequency, runBackupSnapshot]);
+
+    if (
+      githubConfig.enabled &&
+      githubConfig.owner.trim() &&
+      githubConfig.repo.trim() &&
+      githubConfig.token.trim() &&
+      isOnlineRef.current &&
+      !simulatedOfflineRef.current
+    ) {
+      if (githubAutoTimerRef.current) {
+        window.clearTimeout(githubAutoTimerRef.current);
+      }
+      githubAutoTimerRef.current = window.setTimeout(() => {
+        void (async () => {
+          if (githubSyncLockRef.current) return;
+          githubSyncLockRef.current = true;
+          try {
+            const {archive: localArchive} = await createLocalBackupSnapshot('auto', 'GitHub Auto-Sync Snapshot');
+            const result = await syncWithGitHubRepo(githubConfig, localArchive);
+            await restoreFromArchive(result.mergedArchive);
+            const nextCfg: GitHubSyncConfig = {...githubConfig, lastSyncedAtMs: Date.now()};
+            setGithubConfig(nextCfg);
+            saveGitHubSyncConfig(nextCfg, Boolean(nextCfg.token));
+            setGithubStatus(
+              `Auto-synced ${result.mergedArchive.books.length} books to ${githubConfig.owner}/${githubConfig.repo} at ${new Date().toLocaleTimeString()}.`,
+            );
+          } catch (err) {
+            setGithubStatus(
+              `Auto-sync warning: ${err instanceof Error ? err.message : 'GitHub push failed'}`,
+            );
+          } finally {
+            githubSyncLockRef.current = false;
+          }
+        })();
+      }, 6000);
+    }
+  }, [preferences.backupFrequency, runBackupSnapshot, githubConfig]);
 
   // Scheduled Hourly / Daily Backup Interval
   useEffect(() => {
@@ -588,9 +694,10 @@ export default function App() {
             pendingBooks.unshift(res.book);
             pendingChunks.push(...res.chunks);
             if (res.coverDataUrl) pendingCovers[res.book.id] = res.coverDataUrl;
-            if (user && isOnline && !simulatedOffline && cloudReachable) {
-              void syncBookToCloud(user.uid, res.book);
-            }
+            enqueueCloudSync(async (uid) => {
+              await syncBookToCloud(uid, res.book);
+              cloudPushedBookIdsRef.current.add(res.book.id);
+            });
           }
         } catch (err) {
           console.warn(`Skipped ${file.name} during import:`, err);
@@ -696,9 +803,10 @@ export default function App() {
       setBookCovers((prev) => ({...prev, [res.book.id]: res.coverDataUrl!}));
     }
     setTextChunks((prev) => [...res.chunks, ...prev]);
-    if (user && isOnline && !simulatedOffline && cloudReachable) {
-      void syncBookToCloud(user.uid, res.book);
-    }
+    enqueueCloudSync(async (uid) => {
+      await syncBookToCloud(uid, res.book);
+      cloudPushedBookIdsRef.current.add(res.book.id);
+    });
     scheduleAutoBackup();
     setImportNotice(`Added converted "${res.book.title}" to your library.`);
     window.setTimeout(() => setImportNotice(null), 4000);
@@ -720,9 +828,10 @@ export default function App() {
     };
     setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)));
     void saveBookLocal(updated);
-    if (user && isOnline && !simulatedOffline && cloudReachable) {
-      void syncBookToCloud(user.uid, updated);
-    }
+    enqueueCloudSync(async (uid) => {
+      await syncBookToCloud(uid, updated);
+      cloudPushedBookIdsRef.current.add(updated.id);
+    });
     setReaderInitialRightTab(rightTab);
     setOpenBookId(book.id);
   };
@@ -741,24 +850,26 @@ export default function App() {
             updatedAtMs: Date.now(),
           };
           void saveBookLocal(updated);
-          if (user && isOnline && !simulatedOffline && cloudReachable) {
-            void syncBookToCloud(user.uid, updated);
-          }
+          enqueueCloudSync(async (uid) => {
+            await syncBookToCloud(uid, updated);
+            cloudPushedBookIdsRef.current.add(updated.id);
+          });
           return updated;
         }),
       );
       scheduleAutoBackup();
     },
-    [cloudReachable, isOnline, scheduleAutoBackup, simulatedOffline, user],
+    [enqueueCloudSync, scheduleAutoBackup],
   );
 
   const handleToggleFavorite = (book: BookMetadata) => {
     const updated = {...book, isFavorite: !book.isFavorite, updatedAtMs: Date.now()};
     setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)));
     void saveBookLocal(updated);
-    if (user && isOnline && !simulatedOffline && cloudReachable) {
-      void syncBookToCloud(user.uid, updated);
-    }
+    enqueueCloudSync(async (uid) => {
+      await syncBookToCloud(uid, updated);
+      cloudPushedBookIdsRef.current.add(updated.id);
+    });
     scheduleAutoBackup();
   };
 
@@ -766,9 +877,10 @@ export default function App() {
     const updated = {...book, offlinePinned: !book.offlinePinned, updatedAtMs: Date.now()};
     setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)));
     await saveBookLocal(updated);
-    if (user && isOnline && !simulatedOffline && cloudReachable) {
-      void syncBookToCloud(user.uid, updated);
-    }
+    enqueueCloudSync(async (uid) => {
+      await syncBookToCloud(uid, updated);
+      cloudPushedBookIdsRef.current.add(updated.id);
+    });
     scheduleAutoBackup();
   };
 
@@ -783,9 +895,10 @@ export default function App() {
     setCourses((prev) => prev.filter((c) => c.bookId !== book.id));
     setTextChunks((prev) => prev.filter((t) => t.bookId !== book.id));
     await deleteBookLocal(book.id);
-    if (user && isOnline && !simulatedOffline && cloudReachable) {
-      void deleteBookFromCloud(user.uid, book.id);
-    }
+    enqueueCloudSync(async (uid) => {
+      await deleteBookFromCloud(uid, book.id);
+      cloudPushedBookIdsRef.current.delete(book.id);
+    });
     scheduleAutoBackup();
   };
 
@@ -821,10 +934,11 @@ export default function App() {
         migrated.push(nextAnn);
         await saveAnnotationLocal(nextAnn);
         await deleteAnnotationLocal(oldAnn.id);
-        if (user && isOnline && !simulatedOffline && cloudReachable) {
-          void syncAnnotationToCloud(user.uid, nextAnn);
-          void deleteAnnotationFromCloud(user.uid, oldAnn.id);
-        }
+        enqueueCloudSync(async (uid) => {
+          await ensureParentBookSynced(uid, nextAnn.bookId);
+          await syncAnnotationToCloud(uid, nextAnn);
+          await deleteAnnotationFromCloud(uid, oldAnn.id);
+        });
       }
       if (migrated.length > 0) {
         setAnnotations((prev) => [
@@ -864,9 +978,10 @@ export default function App() {
     };
     setAnnotations((prev) => [ann, ...prev]);
     void saveAnnotationLocal(ann);
-    if (user && isOnline && !simulatedOffline && cloudReachable) {
-      void syncAnnotationToCloud(user.uid, ann);
-    }
+    enqueueCloudSync(async (uid) => {
+      await ensureParentBookSynced(uid, ann.bookId);
+      await syncAnnotationToCloud(uid, ann);
+    });
     scheduleAutoBackup();
   };
 
@@ -879,9 +994,10 @@ export default function App() {
         if (a.id !== id) return a;
         const updated: Annotation = {...a, ...patch, updatedAtMs: Date.now()};
         void saveAnnotationLocal(updated);
-        if (user && isOnline && !simulatedOffline && cloudReachable) {
-          void syncAnnotationToCloud(user.uid, updated);
-        }
+        enqueueCloudSync(async (uid) => {
+          await ensureParentBookSynced(uid, updated.bookId);
+          await syncAnnotationToCloud(uid, updated);
+        });
         return updated;
       }),
     );
@@ -891,18 +1007,19 @@ export default function App() {
   const handleDeleteAnnotation = (id: string) => {
     setAnnotations((prev) => prev.filter((a) => a.id !== id));
     void deleteAnnotationLocal(id);
-    if (user && isOnline && !simulatedOffline && cloudReachable) {
-      void deleteAnnotationFromCloud(user.uid, id);
-    }
+    enqueueCloudSync(async (uid) => {
+      await deleteAnnotationFromCloud(uid, id);
+    });
     scheduleAutoBackup();
   };
 
   const handleUpdatePreferences = (nextPrefs: ReaderPreferences) => {
-    setPreferences(nextPrefs);
-    void savePreferencesLocal(nextPrefs);
-    if (user && isOnline && !simulatedOffline && cloudReachable) {
-      void syncPreferencesToCloud(user.uid, nextPrefs);
-    }
+    const stamped = {...nextPrefs, updatedAtMs: Date.now()};
+    setPreferences(stamped);
+    void savePreferencesLocal(stamped);
+    enqueueCloudSync(async (uid) => {
+      await syncPreferencesToCloud(uid, stamped);
+    });
   };
 
   const handleRecordReadingActivity = useCallback(
@@ -910,14 +1027,14 @@ export default function App() {
       setReadingGoal((prev) => {
         const next = recordReadingActivity(prev, pagesDelta, minutesDelta);
         void saveReadingGoalLocal(next);
-        if (user && isOnline && !simulatedOffline && cloudReachable) {
-          void syncReadingGoalToCloud(user.uid, next);
-        }
+        enqueueCloudSync(async (uid) => {
+          await syncReadingGoalToCloud(uid, next);
+        });
         return next;
       });
       scheduleAutoBackup();
     },
-    [cloudReachable, isOnline, scheduleAutoBackup, simulatedOffline, user],
+    [enqueueCloudSync, scheduleAutoBackup],
   );
 
   const handleUpdateGoalTargets = (targets: {
@@ -932,9 +1049,9 @@ export default function App() {
         updatedAtMs: Date.now(),
       };
       void saveReadingGoalLocal(next);
-      if (user && isOnline && !simulatedOffline && cloudReachable) {
-        void syncReadingGoalToCloud(user.uid, next);
-      }
+      enqueueCloudSync(async (uid) => {
+        await syncReadingGoalToCloud(uid, next);
+      });
       return next;
     });
     scheduleAutoBackup();
@@ -944,9 +1061,9 @@ export default function App() {
     setReadingGoal((prev) => {
       const next = resetRecentReadingStats(prev, scope);
       void saveReadingGoalLocal(next);
-      if (user && isOnline && !simulatedOffline && cloudReachable) {
-        void syncReadingGoalToCloud(user.uid, next);
-      }
+      enqueueCloudSync(async (uid) => {
+        await syncReadingGoalToCloud(uid, next);
+      });
       return next;
     });
     scheduleAutoBackup();
@@ -1012,9 +1129,10 @@ export default function App() {
     };
     setCourses((prev) => [course, ...prev.filter((c) => c.bookId !== book.id)]);
     await saveCourseLocal(course);
-    if (user && isOnline && !simulatedOffline && cloudReachable) {
-      void syncCourseToCloud(user.uid, course);
-    }
+    enqueueCloudSync(async (uid) => {
+      await ensureParentBookSynced(uid, course.bookId);
+      await syncCourseToCloud(uid, course);
+    });
     scheduleAutoBackup();
     return course;
   };
@@ -1037,9 +1155,18 @@ export default function App() {
     setSyncStatus('Synchronizing library to Firestore...');
     try {
       await ensureUserProfile(user);
-      for (const b of books) await syncBookToCloud(user.uid, b);
-      for (const a of annotations) await syncAnnotationToCloud(user.uid, a);
-      for (const c of courses) await syncCourseToCloud(user.uid, c);
+      for (const b of books) {
+        await syncBookToCloud(user.uid, b);
+        cloudPushedBookIdsRef.current.add(b.id);
+      }
+      for (const a of annotations) {
+        await ensureParentBookSynced(user.uid, a.bookId);
+        await syncAnnotationToCloud(user.uid, a);
+      }
+      for (const c of courses) {
+        await ensureParentBookSynced(user.uid, c.bookId);
+        await syncCourseToCloud(user.uid, c);
+      }
       await syncPreferencesToCloud(user.uid, preferences);
       await syncReadingGoalToCloud(user.uid, readingGoal);
       setSyncStatus(`Synchronized ${books.length} books & ${annotations.length} notes at ${new Date().toLocaleTimeString()}`);
@@ -1309,6 +1436,47 @@ export default function App() {
     }
   };
 
+  // Auto-pull & merge from GitHub Repository once on startup when configured
+  const githubBootPulledRef = useRef(false);
+  useEffect(() => {
+    if (
+      !initialized ||
+      githubBootPulledRef.current ||
+      !githubConfig.enabled ||
+      !githubConfig.owner.trim() ||
+      !githubConfig.repo.trim() ||
+      !isOnline ||
+      simulatedOffline
+    ) {
+      return;
+    }
+    githubBootPulledRef.current = true;
+    void (async () => {
+      try {
+        const remote = await pullFromGitHubRepo(githubConfig);
+        if (!remote.found || !remote.archive) return;
+        const {archive: localArchive} = await createLocalBackupSnapshot('auto', 'Pre-GitHub Boot Merge');
+        const merged = mergeLibraryArchives(localArchive, remote.archive);
+        await restoreFromArchive(merged);
+        const refreshed = await initializeLibraryStore();
+        setBooks(refreshed.books);
+        setBookCovers(refreshed.covers);
+        setAnnotations(refreshed.annotations);
+        setCourses(refreshed.courses);
+        setPreferences(refreshed.preferences);
+        setReadingGoal(refreshed.readingGoal);
+        setTextChunks(refreshed.textChunks);
+        setGithubStatus(
+          `Synced ${merged.books.length} books & ${merged.annotations.length} notes from ${githubConfig.owner}/${githubConfig.repo}.`,
+        );
+      } catch (err) {
+        setGithubStatus(
+          `GitHub startup sync warning: ${err instanceof Error ? err.message : 'Could not reach repo'}`,
+        );
+      }
+    })();
+  }, [initialized, githubConfig, isOnline, simulatedOffline]);
+
   // Watched Hard-Disk Folder -> Direct Auto-Push to Bookshelf
   const scanWatchedFolderNow = useCallback(async (silent = false) => {
     const handle = watchedDirHandleRef.current;
@@ -1321,8 +1489,12 @@ export default function App() {
         if (perm !== 'granted' && !silent && handle.requestPermission) {
           perm = await handle.requestPermission({mode: 'read'});
         }
-        if (perm !== 'granted') return;
+        if (perm !== 'granted') {
+          setWatchedFolderNeedsPermission(true);
+          return;
+        }
       }
+      setWatchedFolderNeedsPermission(false);
 
       const scannedFiles = await collectSupportedFilesFromDirectoryHandle(handle);
       const currentMeta = loadWatchedFolderMeta();
@@ -1408,6 +1580,7 @@ export default function App() {
         };
         setWatchedFolderMeta(initialMeta);
         saveWatchedFolderMeta(initialMeta);
+        setWatchedFolderNeedsPermission(false);
         watchedScanLockRef.current = false;
         await scanWatchedFolderNow(false);
         return;
@@ -1415,6 +1588,13 @@ export default function App() {
         if (err instanceof DOMException && err.name === 'AbortError') {
           setWatchedFolderBusy(false);
           return;
+        }
+        if (err instanceof DOMException && err.name === 'SecurityError') {
+          setImportNotice(
+            'Persistent folder watching requires opening DocuTrack in its own browser tab or desktop app; importing folder contents now.',
+          );
+          if (importNoticeTimerRef.current) window.clearTimeout(importNoticeTimerRef.current);
+          importNoticeTimerRef.current = window.setTimeout(() => setImportNotice(null), 5500);
         }
       } finally {
         setWatchedFolderBusy(false);
@@ -1427,6 +1607,7 @@ export default function App() {
     watchedDirHandleRef.current = null;
     await saveWatchedDirectoryHandle(null);
     setWatchedFolderMeta(null);
+    setWatchedFolderNeedsPermission(false);
     saveWatchedFolderMeta(null);
   };
 
@@ -1671,6 +1852,7 @@ export default function App() {
               collapsed={sidebarCollapsed}
               watchedFolderMeta={watchedFolderMeta}
               watchedFolderBusy={watchedFolderBusy}
+              watchedFolderNeedsPermission={watchedFolderNeedsPermission}
               onToggleCollapse={() => setSidebarCollapsed((prev) => !prev)}
               onSelectCollection={setActiveCollection}
               onSelectFolder={setActiveFolder}

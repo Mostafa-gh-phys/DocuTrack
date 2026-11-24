@@ -381,7 +381,7 @@ export function createDefaultReadingGoal(ownerId = 'local', todayKey = formatDat
     totalPagesRead: 88,
     totalMinutesRead: 106,
     dailyHistory: serializeDailyHistory(seedLogs),
-    updatedAtMs: Date.now(),
+    updatedAtMs: 0,
   };
 }
 

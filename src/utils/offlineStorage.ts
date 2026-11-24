@@ -92,7 +92,7 @@ export const DEFAULT_PREFERENCES: ReaderPreferences = {
   novelDropCap: true,
   applyThemeToDocument: true,
   backupFrequency: 'onChange',
-  updatedAtMs: Date.now(),
+  updatedAtMs: 0,
 };
 
 let dbPromise: Promise<IDBPDatabase<FolioDB>> | null = null;
