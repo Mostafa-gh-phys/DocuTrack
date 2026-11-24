@@ -4,6 +4,7 @@ import {
   Cloud,
   Download,
   FolderSync,
+  GitBranch,
   Laptop,
   LogOut,
   RefreshCw,
@@ -17,6 +18,7 @@ import type {
   ReaderPreferences,
 } from '../types/library';
 import type {CustomCloudAuthType, CustomCloudConfig, CustomCloudProvider} from '../utils/customCloudSync';
+import type {GitHubSyncConfig} from '../utils/githubSync';
 import {formatBytes} from '../utils/libraryLogic';
 
 interface SyncBackupViewProps {
@@ -28,6 +30,9 @@ interface SyncBackupViewProps {
   customCloudConfig: CustomCloudConfig;
   customCloudStatus: string | null;
   customCloudBusy: boolean;
+  githubConfig: GitHubSyncConfig;
+  githubStatus: string | null;
+  githubBusy: boolean;
   onSignIn: () => void;
   onSignOut: () => void;
   onSyncAllToCloud: () => void;
@@ -41,6 +46,10 @@ interface SyncBackupViewProps {
   onTestCustomCloud: () => Promise<{ok: boolean; message: string}>;
   onSyncCustomCloud: () => Promise<void>;
   onPullCustomCloud: () => Promise<void>;
+  onUpdateGitHubConfig: (next: GitHubSyncConfig, persistToken: boolean) => void;
+  onTestGitHub: () => Promise<{ok: boolean; message: string}>;
+  onSyncGitHub: () => Promise<void>;
+  onPullGitHub: () => Promise<void>;
 }
 
 export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
@@ -52,6 +61,9 @@ export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
   customCloudConfig,
   customCloudStatus,
   customCloudBusy,
+  githubConfig,
+  githubStatus,
+  githubBusy,
   onSignIn,
   onSignOut,
   onSyncAllToCloud,
@@ -65,11 +77,17 @@ export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
   onTestCustomCloud,
   onSyncCustomCloud,
   onPullCustomCloud,
+  onUpdateGitHubConfig,
+  onTestGitHub,
+  onSyncGitHub,
+  onPullGitHub,
 }) => {
   const restoreInputRef = useRef<HTMLInputElement | null>(null);
   const [restoreFeedback, setRestoreFeedback] = useState<string | null>(null);
   const [persistSecret, setPersistSecret] = useState(Boolean(customCloudConfig.secret));
   const [customTestResult, setCustomTestResult] = useState<{ok: boolean; message: string} | null>(null);
+  const [persistGitHubToken, setPersistGitHubToken] = useState(Boolean(githubConfig.token));
+  const [githubTestResult, setGitHubTestResult] = useState<{ok: boolean; message: string} | null>(null);
 
   const supportsDirectoryPicker =
     typeof window !== 'undefined' && 'showDirectoryPicker' in window;
@@ -145,6 +163,187 @@ export const SyncBackupView: React.FC<SyncBackupViewProps> = ({
         {syncStatus && (
           <div className="text-xs text-slate-600 dark:text-slate-300 pt-2 border-t border-slate-100 dark:border-slate-800">
             Sync status: {syncStatus}
+          </div>
+        )}
+      </section>
+
+      {/* 1a. GitHub Repository Sync */}
+      <section
+        aria-label="GitHub repository sync"
+        className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-5"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <GitBranch className="w-5 h-5 accent-text" aria-hidden="true" />
+            <div>
+              <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                GitHub Repository Sync
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Store and merge your DocuTrack library catalog, reading progress, highlights, and study courses in any GitHub repository.
+              </p>
+            </div>
+          </div>
+
+          <label className="flex items-center gap-2 text-xs font-medium cursor-pointer">
+            <input
+              type="checkbox"
+              checked={githubConfig.enabled}
+              onChange={(e) =>
+                onUpdateGitHubConfig({...githubConfig, enabled: e.target.checked}, persistGitHubToken)
+              }
+            />
+            <span>Enable GitHub Sync</span>
+          </label>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+          <div className="space-y-1.5">
+            <label htmlFor="gh-owner" className="block font-medium opacity-80">
+              GitHub Owner / Organization
+            </label>
+            <input
+              id="gh-owner"
+              type="text"
+              value={githubConfig.owner}
+              onChange={(e) => {
+                setGitHubTestResult(null);
+                onUpdateGitHubConfig({...githubConfig, owner: e.target.value}, persistGitHubToken);
+              }}
+              placeholder="octocat"
+              className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <label htmlFor="gh-repo" className="block font-medium opacity-80">
+              Repository Name
+            </label>
+            <input
+              id="gh-repo"
+              type="text"
+              value={githubConfig.repo}
+              onChange={(e) => {
+                setGitHubTestResult(null);
+                onUpdateGitHubConfig({...githubConfig, repo: e.target.value}, persistGitHubToken);
+              }}
+              placeholder="docutrack-library"
+              className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <label htmlFor="gh-branch" className="block font-medium opacity-80">
+              Branch
+            </label>
+            <input
+              id="gh-branch"
+              type="text"
+              value={githubConfig.branch}
+              onChange={(e) =>
+                onUpdateGitHubConfig({...githubConfig, branch: e.target.value}, persistGitHubToken)
+              }
+              placeholder="main"
+              className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <label htmlFor="gh-filepath" className="block font-medium opacity-80">
+              Archive File Path in Repo
+            </label>
+            <input
+              id="gh-filepath"
+              type="text"
+              value={githubConfig.filePath}
+              onChange={(e) =>
+                onUpdateGitHubConfig({...githubConfig, filePath: e.target.value}, persistGitHubToken)
+              }
+              placeholder="docutrack-library-sync.json"
+              className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"
+            />
+          </div>
+
+          <div className="space-y-1.5 md:col-span-2">
+            <label htmlFor="gh-token" className="block font-medium opacity-80">
+              Personal Access Token (Fine-grained PAT with Contents Read &amp; Write)
+            </label>
+            <input
+              id="gh-token"
+              type="password"
+              autoComplete="off"
+              value={githubConfig.token}
+              onChange={(e) => {
+                setGitHubTestResult(null);
+                onUpdateGitHubConfig({...githubConfig, token: e.target.value}, persistGitHubToken);
+              }}
+              placeholder="github_pat_..."
+              className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-transparent font-mono text-xs"
+            />
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+          <label className="flex items-center gap-2 text-xs opacity-75 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={persistGitHubToken}
+              onChange={(e) => {
+                const nextPersist = e.target.checked;
+                setPersistGitHubToken(nextPersist);
+                onUpdateGitHubConfig(githubConfig, nextPersist);
+              }}
+            />
+            <span>Remember token on this browser</span>
+          </label>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={githubBusy || !githubConfig.owner.trim() || !githubConfig.repo.trim()}
+              onClick={() => {
+                void (async () => {
+                  const res = await onTestGitHub();
+                  setGitHubTestResult(res);
+                })();
+              }}
+              className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-45"
+            >
+              Test GitHub Repo
+            </button>
+            <button
+              type="button"
+              disabled={githubBusy || !githubConfig.owner.trim() || !githubConfig.repo.trim()}
+              onClick={() => void onPullGitHub()}
+              className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-45"
+            >
+              Pull from GitHub
+            </button>
+            <button
+              type="button"
+              disabled={githubBusy || !githubConfig.owner.trim() || !githubConfig.repo.trim()}
+              onClick={() => void onSyncGitHub()}
+              className="px-3.5 py-2 rounded-lg accent-btn text-xs font-medium flex items-center gap-1.5 disabled:opacity-45"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${githubBusy ? 'animate-spin' : ''}`} aria-hidden="true" />
+              Sync to GitHub
+            </button>
+          </div>
+        </div>
+
+        {(githubTestResult || githubStatus || githubConfig.lastSyncedAtMs) && (
+          <div className="pt-2 border-t border-slate-100 dark:border-slate-800 text-xs space-y-1">
+            {githubTestResult && (
+              <p className={githubTestResult.ok ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}>
+                {githubTestResult.message}
+              </p>
+            )}
+            {githubStatus && <p className="text-slate-600 dark:text-slate-300">{githubStatus}</p>}
+            {githubConfig.lastSyncedAtMs && (
+              <p className="text-slate-500 dark:text-slate-400 tabular-nums">
+                Last GitHub sync: {new Date(githubConfig.lastSyncedAtMs).toLocaleString()}
+              </p>
+            )}
           </div>
         )}
       </section>

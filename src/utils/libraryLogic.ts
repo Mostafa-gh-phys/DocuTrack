@@ -463,6 +463,98 @@ export function getReadingGoalStats(goal: ReadingGoal, books: BookMetadata[], to
   };
 }
 
+export function getMonthlyReadingStats(
+  goal: ReadingGoal,
+  books: BookMetadata[],
+  todayKey = formatDateKey(),
+) {
+  const logs = parseDailyHistory(goal.dailyHistory);
+  const byDate = new Map(logs.map((l) => [l.date, l]));
+
+  const last30Days: {date: string; label: string; shortLabel: string; pages: number; minutes: number; metTarget: boolean}[] = [];
+  for (let i = 29; i >= 0; i--) {
+    const dk = shiftDateKey(todayKey, -i);
+    const [y, m, d] = dk.split('-').map(Number);
+    const dt = new Date(y, (m || 1) - 1, d || 1);
+    const label = dt.toLocaleDateString('en-US', {month: 'short', day: 'numeric'});
+    const shortLabel = `${m}/${d}`;
+    const log = byDate.get(dk);
+    const pages = log?.pages || 0;
+    const minutes = log?.minutes || 0;
+    last30Days.push({
+      date: dk,
+      label,
+      shortLabel,
+      pages,
+      minutes,
+      metTarget: pages >= goal.dailyPagesTarget,
+    });
+  }
+
+  const monthlyPages = last30Days.reduce((acc, day) => acc + day.pages, 0);
+  const monthlyMinutes = last30Days.reduce((acc, day) => acc + day.minutes, 0);
+  const activeDays = last30Days.filter((day) => day.pages > 0 || day.minutes > 0).length;
+  const daysMetTarget = last30Days.filter((day) => day.metTarget).length;
+  const bestDayPages = last30Days.reduce((max, day) => Math.max(max, day.pages), 0);
+  const avgDailyPages = Math.round((monthlyPages / 30) * 10) / 10;
+  const completedBooks = books.filter((b) => b.progress >= 100).length;
+
+  return {
+    monthlyPages,
+    monthlyMinutes,
+    activeDays,
+    daysMetTarget,
+    bestDayPages,
+    avgDailyPages,
+    completedBooks,
+    last30Days,
+  };
+}
+
+export function resetRecentReadingStats(
+  goal: ReadingGoal,
+  scope: '7days' | '30days' | 'all' = '7days',
+  todayKey = formatDateKey(),
+): ReadingGoal {
+  if (scope === 'all') {
+    return {
+      ...goal,
+      currentStreakDays: 0,
+      longestStreakDays: 0,
+      totalPagesRead: 0,
+      totalMinutesRead: 0,
+      dailyHistory: [],
+      updatedAtMs: Date.now(),
+    };
+  }
+
+  const daysWindow = scope === '30days' ? 30 : 7;
+  const cutoffKey = shiftDateKey(todayKey, -(daysWindow - 1));
+  const logs = parseDailyHistory(goal.dailyHistory);
+
+  let removedPages = 0;
+  let removedMinutes = 0;
+  const keptLogs: ReadingDayLog[] = [];
+  for (const log of logs) {
+    if (log.date >= cutoffKey && log.date <= todayKey) {
+      removedPages += log.pages;
+      removedMinutes += log.minutes;
+    } else {
+      keptLogs.push(log);
+    }
+  }
+
+  const nextStreak = computeReadingStreak(keptLogs, todayKey, Math.max(1, goal.dailyPagesTarget));
+  return {
+    ...goal,
+    currentStreakDays: nextStreak,
+    totalPagesRead: Math.max(0, goal.totalPagesRead - removedPages),
+    totalMinutesRead: Math.max(0, goal.totalMinutesRead - removedMinutes),
+    dailyHistory: serializeDailyHistory(keptLogs),
+    updatedAtMs: Date.now(),
+  };
+}
+
 // --- Zotero Citation & Annotation Export Helpers ---
 export function formatZoteroCitation(book: BookMetadata, annotation: Annotation): string {
   const author = book.author || 'Unknown Author';
@@ -583,7 +675,22 @@ export function clampCoursePayload(course: StudyCourse, ownerId: string) {
   };
 }
 
-const VALID_READER_THEMES: ReaderTheme[] = ['paper', 'sepia', 'parchment', 'sage', 'dusk', 'nord', 'night', 'amoled'];
+const VALID_READER_THEMES: ReaderTheme[] = [
+  'paper',
+  'cream',
+  'sepia',
+  'parchment',
+  'sage',
+  'solarized-light',
+  'dusk',
+  'nord',
+  'solarized-dark',
+  'forest',
+  'gruvbox',
+  'night',
+  'amoled',
+  'high-contrast',
+];
 const VALID_UI_THEMES: UITheme[] = ['light', 'parchment', 'sage', 'dark', 'obsidian'];
 const VALID_ACCENT_COLORS: AppAccentColor[] = ['cobalt', 'forest', 'burgundy', 'ochre', 'indigo', 'graphite'];
 const VALID_FONTS: ReaderFontFamily[] = [
@@ -615,6 +722,7 @@ export function clampPreferencesPayload(prefs: ReaderPreferences, ownerId: strin
     novelIndent: Boolean(prefs.novelIndent ?? true),
     novelJustify: Boolean(prefs.novelJustify ?? true),
     novelDropCap: Boolean(prefs.novelDropCap ?? true),
+    applyThemeToDocument: prefs.applyThemeToDocument !== false,
     backupFrequency: ['manual', 'onChange', 'hourly', 'daily'].includes(prefs.backupFrequency)
       ? prefs.backupFrequency
       : 'onChange',

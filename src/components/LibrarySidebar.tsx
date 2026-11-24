@@ -8,16 +8,20 @@ import {
   FileText,
   Folder,
   FolderOpen,
+  FolderSync,
   FolderTree,
   HardDriveDownload,
   Heart,
   Library,
   PanelLeftClose,
   PanelLeftOpen,
+  RefreshCw,
   Target,
   WifiOff,
+  X,
 } from 'lucide-react';
 import type {BookFormat, BookMetadata, FolderNode, LibraryCollection, ReadingGoal} from '../types/library';
+import type {WatchedFolderSnapshotMeta} from '../utils/diskFolderWatch';
 import {getReadingGoalStats} from '../utils/libraryLogic';
 import {PWAInstallButton} from './PWAInstallButton';
 
@@ -32,6 +36,8 @@ interface LibrarySidebarProps {
   userEmail: string | null;
   readingGoal?: ReadingGoal;
   collapsed: boolean;
+  watchedFolderMeta?: WatchedFolderSnapshotMeta | null;
+  watchedFolderBusy?: boolean;
   onToggleCollapse: () => void;
   onSelectCollection: (c: LibraryCollection) => void;
   onSelectFolder: (path: string | null) => void;
@@ -39,6 +45,10 @@ interface LibrarySidebarProps {
   onToggleSimulatedOffline: () => void;
   onOpenSyncBackup: () => void;
   onOpenGoals?: () => void;
+  onLinkWatchedFolder?: () => void;
+  onScanWatchedFolder?: () => void;
+  onUnlinkWatchedFolder?: () => void;
+  onToggleWatchedAutoPoll?: () => void;
 }
 
 const FolderTreeItem: React.FC<{
@@ -114,6 +124,8 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
   userEmail,
   readingGoal,
   collapsed,
+  watchedFolderMeta,
+  watchedFolderBusy,
   onToggleCollapse,
   onSelectCollection,
   onSelectFolder,
@@ -121,6 +133,10 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
   onToggleSimulatedOffline,
   onOpenSyncBackup,
   onOpenGoals,
+  onLinkWatchedFolder,
+  onScanWatchedFolder,
+  onUnlinkWatchedFolder,
+  onToggleWatchedAutoPoll,
 }) => {
   const goalStats = readingGoal ? getReadingGoalStats(readingGoal, books) : null;
   const readingCount = books.filter((b) => b.progress > 0 && b.progress < 100).length;
@@ -362,6 +378,79 @@ export const LibrarySidebar: React.FC<LibrarySidebarProps> = ({
             })}
           </div>
         </div>
+
+        {onLinkWatchedFolder && (
+          <div className="pt-2 border-t app-border space-y-2">
+            <div className="px-2 flex items-center justify-between gap-2">
+              <h2 className="text-[11px] font-semibold uppercase tracking-wider opacity-55">
+                Auto-Bookshelf Folder
+              </h2>
+              {watchedFolderMeta && onUnlinkWatchedFolder && (
+                <button
+                  type="button"
+                  onClick={onUnlinkWatchedFolder}
+                  aria-label="Unlink watched hard-disk folder"
+                  title="Stop watching folder"
+                  className="p-0.5 opacity-55 hover:opacity-100"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            {watchedFolderMeta ? (
+              <div className="mx-1 p-2.5 rounded-lg border app-border app-surface-muted space-y-2 text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="flex items-center gap-1.5 font-medium truncate">
+                    <FolderSync className="w-3.5 h-3.5 accent-text shrink-0" aria-hidden="true" />
+                    <span className="truncate">{watchedFolderMeta.folderName}</span>
+                  </span>
+                  {onToggleWatchedAutoPoll && (
+                    <button
+                      type="button"
+                      onClick={onToggleWatchedAutoPoll}
+                      aria-pressed={watchedFolderMeta.autoPollEnabled}
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                        watchedFolderMeta.autoPollEnabled
+                          ? 'accent-soft font-semibold'
+                          : 'opacity-65 border app-border'
+                      }`}
+                    >
+                      {watchedFolderMeta.autoPollEnabled ? 'Auto' : 'Manual'}
+                    </button>
+                  )}
+                </div>
+
+                <div className="flex items-center justify-between gap-2 text-[11px] opacity-75">
+                  <span className="tabular-nums">{watchedFolderMeta.knownSignatures.length} tracked</span>
+                  {onScanWatchedFolder && (
+                    <button
+                      type="button"
+                      disabled={watchedFolderBusy}
+                      onClick={onScanWatchedFolder}
+                      className="inline-flex items-center gap-1 accent-text font-medium hover:underline disabled:opacity-50"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${watchedFolderBusy ? 'animate-spin' : ''}`} aria-hidden="true" />
+                      {watchedFolderBusy ? 'Scanning...' : 'Push New Books'}
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={onLinkWatchedFolder}
+                className="w-full flex items-center justify-between px-2.5 py-2 rounded-lg border border-dashed app-border text-xs opacity-85 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+              >
+                <span className="flex items-center gap-2">
+                  <FolderSync className="w-3.5 h-3.5 accent-text shrink-0" aria-hidden="true" />
+                  <span>Watch Disk Folder</span>
+                </span>
+                <span className="text-[10px] opacity-60">Auto</span>
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       <div className={`${mobileOpen ? 'block' : 'hidden'} ${collapsed ? 'lg:hidden' : 'lg:block'} p-4 border-t app-border app-surface-muted space-y-2.5`}>

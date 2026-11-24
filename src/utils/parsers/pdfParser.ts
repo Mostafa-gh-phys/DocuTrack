@@ -1,4 +1,5 @@
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
+import type {OutlineItem} from '../../types/library';
 import {RESOURCE_LIMITS, releaseCanvasMemory, yieldToMain} from '../batchYield';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/workers/pdf.worker.min.mjs';
@@ -7,7 +8,7 @@ export interface ParsedPdfInfo {
   pageCount: number;
   title?: string;
   author?: string;
-  outline: {title: string; page: number}[];
+  outline: OutlineItem[];
   pageTexts: {page: number; text: string}[];
 }
 
@@ -31,14 +32,67 @@ export async function closePdfDocument(doc: pdfjsLib.PDFDocumentProxy | null | u
   }
 }
 
+interface RawPdfOutlineNode {
+  title?: string;
+  dest?: string | unknown[] | null;
+  items?: RawPdfOutlineNode[];
+}
+
+async function resolvePdfDestinationPage(
+  doc: pdfjsLib.PDFDocumentProxy,
+  dest: string | unknown[] | null | undefined,
+): Promise<number> {
+  if (!dest) return 1;
+  try {
+    let destArray: unknown[] | null = null;
+    if (typeof dest === 'string') {
+      destArray = await doc.getDestination(dest);
+    } else if (Array.isArray(dest)) {
+      destArray = dest;
+    }
+    const targetRef = destArray?.[0];
+    if (targetRef && typeof targetRef === 'object') {
+      const idx = await doc.getPageIndex(targetRef as Parameters<pdfjsLib.PDFDocumentProxy['getPageIndex']>[0]);
+      if (Number.isFinite(idx) && idx >= 0) {
+        return Math.min(doc.numPages, idx + 1);
+      }
+    } else if (typeof targetRef === 'number' && Number.isFinite(targetRef)) {
+      return Math.max(1, Math.min(doc.numPages, Math.floor(targetRef) + 1));
+    }
+  } catch {
+    // Unresolved outline destination falls back safely to page 1
+  }
+  return 1;
+}
+
+async function flattenPdfOutlineNodes(
+  doc: pdfjsLib.PDFDocumentProxy,
+  nodes: RawPdfOutlineNode[],
+  out: OutlineItem[],
+  depth = 0,
+  maxItems = 250,
+): Promise<void> {
+  for (const item of nodes) {
+    if (out.length >= maxItems) break;
+    const label = (item.title || '').trim();
+    const pageNum = await resolvePdfDestinationPage(doc, item.dest);
+    if (label) {
+      out.push({title: label, page: pageNum, depth: Math.min(depth, 5)});
+    }
+    if (Array.isArray(item.items) && item.items.length > 0) {
+      await flattenPdfOutlineNodes(doc, item.items, out, depth + 1, maxItems);
+    }
+  }
+}
+
 export async function extractPdfOutlineAndMeta(doc: pdfjsLib.PDFDocumentProxy): Promise<{
   title?: string;
   author?: string;
-  outline: {title: string; page: number}[];
+  outline: OutlineItem[];
 }> {
   let title: string | undefined;
   let author: string | undefined;
-  const outline: {title: string; page: number}[] = [];
+  const outline: OutlineItem[] = [];
 
   await Promise.all([
     (async () => {
@@ -54,19 +108,8 @@ export async function extractPdfOutlineAndMeta(doc: pdfjsLib.PDFDocumentProxy): 
     (async () => {
       try {
         const rawOutline = await doc.getOutline();
-        if (rawOutline) {
-          for (const item of rawOutline.slice(0, 40)) {
-            let pageNum = 1;
-            if (Array.isArray(item.dest) && item.dest[0]) {
-              try {
-                const idx = await doc.getPageIndex(item.dest[0]);
-                pageNum = idx + 1;
-              } catch {
-                pageNum = 1;
-              }
-            }
-            outline.push({title: item.title, page: pageNum});
-          }
+        if (Array.isArray(rawOutline) && rawOutline.length > 0) {
+          await flattenPdfOutlineNodes(doc, rawOutline as RawPdfOutlineNode[], outline, 0, 250);
         }
       } catch {
         // Outline optional
@@ -77,7 +120,7 @@ export async function extractPdfOutlineAndMeta(doc: pdfjsLib.PDFDocumentProxy): 
   if (outline.length === 0) {
     const cap = Math.min(doc.numPages, 200);
     for (let i = 1; i <= cap; i++) {
-      outline.push({title: `Page ${i}`, page: i});
+      outline.push({title: `Page ${i}`, page: i, depth: 0});
     }
   }
 

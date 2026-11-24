@@ -51,11 +51,12 @@ export function computeAutofitZoom(params: AutofitZoomParams): number {
 
   const safePageW = Math.max(120, pageWidth);
   const safePageH = Math.max(120, pageHeight);
-  const padX = isDoublePage ? 76 : 56;
-  const padY = 88;
-  const usableW = Math.max(240, viewportWidth - padX);
-  const usableH = Math.max(240, viewportHeight - padY);
-  const singleColW = isDoublePage ? Math.max(180, (usableW - 18) / 2) : usableW;
+  const sideGutters = viewportWidth >= 640 ? 84 : 44;
+  const padX = isDoublePage ? sideGutters + 30 : sideGutters;
+  const padY = 64;
+  const usableW = Math.max(200, viewportWidth - padX);
+  const usableH = Math.max(220, viewportHeight - padY);
+  const singleColW = isDoublePage ? Math.max(160, (usableW - 14) / 2) : usableW;
 
   const widthScale = singleColW / safePageW;
   const heightScale = usableH / safePageH;

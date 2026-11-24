@@ -1,4 +1,4 @@
-import React, {useState} from 'react';
+import React, {useEffect, useState} from 'react';
 import {BookOpen, Cpu, Download, GraduationCap, RefreshCw} from 'lucide-react';
 import type {BookMetadata, StudyCourse} from '../types/library';
 import {
@@ -6,7 +6,10 @@ import {
   fetchLocalAiModels,
   type LocalAiConfig,
 } from '../utils/localAiClient';
-import {getBookTextChunks} from '../utils/offlineStorage';
+import {getBookBinary, getBookTextChunks} from '../utils/offlineStorage';
+import {extractPdfOutlineAndMeta, extractPdfPageTextRange, loadPdfDocument, closePdfDocument} from '../utils/parsers/pdfParser';
+import {parseEpubQuickIndex} from '../utils/parsers/epubParser';
+import {openDjvuDocument, closeDjvuDocument, extractDjvuPageTextRange} from '../utils/parsers/djvuParser';
 
 interface CoursesHubViewProps {
   books: BookMetadata[];
@@ -37,6 +40,12 @@ export const CoursesHubView: React.FC<CoursesHubViewProps> = ({
   const [detectingModels, setDetectingModels] = useState(false);
   const [detectedModels, setDetectedModels] = useState<string[]>([]);
   const [detectFeedback, setDetectFeedback] = useState<{ok: boolean; message: string} | null>(null);
+
+  useEffect(() => {
+    if (books.length > 0 && !books.some((b) => b.id === selectedBookId)) {
+      setSelectedBookId(books[0].id);
+    }
+  }, [books, selectedBookId]);
 
   const activeCourse = courses.find((c) => c.id === activeCourseId) || courses[0] || null;
   const isLocalProvider = localAiConfig.provider !== 'gemini';
@@ -107,7 +116,7 @@ export const CoursesHubView: React.FC<CoursesHubViewProps> = ({
   };
 
   const handleGenerate = async (mode: 'course' | 'summary') => {
-    const targetBook = books.find((b) => b.id === selectedBookId);
+    const targetBook = books.find((b) => b.id === selectedBookId) || books[0];
     if (!targetBook) return;
     if (!isLocalProvider && (!isOnline || simulatedOffline)) {
       setError(
@@ -120,7 +129,57 @@ export const CoursesHubView: React.FC<CoursesHubViewProps> = ({
     setError(null);
     try {
       const chunks = await getBookTextChunks(targetBook.id);
-      const text = chunks.map((c) => `${c.chapterTitle || ''}\n${c.text}`).join('\n\n') || targetBook.excerpt || targetBook.title;
+      let text = chunks.map((c) => `${c.chapterTitle || ''}\n${c.text}`).join('\n\n').trim();
+
+      if (text.length < 120) {
+        try {
+          const bin = await getBookBinary(targetBook.id);
+          if (bin) {
+            if (targetBook.format === 'pdf') {
+              const doc = await loadPdfDocument(bin);
+              try {
+                const [meta, pages] = await Promise.all([
+                  extractPdfOutlineAndMeta(doc),
+                  extractPdfPageTextRange(doc, 1, Math.min(6, doc.numPages)),
+                ]);
+                const outlineList = meta.outline.slice(0, 25).map((o) => `- ${o.title} (p.${o.page})`).join('\n');
+                const sampled = pages.map((p) => p.text).filter(Boolean).join('\n\n');
+                text = [sampled, outlineList ? `Contents:\n${outlineList}` : ''].filter(Boolean).join('\n\n').trim();
+              } finally {
+                await closePdfDocument(doc);
+              }
+            } else if (targetBook.format === 'epub') {
+              const quick = await parseEpubQuickIndex(bin, 6, false);
+              text = quick.chapters.map((c) => `${c.title}\n${c.plainText}`).join('\n\n').trim();
+            } else if (targetBook.format === 'djvu') {
+              const doc = await openDjvuDocument(bin);
+              try {
+                const pages = await extractDjvuPageTextRange(doc, 1, Math.min(6, doc.page_count()));
+                text = pages.map((p) => p.text).filter(Boolean).join('\n\n').trim();
+              } finally {
+                closeDjvuDocument(doc);
+              }
+            }
+          }
+        } catch {
+          // Fall back to book metadata context below
+        }
+      }
+
+      if (text.length < 40) {
+        text = [
+          `Title: ${targetBook.title}`,
+          `Author: ${targetBook.author}`,
+          `Format: ${targetBook.format.toUpperCase()} (${targetBook.pageCount} pages)`,
+          targetBook.folderPath ? `Collection Folder: ${targetBook.folderPath}` : '',
+          targetBook.tags.length > 0 ? `Tags: ${targetBook.tags.join(', ')}` : '',
+          targetBook.excerpt ? `Excerpt: ${targetBook.excerpt}` : '',
+          text,
+        ]
+          .filter(Boolean)
+          .join('\n');
+      }
+
       const created = await onGenerateCourse(targetBook, mode, text);
       if (created) setActiveCourseId(created.id);
     } catch (err) {

@@ -49,11 +49,11 @@ test('computeAutofitZoom handles manual clamping, single page fit-width/fit-page
     manualZoom: 1.0,
     pageWidth: 600,
     pageHeight: 800,
-    viewportWidth: 1256,
+    viewportWidth: 1284,
     viewportHeight: 900,
     isDoublePage: false,
   });
-  // usableW = 1256 - 56 = 1200 -> 1200 / 600 = 2.0
+  // usableW = 1284 - 84 = 1200 -> 1200 / 600 = 2.0
   assert.equal(singleWidthZoom, 2);
 
   const doubleWidthZoom = computeAutofitZoom({
@@ -61,11 +61,11 @@ test('computeAutofitZoom handles manual clamping, single page fit-width/fit-page
     manualZoom: 1.0,
     pageWidth: 600,
     pageHeight: 800,
-    viewportWidth: 1294,
+    viewportWidth: 1328,
     viewportHeight: 900,
     isDoublePage: true,
   });
-  // usableW = 1294 - 76 = 1218 -> singleColW = (1218 - 18) / 2 = 600 -> 600 / 600 = 1.0
+  // usableW = 1328 - 114 = 1214 -> singleColW = (1214 - 14) / 2 = 600 -> 600 / 600 = 1.0
   assert.equal(doubleWidthZoom, 1);
 
   // Fit page constrains by height when viewport is short
@@ -75,10 +75,10 @@ test('computeAutofitZoom handles manual clamping, single page fit-width/fit-page
     pageWidth: 600,
     pageHeight: 1000,
     viewportWidth: 1400,
-    viewportHeight: 588,
+    viewportHeight: 564,
     isDoublePage: false,
   });
-  // usableH = 588 - 88 = 500 -> 500 / 1000 = 0.5
+  // usableH = 564 - 64 = 500 -> 500 / 1000 = 0.5
   assert.equal(fitPageZoom, 0.5);
 });
 

@@ -262,7 +262,7 @@
         },
         "theme": {
           "type": "string",
-          "enum": ["paper", "sepia", "parchment", "sage", "dusk", "nord", "night", "amoled"]
+          "enum": ["paper", "cream", "sepia", "parchment", "sage", "solarized-light", "dusk", "nord", "solarized-dark", "forest", "gruvbox", "night", "amoled", "high-contrast"]
         },
         "uiTheme": {
           "type": "string",
@@ -299,6 +299,9 @@
           "type": "boolean"
         },
         "novelDropCap": {
+          "type": "boolean"
+        },
+        "applyThemeToDocument": {
           "type": "boolean"
         },
         "backupFrequency": {

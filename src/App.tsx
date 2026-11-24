@@ -53,6 +53,7 @@ import {
   detectSupportedBookFormat,
   findDuplicateBookGroups,
   recordReadingActivity,
+  resetRecentReadingStats,
   sanitizeId,
   searchLocalSemanticChunks,
   sortAndFilterBooks,
@@ -67,6 +68,24 @@ import {
   testCustomCloudConnection,
   type CustomCloudConfig,
 } from './utils/customCloudSync';
+import {
+  loadGitHubSyncConfig,
+  pullFromGitHubRepo,
+  saveGitHubSyncConfig,
+  syncWithGitHubRepo,
+  testGitHubRepoConnection,
+  type GitHubSyncConfig,
+} from './utils/githubSync';
+import {
+  collectSupportedFilesFromDirectoryHandle,
+  filterNewDiskFilesForBookshelf,
+  loadWatchedDirectoryHandle,
+  loadWatchedFolderMeta,
+  saveWatchedDirectoryHandle,
+  saveWatchedFolderMeta,
+  type WatchedDirectoryHandleLike,
+  type WatchedFolderSnapshotMeta,
+} from './utils/diskFolderWatch';
 import {
   generateCourseWithProvider,
   loadLocalAiConfig,
@@ -162,13 +181,41 @@ export default function App() {
   const cancelImportRef = useRef(false);
   const importNoticeTimerRef = useRef<number | null>(null);
 
-  // Automated local disk backup handle & Custom Cloud Sync
+  // Automated local disk backup handle, watched bookshelf folder & Custom/GitHub Cloud Sync
   const backupDirHandleRef = useRef<DirectoryHandleLike | null>(null);
   const [linkedBackupDirName, setLinkedBackupDirName] = useState<string | null>(null);
   const autoBackupTimerRef = useRef<number | null>(null);
   const [customCloudConfig, setCustomCloudConfig] = useState<CustomCloudConfig>(() => loadCustomCloudConfig());
   const [customCloudStatus, setCustomCloudStatus] = useState<string | null>(null);
   const [customCloudBusy, setCustomCloudBusy] = useState(false);
+
+  const [githubConfig, setGithubConfig] = useState<GitHubSyncConfig>(() => loadGitHubSyncConfig());
+  const [githubStatus, setGithubStatus] = useState<string | null>(null);
+  const [githubBusy, setGithubBusy] = useState(false);
+
+  const watchedDirHandleRef = useRef<WatchedDirectoryHandleLike | null>(null);
+  const watchedScanLockRef = useRef(false);
+  const [watchedFolderMeta, setWatchedFolderMeta] = useState<WatchedFolderSnapshotMeta | null>(() =>
+    loadWatchedFolderMeta(),
+  );
+  const [watchedFolderBusy, setWatchedFolderBusy] = useState(false);
+
+  const booksRef = useRef(books);
+  booksRef.current = books;
+  const annotationsRef = useRef(annotations);
+  annotationsRef.current = annotations;
+  const coursesRef = useRef(courses);
+  coursesRef.current = courses;
+  const preferencesRef = useRef(preferences);
+  preferencesRef.current = preferences;
+  const readingGoalRef = useRef(readingGoal);
+  readingGoalRef.current = readingGoal;
+  const simulatedOfflineRef = useRef(simulatedOffline);
+  simulatedOfflineRef.current = simulatedOffline;
+  const isOnlineRef = useRef(isOnline);
+  isOnlineRef.current = isOnline;
+  const importProgressRef = useRef(importProgress);
+  importProgressRef.current = importProgress;
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
@@ -231,6 +278,30 @@ export default function App() {
     let unsubCloud: (() => void) | null = null;
     let activeAuthGeneration = 0;
 
+    const pushLocalStateSequentially = async (targetUser: User, gen: number) => {
+      try {
+        await ensureUserProfile(targetUser);
+        if (gen !== activeAuthGeneration) return;
+        for (const b of booksRef.current) {
+          if (gen !== activeAuthGeneration) return;
+          await syncBookToCloud(targetUser.uid, b);
+        }
+        for (const a of annotationsRef.current) {
+          if (gen !== activeAuthGeneration) return;
+          await syncAnnotationToCloud(targetUser.uid, a);
+        }
+        for (const c of coursesRef.current) {
+          if (gen !== activeAuthGeneration) return;
+          await syncCourseToCloud(targetUser.uid, c);
+        }
+        if (gen !== activeAuthGeneration) return;
+        await syncPreferencesToCloud(targetUser.uid, preferencesRef.current);
+        await syncReadingGoalToCloud(targetUser.uid, readingGoalRef.current);
+      } catch (pushErr) {
+        console.warn('Initial cross-device push deferred:', pushErr);
+      }
+    };
+
     const unsubAuth = onAuthStateChanged(auth, async (nextUser) => {
       const generation = ++activeAuthGeneration;
       setUser(nextUser);
@@ -240,25 +311,25 @@ export default function App() {
       }
 
       if (nextUser) {
-        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        if ((typeof navigator !== 'undefined' && navigator.onLine === false) || simulatedOfflineRef.current) {
           setCloudReachable(false);
           await disableCloudNetwork();
           setSyncStatus('Offline — changes saved locally in IndexedDB');
           return;
         }
 
+        await enableCloudNetwork();
         const reachable = await testConnection();
         if (generation !== activeAuthGeneration) return;
 
         if (!reachable) {
           setCloudReachable(false);
-          await disableCloudNetwork();
           setSyncStatus('Cloud Firestore unreachable — operating in local-first mode');
           return;
         }
 
         setCloudReachable(true);
-        setSyncStatus('Connected to Cloud Sync');
+        setSyncStatus('Connected to Cross-Device Cloud Sync');
         try {
           await ensureUserProfile(nextUser);
           if (generation !== activeAuthGeneration) return;
@@ -270,11 +341,16 @@ export default function App() {
                   for (const local of prev) merged.set(local.id, local);
                   for (const cloud of cloudBooks) {
                     const existing = merged.get(cloud.id);
-                    merged.set(cloud.id, existing ? {...existing, ...cloud} : cloud);
+                    if (!existing) {
+                      merged.set(cloud.id, cloud);
+                      void saveBookLocal(cloud);
+                    } else if ((cloud.updatedAtMs || 0) >= (existing.updatedAtMs || 0)) {
+                      const nextBook = {...existing, ...cloud};
+                      merged.set(cloud.id, nextBook);
+                      void saveBookLocal(nextBook);
+                    }
                   }
-                  const list = Array.from(merged.values());
-                  list.forEach((b) => void saveBookLocal(b));
-                  return list;
+                  return Array.from(merged.values());
                 });
               }
             },
@@ -283,10 +359,14 @@ export default function App() {
                 setAnnotations((prev) => {
                   const merged = new Map<string, Annotation>();
                   for (const a of prev) merged.set(a.id, a);
-                  for (const a of cloudAnns) merged.set(a.id, a);
-                  const list = Array.from(merged.values());
-                  list.forEach((a) => void saveAnnotationLocal(a));
-                  return list;
+                  for (const cloud of cloudAnns) {
+                    const existing = merged.get(cloud.id);
+                    if (!existing || (cloud.updatedAtMs || 0) >= (existing.updatedAtMs || 0)) {
+                      merged.set(cloud.id, cloud);
+                      void saveAnnotationLocal(cloud);
+                    }
+                  }
+                  return Array.from(merged.values());
                 });
               }
             },
@@ -295,27 +375,40 @@ export default function App() {
                 setCourses((prev) => {
                   const merged = new Map<string, StudyCourse>();
                   for (const c of prev) merged.set(c.id, c);
-                  for (const c of cloudCourses) merged.set(c.id, c);
-                  const list = Array.from(merged.values());
-                  list.forEach((c) => void saveCourseLocal(c));
-                  return list;
+                  for (const cloud of cloudCourses) {
+                    const existing = merged.get(cloud.id);
+                    if (!existing || (cloud.updatedAtMs || 0) >= (existing.updatedAtMs || 0)) {
+                      merged.set(cloud.id, cloud);
+                      void saveCourseLocal(cloud);
+                    }
+                  }
+                  return Array.from(merged.values());
                 });
               }
             },
+            onPreferences: (cloudPrefs) => {
+              if ((cloudPrefs.updatedAtMs || 0) >= (preferencesRef.current.updatedAtMs || 0)) {
+                setPreferences(cloudPrefs);
+                void savePreferencesLocal(cloudPrefs);
+              }
+            },
             onGoal: (cloudGoal) => {
-              setReadingGoal(cloudGoal);
-              void saveReadingGoalLocal(cloudGoal);
+              if ((cloudGoal.updatedAtMs || 0) >= (readingGoalRef.current.updatedAtMs || 0)) {
+                setReadingGoal(cloudGoal);
+                void saveReadingGoalLocal(cloudGoal);
+              }
             },
             onError: (err) => {
               if (err.message.includes('unavailable') || err.message.includes('offline')) {
                 setCloudReachable(false);
-                void disableCloudNetwork();
                 setSyncStatus('Cloud Firestore temporarily unreachable — local-first mode active');
               } else {
                 setSyncStatus(`Sync warning: ${err.message}`);
               }
             },
           });
+
+          void pushLocalStateSequentially(nextUser, generation);
         } catch (err) {
           setSyncStatus(err instanceof Error ? err.message : 'Cloud initialization warning');
         }
@@ -353,10 +446,9 @@ export default function App() {
       if (cancelled) return;
       setCloudReachable(reachable);
       if (!reachable) {
-        await disableCloudNetwork();
         setSyncStatus('Cloud Firestore unreachable — operating in local-first mode');
       } else {
-        setSyncStatus('Connected to Cloud Sync');
+        setSyncStatus('Connected to Cross-Device Cloud Sync');
       }
     })();
     return () => {
@@ -496,7 +588,7 @@ export default function App() {
             pendingBooks.unshift(res.book);
             pendingChunks.push(...res.chunks);
             if (res.coverDataUrl) pendingCovers[res.book.id] = res.coverDataUrl;
-            if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+            if (user && isOnline && !simulatedOffline && cloudReachable) {
               void syncBookToCloud(user.uid, res.book);
             }
           }
@@ -604,7 +696,7 @@ export default function App() {
       setBookCovers((prev) => ({...prev, [res.book.id]: res.coverDataUrl!}));
     }
     setTextChunks((prev) => [...res.chunks, ...prev]);
-    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+    if (user && isOnline && !simulatedOffline && cloudReachable) {
       void syncBookToCloud(user.uid, res.book);
     }
     scheduleAutoBackup();
@@ -628,6 +720,9 @@ export default function App() {
     };
     setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)));
     void saveBookLocal(updated);
+    if (user && isOnline && !simulatedOffline && cloudReachable) {
+      void syncBookToCloud(user.uid, updated);
+    }
     setReaderInitialRightTab(rightTab);
     setOpenBookId(book.id);
   };
@@ -646,7 +741,7 @@ export default function App() {
             updatedAtMs: Date.now(),
           };
           void saveBookLocal(updated);
-          if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+          if (user && isOnline && !simulatedOffline && cloudReachable) {
             void syncBookToCloud(user.uid, updated);
           }
           return updated;
@@ -661,7 +756,7 @@ export default function App() {
     const updated = {...book, isFavorite: !book.isFavorite, updatedAtMs: Date.now()};
     setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)));
     void saveBookLocal(updated);
-    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+    if (user && isOnline && !simulatedOffline && cloudReachable) {
       void syncBookToCloud(user.uid, updated);
     }
     scheduleAutoBackup();
@@ -671,7 +766,7 @@ export default function App() {
     const updated = {...book, offlinePinned: !book.offlinePinned, updatedAtMs: Date.now()};
     setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)));
     await saveBookLocal(updated);
-    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+    if (user && isOnline && !simulatedOffline && cloudReachable) {
       void syncBookToCloud(user.uid, updated);
     }
     scheduleAutoBackup();
@@ -688,7 +783,7 @@ export default function App() {
     setCourses((prev) => prev.filter((c) => c.bookId !== book.id));
     setTextChunks((prev) => prev.filter((t) => t.bookId !== book.id));
     await deleteBookLocal(book.id);
-    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+    if (user && isOnline && !simulatedOffline && cloudReachable) {
       void deleteBookFromCloud(user.uid, book.id);
     }
     scheduleAutoBackup();
@@ -726,7 +821,7 @@ export default function App() {
         migrated.push(nextAnn);
         await saveAnnotationLocal(nextAnn);
         await deleteAnnotationLocal(oldAnn.id);
-        if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+        if (user && isOnline && !simulatedOffline && cloudReachable) {
           void syncAnnotationToCloud(user.uid, nextAnn);
           void deleteAnnotationFromCloud(user.uid, oldAnn.id);
         }
@@ -769,7 +864,7 @@ export default function App() {
     };
     setAnnotations((prev) => [ann, ...prev]);
     void saveAnnotationLocal(ann);
-    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+    if (user && isOnline && !simulatedOffline && cloudReachable) {
       void syncAnnotationToCloud(user.uid, ann);
     }
     scheduleAutoBackup();
@@ -784,7 +879,7 @@ export default function App() {
         if (a.id !== id) return a;
         const updated: Annotation = {...a, ...patch, updatedAtMs: Date.now()};
         void saveAnnotationLocal(updated);
-        if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+        if (user && isOnline && !simulatedOffline && cloudReachable) {
           void syncAnnotationToCloud(user.uid, updated);
         }
         return updated;
@@ -796,7 +891,7 @@ export default function App() {
   const handleDeleteAnnotation = (id: string) => {
     setAnnotations((prev) => prev.filter((a) => a.id !== id));
     void deleteAnnotationLocal(id);
-    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+    if (user && isOnline && !simulatedOffline && cloudReachable) {
       void deleteAnnotationFromCloud(user.uid, id);
     }
     scheduleAutoBackup();
@@ -805,7 +900,7 @@ export default function App() {
   const handleUpdatePreferences = (nextPrefs: ReaderPreferences) => {
     setPreferences(nextPrefs);
     void savePreferencesLocal(nextPrefs);
-    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+    if (user && isOnline && !simulatedOffline && cloudReachable) {
       void syncPreferencesToCloud(user.uid, nextPrefs);
     }
   };
@@ -815,7 +910,7 @@ export default function App() {
       setReadingGoal((prev) => {
         const next = recordReadingActivity(prev, pagesDelta, minutesDelta);
         void saveReadingGoalLocal(next);
-        if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+        if (user && isOnline && !simulatedOffline && cloudReachable) {
           void syncReadingGoalToCloud(user.uid, next);
         }
         return next;
@@ -837,7 +932,19 @@ export default function App() {
         updatedAtMs: Date.now(),
       };
       void saveReadingGoalLocal(next);
-      if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+      if (user && isOnline && !simulatedOffline && cloudReachable) {
+        void syncReadingGoalToCloud(user.uid, next);
+      }
+      return next;
+    });
+    scheduleAutoBackup();
+  };
+
+  const handleResetReadingStats = (scope: '7days' | '30days' | 'all') => {
+    setReadingGoal((prev) => {
+      const next = resetRecentReadingStats(prev, scope);
+      void saveReadingGoalLocal(next);
+      if (user && isOnline && !simulatedOffline && cloudReachable) {
         void syncReadingGoalToCloud(user.uid, next);
       }
       return next;
@@ -905,7 +1012,7 @@ export default function App() {
     };
     setCourses((prev) => [course, ...prev.filter((c) => c.bookId !== book.id)]);
     await saveCourseLocal(course);
-    if (user?.emailVerified && isOnline && !simulatedOffline && cloudReachable) {
+    if (user && isOnline && !simulatedOffline && cloudReachable) {
       void syncCourseToCloud(user.uid, course);
     }
     scheduleAutoBackup();
@@ -919,10 +1026,10 @@ export default function App() {
       return;
     }
     setSyncStatus('Checking Firestore connection...');
+    await enableCloudNetwork();
     const reachable = await testConnection();
     if (!reachable) {
       setCloudReachable(false);
-      await disableCloudNetwork();
       setSyncStatus('Cloud Firestore unreachable — changes remain safely stored locally in IndexedDB.');
       return;
     }
@@ -1109,6 +1216,228 @@ export default function App() {
     } finally {
       setCustomCloudBusy(false);
     }
+  };
+
+  // GitHub Repository Sync Handlers
+  const handleUpdateGitHubConfig = (next: GitHubSyncConfig, persistToken: boolean) => {
+    setGithubConfig(next);
+    saveGitHubSyncConfig(next, persistToken);
+  };
+
+  const handleTestGitHub = async (): Promise<{ok: boolean; message: string}> => {
+    if (!isOnline || simulatedOffline) {
+      return {ok: false, message: 'Disable Offline Reading Mode to test GitHub repository connectivity.'};
+    }
+    setGithubBusy(true);
+    try {
+      return await testGitHubRepoConnection(githubConfig);
+    } catch (err) {
+      return {ok: false, message: err instanceof Error ? err.message : 'GitHub connection test failed.'};
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+
+  const handlePullGitHub = async () => {
+    if (!isOnline || simulatedOffline) {
+      setGithubStatus('Offline mode active — reconnect to pull from GitHub.');
+      return;
+    }
+    setGithubBusy(true);
+    setGithubStatus('Pulling library snapshot from GitHub repository...');
+    try {
+      const remote = await pullFromGitHubRepo(githubConfig);
+      if (!remote.found || !remote.archive) {
+        setGithubStatus('No DocuTrack sync file found in this repository/branch yet.');
+        return;
+      }
+      const {archive: localArchive} = await createLocalBackupSnapshot('auto', 'Pre-GitHub Pull State');
+      const merged = mergeLibraryArchives(localArchive, remote.archive);
+      await restoreFromArchive(merged);
+      const refreshed = await initializeLibraryStore();
+      setBooks(refreshed.books);
+      setBookCovers(refreshed.covers);
+      setAnnotations(refreshed.annotations);
+      setCourses(refreshed.courses);
+      setPreferences(refreshed.preferences);
+      setReadingGoal(refreshed.readingGoal);
+      setTextChunks(refreshed.textChunks);
+      const nextCfg: GitHubSyncConfig = {...githubConfig, lastSyncedAtMs: Date.now()};
+      setGithubConfig(nextCfg);
+      saveGitHubSyncConfig(nextCfg, Boolean(nextCfg.token));
+      setGithubStatus(
+        `Merged ${merged.books.length} books & ${merged.annotations.length} annotations from ${githubConfig.owner}/${githubConfig.repo}.`,
+      );
+    } catch (err) {
+      setGithubStatus(err instanceof Error ? err.message : 'Pull from GitHub failed.');
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+
+  const handleSyncGitHub = async () => {
+    if (!isOnline || simulatedOffline) {
+      setGithubStatus('Offline mode active — changes remain safely stored locally.');
+      return;
+    }
+    setGithubBusy(true);
+    setGithubStatus('Synchronizing library with GitHub repository...');
+    try {
+      const {archive: localArchive} = await createLocalBackupSnapshot('manual', 'GitHub Repo Sync Snapshot');
+      const result = await syncWithGitHubRepo(githubConfig, localArchive);
+      await restoreFromArchive(result.mergedArchive);
+      const refreshed = await initializeLibraryStore();
+      setBooks(refreshed.books);
+      setBookCovers(refreshed.covers);
+      setAnnotations(refreshed.annotations);
+      setCourses(refreshed.courses);
+      setPreferences(refreshed.preferences);
+      setReadingGoal(refreshed.readingGoal);
+      setTextChunks(refreshed.textChunks);
+      const nextCfg: GitHubSyncConfig = {...githubConfig, lastSyncedAtMs: Date.now()};
+      setGithubConfig(nextCfg);
+      saveGitHubSyncConfig(nextCfg, Boolean(nextCfg.token));
+      setGithubStatus(
+        `Committed ${result.mergedArchive.books.length} books & ${result.mergedArchive.annotations.length} notes (${Math.round(
+          result.uploadedBytes / 1024,
+        )} KB) to ${githubConfig.owner}/${githubConfig.repo}.`,
+      );
+    } catch (err) {
+      setGithubStatus(err instanceof Error ? err.message : 'GitHub repository sync failed.');
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+
+  // Watched Hard-Disk Folder -> Direct Auto-Push to Bookshelf
+  const scanWatchedFolderNow = useCallback(async (silent = false) => {
+    const handle = watchedDirHandleRef.current;
+    if (!handle || watchedScanLockRef.current || importProgressRef.current) return;
+    watchedScanLockRef.current = true;
+    if (!silent) setWatchedFolderBusy(true);
+    try {
+      if (handle.queryPermission) {
+        let perm = await handle.queryPermission({mode: 'read'});
+        if (perm !== 'granted' && !silent && handle.requestPermission) {
+          perm = await handle.requestPermission({mode: 'read'});
+        }
+        if (perm !== 'granted') return;
+      }
+
+      const scannedFiles = await collectSupportedFilesFromDirectoryHandle(handle);
+      const currentMeta = loadWatchedFolderMeta();
+      const {newFiles, allSignatures} = filterNewDiskFilesForBookshelf(
+        scannedFiles,
+        currentMeta?.knownSignatures || [],
+        booksRef.current,
+      );
+
+      if (newFiles.length > 0) {
+        await handleImportFileList(newFiles);
+      }
+
+      const nextMeta: WatchedFolderSnapshotMeta = {
+        folderName: handle.name,
+        linkedAtMs: currentMeta?.linkedAtMs || Date.now(),
+        lastScanAtMs: Date.now(),
+        knownSignatures: allSignatures,
+        autoPollEnabled: currentMeta?.autoPollEnabled ?? true,
+      };
+      setWatchedFolderMeta(nextMeta);
+      saveWatchedFolderMeta(nextMeta);
+    } catch (err) {
+      if (!silent) {
+        console.warn('Watched folder scan failed:', err);
+      }
+    } finally {
+      watchedScanLockRef.current = false;
+      if (!silent) setWatchedFolderBusy(false);
+    }
+  }, []);
+
+  // Rehydrate watched disk folder handle after boot
+  useEffect(() => {
+    if (!initialized) return;
+    let cancelled = false;
+    void (async () => {
+      const handle = await loadWatchedDirectoryHandle();
+      if (!handle || cancelled) return;
+      watchedDirHandleRef.current = handle;
+      const meta = loadWatchedFolderMeta();
+      if (meta && meta.autoPollEnabled) {
+        await scanWatchedFolderNow(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [initialized, scanWatchedFolderNow]);
+
+  // Background interval & window focus check for newly dropped books on disk
+  useEffect(() => {
+    if (!initialized || !watchedFolderMeta?.autoPollEnabled) return;
+    const id = window.setInterval(() => {
+      void scanWatchedFolderNow(true);
+    }, 12000);
+    const onFocus = () => {
+      void scanWatchedFolderNow(true);
+    };
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.clearInterval(id);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [initialized, watchedFolderMeta?.autoPollEnabled, scanWatchedFolderNow]);
+
+  const handleLinkWatchedFolder = async () => {
+    const win = window as unknown as {
+      showDirectoryPicker?: (opts?: {mode?: 'read' | 'readwrite'}) => Promise<WatchedDirectoryHandleLike>;
+    };
+    if (typeof win.showDirectoryPicker === 'function') {
+      try {
+        setWatchedFolderBusy(true);
+        const dirHandle = await win.showDirectoryPicker({mode: 'read'});
+        watchedDirHandleRef.current = dirHandle;
+        await saveWatchedDirectoryHandle(dirHandle);
+        const initialMeta: WatchedFolderSnapshotMeta = {
+          folderName: dirHandle.name,
+          linkedAtMs: Date.now(),
+          lastScanAtMs: 0,
+          knownSignatures: [],
+          autoPollEnabled: true,
+        };
+        setWatchedFolderMeta(initialMeta);
+        saveWatchedFolderMeta(initialMeta);
+        watchedScanLockRef.current = false;
+        await scanWatchedFolderNow(false);
+        return;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          setWatchedFolderBusy(false);
+          return;
+        }
+      } finally {
+        setWatchedFolderBusy(false);
+      }
+    }
+    folderInputRef.current?.click();
+  };
+
+  const handleUnlinkWatchedFolder = async () => {
+    watchedDirHandleRef.current = null;
+    await saveWatchedDirectoryHandle(null);
+    setWatchedFolderMeta(null);
+    saveWatchedFolderMeta(null);
+  };
+
+  const handleToggleWatchedAutoPoll = () => {
+    if (!watchedFolderMeta) return;
+    const next: WatchedFolderSnapshotMeta = {
+      ...watchedFolderMeta,
+      autoPollEnabled: !watchedFolderMeta.autoPollEnabled,
+    };
+    setWatchedFolderMeta(next);
+    saveWatchedFolderMeta(next);
   };
 
   if (!initialized) {
@@ -1340,6 +1669,8 @@ export default function App() {
               userEmail={user?.email || null}
               readingGoal={readingGoal}
               collapsed={sidebarCollapsed}
+              watchedFolderMeta={watchedFolderMeta}
+              watchedFolderBusy={watchedFolderBusy}
               onToggleCollapse={() => setSidebarCollapsed((prev) => !prev)}
               onSelectCollection={setActiveCollection}
               onSelectFolder={setActiveFolder}
@@ -1347,6 +1678,10 @@ export default function App() {
               onToggleSimulatedOffline={() => setSimulatedOffline((prev) => !prev)}
               onOpenSyncBackup={() => setActiveTab('sync')}
               onOpenGoals={() => setActiveTab('goals')}
+              onLinkWatchedFolder={() => void handleLinkWatchedFolder()}
+              onScanWatchedFolder={() => void scanWatchedFolderNow(false)}
+              onUnlinkWatchedFolder={() => void handleUnlinkWatchedFolder()}
+              onToggleWatchedAutoPoll={handleToggleWatchedAutoPoll}
             />
             <div className="flex-1 flex flex-col min-w-0">
               <LibraryView
@@ -1417,6 +1752,7 @@ export default function App() {
             books={books}
             onLogActivity={handleRecordReadingActivity}
             onUpdateTargets={handleUpdateGoalTargets}
+            onResetStats={handleResetReadingStats}
           />
         )}
 
@@ -1452,6 +1788,9 @@ export default function App() {
             customCloudConfig={customCloudConfig}
             customCloudStatus={customCloudStatus}
             customCloudBusy={customCloudBusy}
+            githubConfig={githubConfig}
+            githubStatus={githubStatus}
+            githubBusy={githubBusy}
             onSignIn={() => void signInWithGoogle()}
             onSignOut={() => void signOutUser()}
             onSyncAllToCloud={() => void handleSyncAllToCloud()}
@@ -1467,6 +1806,10 @@ export default function App() {
             onTestCustomCloud={handleTestCustomCloud}
             onSyncCustomCloud={handleSyncCustomCloud}
             onPullCustomCloud={handlePullCustomCloud}
+            onUpdateGitHubConfig={handleUpdateGitHubConfig}
+            onTestGitHub={handleTestGitHub}
+            onSyncGitHub={handleSyncGitHub}
+            onPullGitHub={handlePullGitHub}
           />
         )}
       </div>

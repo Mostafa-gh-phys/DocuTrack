@@ -1,4 +1,5 @@
 import JSZip from 'jszip';
+import type {OutlineItem} from '../../types/library';
 import {releaseCanvasMemory, yieldToMain} from '../batchYield';
 
 export interface EpubChapter {
@@ -15,6 +16,7 @@ export interface ParsedEpubDocument {
   author?: string;
   language?: string;
   chapters: EpubChapter[];
+  toc: OutlineItem[];
   dispose: () => void;
 }
 
@@ -244,16 +246,31 @@ async function locateOpfPackage(zip: JSZip, parser: DOMParser): Promise<{
   return {opfPath, opfDir, opfDoc};
 }
 
-async function buildTocTitleMap(
+interface RawEpubTocEntry {
+  title: string;
+  href: string;
+  fragmentId?: string;
+  depth: number;
+}
+
+function getDirectChildrenByLocalName(el: Element, localName: string): Element[] {
+  const target = localName.toLowerCase();
+  return Array.from(el.children).filter(
+    (child) => (child.localName || child.nodeName.split(':').pop() || '').toLowerCase() === target,
+  );
+}
+
+async function buildTocData(
   zip: JSZip,
   parser: DOMParser,
   opfDoc: Document,
   opfDir: string,
   manifest: Map<string, {href: string; mediaType: string; properties: string}>,
-): Promise<Map<string, string>> {
+): Promise<{tocTitleByHref: Map<string, string>; rawTocEntries: RawEpubTocEntry[]}> {
   const tocTitleByHref = new Map<string, string>();
+  const rawTocEntries: RawEpubTocEntry[] = [];
 
-  // 1. EPUB 2 NCX TOC
+  // 1. EPUB 2 NCX TOC (preserves nested navPoint hierarchy)
   const spineEl = getElementsByLocalName(opfDoc, 'spine')[0];
   const ncxId = spineEl?.getAttribute('toc') || '';
   const ncxEntry =
@@ -267,16 +284,37 @@ async function buildTocTitleMap(
         const ncxXml = await ncxFile.async('text');
         const ncxDoc = parser.parseFromString(ncxXml, 'application/xml');
         const ncxDir = ncxEntry.href.includes('/') ? ncxEntry.href.slice(0, ncxEntry.href.lastIndexOf('/')) : '';
-        for (const np of getElementsByLocalName(ncxDoc, 'navPoint')) {
-          const label = getFirstTextByLocalName(np, 'text');
-          const contentEl = getElementsByLocalName(np, 'content')[0];
-          const src = contentEl?.getAttribute('src');
-          if (label && src) {
-            const resolved = resolveEpubPath(ncxDir, safeDecodeUri(src));
-            if (resolved && !tocTitleByHref.has(resolved.toLowerCase())) {
-              tocTitleByHref.set(resolved.toLowerCase(), label);
+
+        const walkNavPoints = (parent: Element, depth: number) => {
+          for (const np of getDirectChildrenByLocalName(parent, 'navPoint')) {
+            if (rawTocEntries.length >= 250) break;
+            const navLabel = getDirectChildrenByLocalName(np, 'navLabel')[0];
+            const label = navLabel ? getFirstTextByLocalName(navLabel, 'text') : getFirstTextByLocalName(np, 'text');
+            const contentEl = getDirectChildrenByLocalName(np, 'content')[0] || getElementsByLocalName(np, 'content')[0];
+            const src = contentEl?.getAttribute('src');
+            if (label && src) {
+              const decodedSrc = safeDecodeUri(src);
+              const [pathPart, fragPart] = decodedSrc.split('#');
+              const resolved = resolveEpubPath(ncxDir, pathPart || decodedSrc);
+              if (resolved) {
+                if (!tocTitleByHref.has(resolved.toLowerCase())) {
+                  tocTitleByHref.set(resolved.toLowerCase(), label);
+                }
+                rawTocEntries.push({
+                  title: label,
+                  href: resolved,
+                  fragmentId: fragPart?.trim() || undefined,
+                  depth: Math.min(depth, 5),
+                });
+              }
             }
+            walkNavPoints(np, depth + 1);
           }
+        };
+
+        const navMap = getElementsByLocalName(ncxDoc, 'navMap')[0];
+        if (navMap) {
+          walkNavPoints(navMap, 0);
         }
       } catch {
         // Non-fatal
@@ -284,7 +322,7 @@ async function buildTocTitleMap(
     }
   }
 
-  // 2. EPUB 3 HTML <nav epub:type="toc">
+  // 2. EPUB 3 HTML <nav epub:type="toc"> (prefer nested <ol>/<li> structure if present)
   const navEntry = Array.from(manifest.values()).find((m) =>
     m.properties.toLowerCase().split(/\s+/).includes('nav'),
   );
@@ -297,24 +335,63 @@ async function buildTocTitleMap(
         const navDir = navEntry.href.includes('/') ? navEntry.href.slice(0, navEntry.href.lastIndexOf('/')) : '';
         const navEl =
           navDoc.querySelector('nav[epub\\:type="toc"], nav[role="doc-toc"], nav') || navDoc.body;
-        navEl?.querySelectorAll('a[href]').forEach((a) => {
-          const href = a.getAttribute('href');
-          const label = a.textContent?.replace(/\s+/g, ' ').trim();
-          if (href && label) {
-            const resolved = resolveEpubPath(navDir, safeDecodeUri(href)).toLowerCase();
-            if (resolved && !tocTitleByHref.has(resolved)) {
-              tocTitleByHref.set(resolved, label);
+        const epub3Entries: RawEpubTocEntry[] = [];
+
+        const walkList = (listEl: Element, depth: number) => {
+          for (const li of Array.from(listEl.children).filter((c) => c.tagName.toLowerCase() === 'li')) {
+            if (epub3Entries.length >= 250) break;
+            const anchor = Array.from(li.children).find((c) => c.tagName.toLowerCase() === 'a') || li.querySelector('a[href]');
+            if (anchor) {
+              const href = anchor.getAttribute('href');
+              const label = anchor.textContent?.replace(/\s+/g, ' ').trim();
+              if (href && label) {
+                const decodedHref = safeDecodeUri(href);
+                const [pathPart, fragPart] = decodedHref.split('#');
+                const resolved = resolveEpubPath(navDir, pathPart || navEntry.href);
+                if (resolved) {
+                  if (!tocTitleByHref.has(resolved.toLowerCase())) {
+                    tocTitleByHref.set(resolved.toLowerCase(), label);
+                  }
+                  epub3Entries.push({
+                    title: label,
+                    href: resolved,
+                    fragmentId: fragPart?.trim() || undefined,
+                    depth: Math.min(depth, 5),
+                  });
+                }
+              }
+            }
+            for (const sub of Array.from(li.children).filter((c) => c.tagName.toLowerCase() === 'ol' || c.tagName.toLowerCase() === 'ul')) {
+              walkList(sub, depth + 1);
             }
           }
-        });
+        };
+
+        const rootList = navEl?.querySelector('ol, ul');
+        if (rootList) {
+          walkList(rootList, 0);
+        }
+        if (epub3Entries.length > 0 && rawTocEntries.length === 0) {
+          rawTocEntries.push(...epub3Entries);
+        }
       } catch {
         // Non-fatal
       }
     }
   }
 
-  // Also map relative to opfDir if TOC entries used relative names
   void opfDir;
+  return {tocTitleByHref, rawTocEntries};
+}
+
+async function buildTocTitleMap(
+  zip: JSZip,
+  parser: DOMParser,
+  opfDoc: Document,
+  opfDir: string,
+  manifest: Map<string, {href: string; mediaType: string; properties: string}>,
+): Promise<Map<string, string>> {
+  const {tocTitleByHref} = await buildTocData(zip, parser, opfDoc, opfDir, manifest);
   return tocTitleByHref;
 }
 
@@ -343,6 +420,7 @@ export async function parseEpubDocument(buffer: ArrayBuffer): Promise<ParsedEpub
     let author: string | undefined;
     let language: string | undefined;
     let tocTitleByHref = new Map<string, string>();
+    let rawTocEntries: RawEpubTocEntry[] = [];
     let orderedEntries: {id: string; href: string}[] = [];
 
     if (opfDoc) {
@@ -365,7 +443,9 @@ export async function parseEpubDocument(buffer: ArrayBuffer): Promise<ParsedEpub
         }
       }
 
-      tocTitleByHref = await buildTocTitleMap(zip, parser, opfDoc, opfDir, manifest);
+      const tocData = await buildTocData(zip, parser, opfDoc, opfDir, manifest);
+      tocTitleByHref = tocData.tocTitleByHref;
+      rawTocEntries = tocData.rawTocEntries;
 
       const spineRefs = getElementsByLocalName(opfDoc, 'itemref')
         .map((ref) => ref.getAttribute('idref'))
@@ -435,7 +515,31 @@ export async function parseEpubDocument(buffer: ArrayBuffer): Promise<ParsedEpub
       throw new Error('EPUB archive contains no readable HTML or XHTML chapters.');
     }
 
-    return {title, author, language, chapters, dispose};
+    const chapterByHref = new Map<string, number>();
+    for (const ch of chapters) {
+      chapterByHref.set(ch.href.toLowerCase(), ch.index);
+    }
+    const toc: OutlineItem[] = rawTocEntries
+      .map((entry): OutlineItem | null => {
+        const page = chapterByHref.get(entry.href.toLowerCase());
+        if (!page) return null;
+        return {
+          title: entry.title,
+          page,
+          depth: entry.depth,
+          href: entry.href,
+          fragmentId: entry.fragmentId,
+        };
+      })
+      .filter((item): item is OutlineItem => item !== null);
+
+    if (toc.length === 0) {
+      for (const ch of chapters) {
+        toc.push({title: ch.title, page: ch.index, depth: 0, href: ch.href});
+      }
+    }
+
+    return {title, author, language, chapters, toc, dispose};
   } catch (err) {
     dispose();
     throw err;

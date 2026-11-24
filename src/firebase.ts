@@ -6,11 +6,13 @@ import {
   disableNetwork,
   doc,
   enableNetwork,
+  getDoc,
   getDocFromServer,
   initializeFirestore,
   onSnapshot,
   serverTimestamp,
   setDoc,
+  updateDoc,
   type Unsubscribe,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
@@ -121,6 +123,14 @@ export function handleFirestoreError(
   throw new Error(JSON.stringify(errInfo));
 }
 
+function timestampToMs(val: unknown): number {
+  if (val && typeof val === 'object' && 'toMillis' in val && typeof (val as {toMillis?: unknown}).toMillis === 'function') {
+    return Number((val as {toMillis: () => number}).toMillis()) || Date.now();
+  }
+  if (typeof val === 'number' && Number.isFinite(val)) return val;
+  return Date.now();
+}
+
 export async function testConnection(): Promise<boolean> {
   if (!isFirebaseConfigured) {
     console.error('Please check your Firebase configuration.');
@@ -155,6 +165,7 @@ export async function testConnection(): Promise<boolean> {
 }
 
 export async function signInWithGoogle(): Promise<User> {
+  await enableCloudNetwork();
   const provider = new GoogleAuthProvider();
   const result = await signInWithPopup(auth, provider);
   return result.user;
@@ -165,22 +176,34 @@ export async function signOutUser(): Promise<void> {
   await signOut(auth);
 }
 
+/**
+ * Creates user profile once or updates mutable profile metadata without mutating immutable createdAt.
+ */
 export async function ensureUserProfile(user: User): Promise<void> {
   if (!isFirebaseConfigured) return;
   const path = `users/${user.uid}`;
+  const ref = doc(db, 'users', user.uid);
+  const mutableFields = {
+    displayName: (user.displayName || user.email || 'Reader').slice(0, 120),
+    email: (user.email || '').slice(0, 254),
+    photoURL: (user.photoURL || '').slice(0, 500),
+  };
+
   try {
-    await setDoc(
-      doc(db, 'users', user.uid),
-      {
+    const existingSnap = await getDoc(ref);
+    if (!existingSnap.exists()) {
+      await setDoc(ref, {
         uid: user.uid,
-        displayName: (user.displayName || user.email || 'Reader').slice(0, 120),
-        email: (user.email || '').slice(0, 254),
-        photoURL: (user.photoURL || '').slice(0, 500),
+        ...mutableFields,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-      },
-      {merge: true},
-    );
+      });
+    } else {
+      await updateDoc(ref, {
+        ...mutableFields,
+        updatedAt: serverTimestamp(),
+      });
+    }
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -189,12 +212,22 @@ export async function ensureUserProfile(user: User): Promise<void> {
 export async function syncBookToCloud(uid: string, book: BookMetadata): Promise<void> {
   const payload = clampBookPayload(book, uid);
   const path = `users/${uid}/books/${payload.id}`;
+  const ref = doc(db, 'users', uid, 'books', payload.id);
   try {
-    await setDoc(doc(db, 'users', uid, 'books', payload.id), {
-      ...payload,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+    const existingSnap = await getDoc(ref);
+    if (!existingSnap.exists()) {
+      await setDoc(ref, {
+        ...payload,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      const {id: _id, ownerId: _ownerId, format: _format, addedAt: _addedAt, ...mutable} = payload;
+      await updateDoc(ref, {
+        ...mutable,
+        updatedAt: serverTimestamp(),
+      });
+    }
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -212,12 +245,23 @@ export async function deleteBookFromCloud(uid: string, bookId: string): Promise<
 export async function syncAnnotationToCloud(uid: string, ann: Annotation): Promise<void> {
   const payload = clampAnnotationPayload(ann, uid);
   const path = `users/${uid}/annotations/${payload.id}`;
+  const ref = doc(db, 'users', uid, 'annotations', payload.id);
   try {
-    await setDoc(doc(db, 'users', uid, 'annotations', payload.id), {
-      ...payload,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+    const existingSnap = await getDoc(ref);
+    if (!existingSnap.exists()) {
+      await setDoc(ref, {
+        ...payload,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await updateDoc(ref, {
+        note: payload.note,
+        color: payload.color,
+        tags: payload.tags,
+        updatedAt: serverTimestamp(),
+      });
+    }
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -235,12 +279,24 @@ export async function deleteAnnotationFromCloud(uid: string, annotationId: strin
 export async function syncCourseToCloud(uid: string, course: StudyCourse): Promise<void> {
   const payload = clampCoursePayload(course, uid);
   const path = `users/${uid}/courses/${payload.id}`;
+  const ref = doc(db, 'users', uid, 'courses', payload.id);
   try {
-    await setDoc(doc(db, 'users', uid, 'courses', payload.id), {
-      ...payload,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+    const existingSnap = await getDoc(ref);
+    if (!existingSnap.exists()) {
+      await setDoc(ref, {
+        ...payload,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await updateDoc(ref, {
+        title: payload.title,
+        summary: payload.summary,
+        keyConcepts: payload.keyConcepts,
+        modules: payload.modules,
+        updatedAt: serverTimestamp(),
+      });
+    }
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -249,11 +305,21 @@ export async function syncCourseToCloud(uid: string, course: StudyCourse): Promi
 export async function syncPreferencesToCloud(uid: string, prefs: ReaderPreferences): Promise<void> {
   const payload = clampPreferencesPayload(prefs, uid);
   const path = `users/${uid}/preferences/reader`;
+  const ref = doc(db, 'users', uid, 'preferences', 'reader');
   try {
-    await setDoc(doc(db, 'users', uid, 'preferences', 'reader'), {
-      ...payload,
-      updatedAt: serverTimestamp(),
-    });
+    const existingSnap = await getDoc(ref);
+    if (!existingSnap.exists()) {
+      await setDoc(ref, {
+        ...payload,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      const {ownerId: _ownerId, ...mutable} = payload;
+      await updateDoc(ref, {
+        ...mutable,
+        updatedAt: serverTimestamp(),
+      });
+    }
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -262,11 +328,21 @@ export async function syncPreferencesToCloud(uid: string, prefs: ReaderPreferenc
 export async function syncReadingGoalToCloud(uid: string, goal: ReadingGoal): Promise<void> {
   const payload = clampReadingGoalPayload(goal, uid);
   const path = `users/${uid}/goals/${payload.id}`;
+  const ref = doc(db, 'users', uid, 'goals', payload.id);
   try {
-    await setDoc(doc(db, 'users', uid, 'goals', payload.id), {
-      ...payload,
-      updatedAt: serverTimestamp(),
-    });
+    const existingSnap = await getDoc(ref);
+    if (!existingSnap.exists()) {
+      await setDoc(ref, {
+        ...payload,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      const {id: _id, ownerId: _ownerId, ...mutable} = payload;
+      await updateDoc(ref, {
+        ...mutable,
+        updatedAt: serverTimestamp(),
+      });
+    }
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -278,6 +354,7 @@ export function subscribeToCloudLibrary(
     onBooks: (books: BookMetadata[]) => void;
     onAnnotations: (annotations: Annotation[]) => void;
     onCourses: (courses: StudyCourse[]) => void;
+    onPreferences?: (prefs: ReaderPreferences) => void;
     onGoal?: (goal: ReadingGoal) => void;
     onError: (err: Error) => void;
   },
@@ -285,6 +362,7 @@ export function subscribeToCloudLibrary(
   const booksPath = `users/${uid}/books`;
   const annPath = `users/${uid}/annotations`;
   const coursesPath = `users/${uid}/courses`;
+  const prefsPath = `users/${uid}/preferences/reader`;
   const goalsPath = `users/${uid}/goals`;
 
   const unsubBooks = onSnapshot(
@@ -306,12 +384,12 @@ export function subscribeToCloudLibrary(
           isFavorite: Boolean(data.isFavorite),
           offlinePinned: Boolean(data.offlinePinned),
           tags: Array.isArray(data.tags) ? data.tags.map(String) : [],
-          coverUrl: typeof data.coverUrl === 'string' ? data.coverUrl : undefined,
+          coverUrl: typeof data.coverUrl === 'string' && data.coverUrl ? data.coverUrl : undefined,
           excerpt: typeof data.excerpt === 'string' ? data.excerpt : undefined,
           language: typeof data.language === 'string' ? data.language : undefined,
           addedAt: Number(data.addedAt || Date.now()),
           lastOpenedAt: typeof data.lastOpenedAt === 'number' ? data.lastOpenedAt : undefined,
-          updatedAtMs: Date.now(),
+          updatedAtMs: timestampToMs(data.updatedAt),
         };
       });
       callbacks.onBooks(items);
@@ -361,8 +439,8 @@ export function subscribeToCloudLibrary(
                 }))
             : undefined,
           inkStrokes: Array.isArray(data.inkStrokes) ? data.inkStrokes.map(String) : undefined,
-          createdAtMs: Date.now(),
-          updatedAtMs: Date.now(),
+          createdAtMs: timestampToMs(data.createdAt),
+          updatedAtMs: timestampToMs(data.updatedAt),
         };
       });
       callbacks.onAnnotations(items);
@@ -389,8 +467,8 @@ export function subscribeToCloudLibrary(
           summary: String(data.summary || ''),
           keyConcepts: Array.isArray(data.keyConcepts) ? data.keyConcepts.map(String) : [],
           modules: Array.isArray(data.modules) ? data.modules : [],
-          createdAtMs: Date.now(),
-          updatedAtMs: Date.now(),
+          createdAtMs: timestampToMs(data.createdAt),
+          updatedAtMs: timestampToMs(data.updatedAt),
         };
       });
       callbacks.onCourses(items);
@@ -398,6 +476,39 @@ export function subscribeToCloudLibrary(
     (error) => {
       try {
         handleFirestoreError(error, OperationType.LIST, coursesPath);
+      } catch (e) {
+        callbacks.onError(e as Error);
+      }
+    },
+  );
+
+  const unsubPrefs = onSnapshot(
+    doc(db, 'users', uid, 'preferences', 'reader'),
+    (snap) => {
+      if (!snap.exists() || !callbacks.onPreferences) return;
+      const data = snap.data();
+      callbacks.onPreferences({
+        theme: (data.theme as ReaderPreferences['theme']) || 'paper',
+        uiTheme: (data.uiTheme as ReaderPreferences['uiTheme']) || 'light',
+        accentColor: (data.accentColor as ReaderPreferences['accentColor']) || 'cobalt',
+        fontFamily: (data.fontFamily as ReaderPreferences['fontFamily']) || 'serif',
+        fontSize: Number(data.fontSize || 18),
+        lineHeight: Number(data.lineHeight || 1.7),
+        maxWidth: Number(data.maxWidth || 740),
+        columnCount: data.columnCount === 2 ? 2 : 1,
+        epubViewMode: (data.epubViewMode as ReaderPreferences['epubViewMode']) || 'scroll',
+        novelIndent: typeof data.novelIndent === 'boolean' ? data.novelIndent : true,
+        novelJustify: typeof data.novelJustify === 'boolean' ? data.novelJustify : true,
+        novelDropCap: typeof data.novelDropCap === 'boolean' ? data.novelDropCap : true,
+        applyThemeToDocument:
+          typeof data.applyThemeToDocument === 'boolean' ? data.applyThemeToDocument : true,
+        backupFrequency: (data.backupFrequency as ReaderPreferences['backupFrequency']) || 'onChange',
+        updatedAtMs: timestampToMs(data.updatedAt),
+      });
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.GET, prefsPath);
       } catch (e) {
         callbacks.onError(e as Error);
       }
@@ -421,7 +532,7 @@ export function subscribeToCloudLibrary(
         totalPagesRead: Number(data.totalPagesRead || 0),
         totalMinutesRead: Number(data.totalMinutesRead || 0),
         dailyHistory: Array.isArray(data.dailyHistory) ? data.dailyHistory.map(String) : [],
-        updatedAtMs: Date.now(),
+        updatedAtMs: timestampToMs(data.updatedAt),
       });
     },
     (error) => {
@@ -437,6 +548,7 @@ export function subscribeToCloudLibrary(
     unsubBooks();
     unsubAnns();
     unsubCourses();
+    unsubPrefs();
     unsubGoals();
   };
 }

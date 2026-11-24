@@ -153,10 +153,26 @@ export const AppearanceDialog: React.FC<AppearanceDialogProps> = ({
         </section>
 
         {/* Reader Paper Surface */}
-        <section className="space-y-2.5">
-          <h3 className="text-xs font-semibold uppercase tracking-wide opacity-70">
-            Default Reader Paper Surface
-          </h3>
+        <section className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-xs font-semibold uppercase tracking-wide opacity-70">
+              Default Reader Surface ({Object.keys(READER_THEMES).length} Themes)
+            </h3>
+            <label className="flex items-center gap-2 text-xs cursor-pointer">
+              <input
+                type="checkbox"
+                checked={preferences.applyThemeToDocument !== false}
+                onChange={(e) =>
+                  onUpdatePreferences({
+                    ...preferences,
+                    applyThemeToDocument: e.target.checked,
+                    updatedAtMs: Date.now(),
+                  })
+                }
+              />
+              <span>Extend theme to document pages</span>
+            </label>
+          </div>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
             {(Object.keys(READER_THEMES) as Array<keyof typeof READER_THEMES>).map((key) => {
               const item = READER_THEMES[key];

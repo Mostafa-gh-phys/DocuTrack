@@ -53,6 +53,7 @@ interface DocumentPageSheetProps {
   themeMuted: string;
   isDarkTheme: boolean;
   themeId: ReaderTheme;
+  applyThemeToDocument?: boolean;
   fontClass: string;
   activeTool: PageZoteroTool;
   selectedColor: HighlightColor;
@@ -77,7 +78,7 @@ interface DocumentPageSheetProps {
   onPageMetrics?: (pageNumber: number, metrics: PageMetricsInfo) => void;
 }
 
-export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
+const DocumentPageSheetComponent: React.FC<DocumentPageSheetProps> = ({
   format,
   bookTitle,
   pageNumber,
@@ -95,6 +96,7 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
   themeMuted,
   isDarkTheme,
   themeId,
+  applyThemeToDocument = true,
   fontClass,
   activeTool,
   selectedColor,
@@ -161,7 +163,7 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
         for (const entry of entries) {
           if (entry.isIntersecting) {
             setInViewport(true);
-            if (entry.intersectionRatio >= 0.45) {
+            if (entry.intersectionRatio >= 0.25) {
               onVisibleRef.current?.(pageNumber);
             }
           } else if (totalPages > 8) {
@@ -170,7 +172,7 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
           }
         }
       },
-      {rootMargin: '640px', threshold: [0.02, 0.45]},
+      {rootMargin: '640px', threshold: [0.02, 0.25]},
     );
     observer.observe(el);
     return () => observer.disconnect();
@@ -433,7 +435,7 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
   return (
     <div
       className={`evince-page-sheet shrink-0 border ${themeBorder} shadow-[0_2px_10px_rgba(15,23,42,0.10)] dark:shadow-[0_2px_14px_rgba(0,0,0,0.45)] ${
-        !isDarkTheme ? themeBgSurface : 'bg-white'
+        applyThemeToDocument && !isDarkTheme ? themeBgSurface : 'bg-white'
       } flex flex-col`}
       style={{width: `${stageWidth}px`}}
     >
@@ -455,11 +457,13 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
             ref={canvasRef}
             data-testid="document-canvas"
             className={`block max-w-full ${
-              isDarkTheme
-                ? 'invert-[0.88] hue-rotate-180'
-                : themeId !== 'paper'
-                  ? 'mix-blend-multiply'
-                  : ''
+              !applyThemeToDocument
+                ? ''
+                : isDarkTheme
+                  ? 'invert-[0.88] hue-rotate-180'
+                  : themeId !== 'paper'
+                    ? 'mix-blend-multiply'
+                    : ''
             }`}
           />
         ) : (
@@ -497,8 +501,12 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
         )}
 
         {format === 'djvu' && djvuBlankBitmap && djvuPageText && (
-          <div className={`absolute inset-0 p-8 sm:p-10 overflow-y-auto ${themeBgSurface} ${themeText} z-10`}>
-            <div className={`text-[11px] font-mono uppercase tracking-wider ${themeMuted} mb-4`}>
+          <div
+            className={`absolute inset-0 p-8 sm:p-10 overflow-y-auto z-10 ${
+              applyThemeToDocument ? `${themeBgSurface} ${themeText}` : 'bg-white text-slate-900'
+            }`}
+          >
+            <div className={`text-[11px] font-mono uppercase tracking-wider ${applyThemeToDocument ? themeMuted : 'text-slate-500'} mb-4`}>
               DjVu Text Layer (TXTa) · {bookTitle}
             </div>
             <div className={`${fontClass} text-base leading-relaxed whitespace-pre-wrap select-text`}>
@@ -674,8 +682,8 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
       </div>
 
       {format === 'djvu' && !djvuBlankBitmap && djvuPageText && (
-        <details className={`border-t ${themeBorder} ${themeBgSurface} ${themeText} text-xs`}>
-          <summary className={`px-3 py-1.5 cursor-pointer select-none ${themeMuted} hover:opacity-100`}>
+        <details className={`border-t ${themeBorder} ${applyThemeToDocument ? `${themeBgSurface} ${themeText}` : 'bg-white text-slate-900'} text-xs`}>
+          <summary className={`px-3 py-1.5 cursor-pointer select-none ${applyThemeToDocument ? themeMuted : 'text-slate-500'} hover:opacity-100`}>
             Selectable OCR Text Layer (Page {pageNumber})
           </summary>
           <div className={`px-4 pb-3 pt-1 max-h-40 overflow-y-auto ${fontClass} leading-relaxed whitespace-pre-wrap select-text`}>
@@ -686,3 +694,5 @@ export const DocumentPageSheet: React.FC<DocumentPageSheetProps> = ({
     </div>
   );
 };
+
+export const DocumentPageSheet = React.memo(DocumentPageSheetComponent);

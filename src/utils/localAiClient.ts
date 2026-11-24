@@ -67,10 +67,31 @@ export function validateLocalAiEndpoint(rawUrl: string): {valid: boolean; baseUr
     if (u.protocol !== 'http:' && u.protocol !== 'https:') {
       return {valid: false, error: 'Only HTTP and HTTPS endpoints are supported.'};
     }
-    return {valid: true, baseUrl: `${u.origin}${u.pathname === '/' ? '' : u.pathname}`.replace(/\/+$/, '')};
+    const cleanPath = (u.pathname === '/' ? '' : u.pathname).replace(/\/+$/, '');
+    return {valid: true, baseUrl: `${u.origin}${cleanPath}`};
   } catch {
     return {valid: false, error: 'Invalid URL format. Example: http://localhost:11434'};
   }
+}
+
+function getOllamaRoot(baseUrl: string): string {
+  return baseUrl.replace(/\/(api|v1)$/i, '').replace(/\/+$/, '');
+}
+
+function getOpenAiV1Root(baseUrl: string): string {
+  const stripped = baseUrl.replace(/\/api$/i, '').replace(/\/+$/, '');
+  return stripped.endsWith('/v1') ? stripped : `${stripped}/v1`;
+}
+
+function buildLocalNetworkHelpHint(providerLabel: string, baseUrl: string): string {
+  const isHttpsPage =
+    typeof window !== 'undefined' &&
+    window.location?.protocol === 'https:' &&
+    baseUrl.startsWith('http://');
+  if (isHttpsPage) {
+    return `Browser security blocked HTTP call to ${providerLabel} (${baseUrl}) from an HTTPS page. Allow insecure local connections for this site or run DocuTrack on http://localhost / the desktop app, and enable CORS (${providerLabel === 'Ollama' ? 'OLLAMA_ORIGINS="*"' : 'CORS = ON'}).`;
+  }
+  return `Could not reach ${providerLabel} at ${baseUrl}. Ensure the local server is running and CORS is enabled (${providerLabel === 'Ollama' ? 'OLLAMA_ORIGINS="*"' : 'Enable CORS in Server Settings'}).`;
 }
 
 export interface GeneratedCoursePayload {
@@ -181,9 +202,15 @@ export async function fetchLocalAiModels(config: LocalAiConfig): Promise<string[
   }
 
   if (config.provider === 'ollama') {
-    const res = await fetch(`${check.baseUrl}/api/tags`, {
-      signal: AbortSignal.timeout(5000),
-    });
+    const root = getOllamaRoot(check.baseUrl);
+    let res: Response;
+    try {
+      res = await fetch(`${root}/api/tags`, {
+        signal: AbortSignal.timeout(5000),
+      });
+    } catch {
+      throw new Error(buildLocalNetworkHelpHint('Ollama', root));
+    }
     if (!res.ok) throw new Error(`Ollama returned HTTP ${res.status}`);
     const data = (await res.json()) as {models?: Array<{name?: string; model?: string}>};
     return (data.models || [])
@@ -192,15 +219,22 @@ export async function fetchLocalAiModels(config: LocalAiConfig): Promise<string[
   }
 
   // LM Studio & OpenAI-compatible (/v1/models)
-  const v1Base = check.baseUrl.endsWith('/v1') ? check.baseUrl : `${check.baseUrl}/v1`;
+  const v1Base = getOpenAiV1Root(check.baseUrl);
   const headers: Record<string, string> = {};
   if (config.provider === 'openai-compat' && config.customApiKey.trim()) {
     headers.Authorization = `Bearer ${config.customApiKey.trim()}`;
   }
-  const res = await fetch(`${v1Base}/models`, {
-    headers,
-    signal: AbortSignal.timeout(5000),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${v1Base}/models`, {
+      headers,
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {
+    throw new Error(
+      buildLocalNetworkHelpHint(config.provider === 'lmstudio' ? 'LM Studio' : 'Local AI Server', check.baseUrl),
+    );
+  }
   if (!res.ok) throw new Error(`Local OpenAI server returned HTTP ${res.status}`);
   const data = (await res.json()) as {data?: Array<{id?: string}>};
   return (data.data || []).map((m) => m.id || '').filter(Boolean);
@@ -212,13 +246,41 @@ function buildLocalCoursePrompt(params: {
   content: string;
   mode: 'course' | 'summary';
 }): {system: string; user: string} {
-  const clipped = params.content.slice(0, 18000);
+  const safeContent =
+    params.content && params.content.trim().length >= 20
+      ? params.content.slice(0, 18000)
+      : `Book Metadata:\nTitle: ${params.title}\nAuthor: ${params.author}\n\n${params.content || ''}`.trim();
   const count = params.mode === 'summary' ? 3 : 4;
   return {
     system:
       'You are an expert curriculum designer. Respond ONLY with a valid JSON object matching this exact schema: {"title": string, "summary": string, "keyConcepts": string[], "modules": [{"moduleNumber": number, "title": string, "durationMinutes": number, "objectives": string[], "lectureNotes": string, "quizQuestion": string, "quizAnswer": string}]}. Do not include markdown commentary outside the JSON.',
-    user: `Transform "${params.title}" by ${params.author} into a ${params.mode === 'summary' ? 'concise 3-module study guide' : `structured ${count}-module lecture course`} strictly grounded in the text below.\n\nDocument text:\n${clipped}`,
+    user: `Transform "${params.title}" by ${params.author} into a ${params.mode === 'summary' ? 'concise 3-module study guide' : `structured ${count}-module lecture course`} grounded in the text below.\n\nDocument text:\n${safeContent}`,
   };
+}
+
+async function resolveTargetModelName(config: LocalAiConfig): Promise<string> {
+  const explicit =
+    config.provider === 'ollama'
+      ? config.ollamaModel.trim()
+      : config.provider === 'lmstudio'
+        ? config.lmStudioModel.trim()
+        : config.customModel.trim();
+
+  if (explicit && explicit !== 'local-model') return explicit;
+
+  try {
+    const models = await fetchLocalAiModels(config);
+    if (models.length > 0) return models[0];
+  } catch (err) {
+    if (config.provider === 'ollama') throw err;
+  }
+
+  if (config.provider === 'lmstudio') {
+    return 'local-model';
+  }
+  throw new Error(
+    `Select or enter a loaded model name for ${config.provider === 'ollama' ? 'Ollama' : 'your local AI server'}.`,
+  );
 }
 
 export async function generateCourseWithProvider(
@@ -230,67 +292,92 @@ export async function generateCourseWithProvider(
     mode: 'course' | 'summary';
   },
 ): Promise<GeneratedCoursePayload> {
+  const normalizedContent =
+    (params.content || '').trim().length >= 20
+      ? params.content.trim()
+      : `Title: ${params.title || 'Untitled Document'}\nAuthor: ${params.author || 'Unknown'}\n${params.content || ''}`.trim();
+
   if (config.provider === 'gemini') {
     const res = await fetch('/api/ai/course', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(params),
+      body: JSON.stringify({...params, content: normalizedContent}),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to generate AI course.');
+    const raw = await res.text();
+    let data: Record<string, unknown> = {};
+    try {
+      data = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    } catch {
+      throw new Error(res.ok ? 'Received malformed JSON from Cloud AI service.' : `Cloud AI error (HTTP ${res.status}): ${raw.slice(0, 140)}`);
+    }
+    if (!res.ok) {
+      throw new Error(typeof data.error === 'string' && data.error ? data.error : `Cloud Gemini failed (HTTP ${res.status}).`);
+    }
     return {
-      title: data.title || `${params.title} — Study Course`,
-      summary: data.summary || '',
+      title: typeof data.title === 'string' && data.title ? data.title : `${params.title} — Study Course`,
+      summary: typeof data.summary === 'string' ? data.summary : '',
       keyConcepts: Array.isArray(data.keyConcepts) ? data.keyConcepts : [],
-      modules: Array.isArray(data.modules) ? data.modules : [],
+      modules: Array.isArray(data.modules) ? (data.modules as CourseModule[]) : [],
     };
   }
 
-  const prompt = buildLocalCoursePrompt(params);
+  const prompt = buildLocalCoursePrompt({...params, content: normalizedContent});
 
   if (config.provider === 'ollama') {
     const check = validateLocalAiEndpoint(config.ollamaUrl);
     if (!check.valid || !check.baseUrl) throw new Error(check.error || 'Invalid Ollama URL');
-    const model = config.ollamaModel.trim();
-    if (!model) throw new Error('Select or enter an Ollama model name (e.g. llama3.2).');
+    const root = getOllamaRoot(check.baseUrl);
+    const model = await resolveTargetModelName(config);
 
-    let res: Response;
-    try {
-      res = await fetch(`${check.baseUrl}/api/chat`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          model,
-          stream: false,
-          format: 'json',
-          messages: [
-            {role: 'system', content: prompt.system},
-            {role: 'user', content: prompt.user},
-          ],
-          options: {temperature: 0.3},
-        }),
-        signal: AbortSignal.timeout(120000),
-      });
-    } catch {
-      throw new Error(
-        `Could not reach Ollama at ${check.baseUrl}. Ensure Ollama is running (and set OLLAMA_ORIGINS="*" if calling from an HTTPS browser tab).`,
-      );
+    const callOllama = async (useJsonFormat: boolean): Promise<Response> => {
+      try {
+        return await fetch(`${root}/api/chat`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            model,
+            stream: false,
+            ...(useJsonFormat ? {format: 'json'} : {}),
+            messages: [
+              {role: 'system', content: prompt.system},
+              {role: 'user', content: prompt.user},
+            ],
+            options: {temperature: 0.3},
+          }),
+          signal: AbortSignal.timeout(120000),
+        });
+      } catch {
+        throw new Error(buildLocalNetworkHelpHint('Ollama', root));
+      }
+    };
+
+    let res = await callOllama(true);
+    if (!res.ok && res.status === 400) {
+      // Retry without strict format='json' for models/versions that disallow JSON grammar mode
+      res = await callOllama(false);
     }
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
       throw new Error(`Ollama error (HTTP ${res.status}): ${errText.slice(0, 180)}`);
     }
     const json = (await res.json()) as {message?: {content?: string}; response?: string};
-    return parseAiCoursePayload(json.message?.content || json.response || '', params.title);
+    const rawOut = json.message?.content || json.response || '';
+    if (!rawOut.trim()) {
+      const retry = await callOllama(false);
+      if (retry.ok) {
+        const retryJson = (await retry.json()) as {message?: {content?: string}; response?: string};
+        return parseAiCoursePayload(retryJson.message?.content || retryJson.response || '', params.title);
+      }
+    }
+    return parseAiCoursePayload(rawOut, params.title);
   }
 
   // LM Studio or Custom OpenAI-Compatible endpoint
   const rawBase = config.provider === 'lmstudio' ? config.lmStudioUrl : config.customBaseUrl;
   const check = validateLocalAiEndpoint(rawBase);
   if (!check.valid || !check.baseUrl) throw new Error(check.error || 'Invalid endpoint URL');
-  const v1Base = check.baseUrl.endsWith('/v1') ? check.baseUrl : `${check.baseUrl}/v1`;
-  const model =
-    (config.provider === 'lmstudio' ? config.lmStudioModel : config.customModel).trim() || 'local-model';
+  const v1Base = getOpenAiV1Root(check.baseUrl);
+  const model = await resolveTargetModelName(config);
 
   const headers: Record<string, string> = {'Content-Type': 'application/json'};
   if (config.provider === 'openai-compat' && config.customApiKey.trim()) {
@@ -314,7 +401,7 @@ export async function generateCourseWithProvider(
     });
   } catch {
     throw new Error(
-      `Could not reach ${config.provider === 'lmstudio' ? 'LM Studio' : 'local AI server'} at ${check.baseUrl}. Verify the local server is started and CORS is enabled.`,
+      buildLocalNetworkHelpHint(config.provider === 'lmstudio' ? 'LM Studio' : 'local AI server', check.baseUrl),
     );
   }
   if (!res.ok) {

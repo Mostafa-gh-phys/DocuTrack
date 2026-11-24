@@ -13,13 +13,27 @@ export interface AnnotationPosition {
 
 export type ReaderTheme =
   | 'paper'
+  | 'cream'
   | 'sepia'
   | 'parchment'
   | 'sage'
+  | 'solarized-light'
   | 'dusk'
   | 'nord'
+  | 'solarized-dark'
+  | 'forest'
+  | 'gruvbox'
   | 'night'
-  | 'amoled';
+  | 'amoled'
+  | 'high-contrast';
+
+export interface OutlineItem {
+  title: string;
+  page: number;
+  depth: number;
+  href?: string;
+  fragmentId?: string;
+}
 
 export type UITheme = 'light' | 'parchment' | 'sage' | 'dark' | 'obsidian';
 
@@ -150,6 +164,7 @@ export interface ReaderPreferences {
   novelIndent?: boolean;
   novelJustify?: boolean;
   novelDropCap?: boolean;
+  applyThemeToDocument?: boolean;
   backupFrequency: BackupFrequency;
   updatedAtMs: number;
 }

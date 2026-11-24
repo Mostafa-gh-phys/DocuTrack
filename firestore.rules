@@ -173,11 +173,11 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'ownerId', 'theme', 'uiTheme', 'accentColor', 'fontFamily', 'fontSize', 'lineHeight',
           'maxWidth', 'columnCount', 'epubViewMode', 'novelIndent', 'novelJustify', 'novelDropCap',
-          'backupFrequency', 'updatedAt'
+          'applyThemeToDocument', 'backupFrequency', 'updatedAt'
         ])
         && data.ownerId == userId
         && isValidId(data.ownerId)
-        && data.theme in ['paper', 'sepia', 'parchment', 'sage', 'dusk', 'nord', 'night', 'amoled']
+        && data.theme in ['paper', 'cream', 'sepia', 'parchment', 'sage', 'solarized-light', 'dusk', 'nord', 'solarized-dark', 'forest', 'gruvbox', 'night', 'amoled', 'high-contrast']
         && data.uiTheme in ['light', 'parchment', 'sage', 'dark', 'obsidian']
         && (!('accentColor' in data) || (data.accentColor in ['cobalt', 'forest', 'burgundy', 'ochre', 'indigo', 'graphite']))
         && data.fontFamily in ['serif', 'literary', 'garamond', 'merriweather', 'sans', 'humanist', 'accessible', 'mono']
@@ -189,6 +189,7 @@ service cloud.firestore {
         && (!('novelIndent' in data) || data.novelIndent is bool)
         && (!('novelJustify' in data) || data.novelJustify is bool)
         && (!('novelDropCap' in data) || data.novelDropCap is bool)
+        && (!('applyThemeToDocument' in data) || data.applyThemeToDocument is bool)
         && data.backupFrequency in ['manual', 'onChange', 'hourly', 'daily']
         && data.updatedAt is timestamp;
     }
@@ -250,13 +251,15 @@ service cloud.firestore {
           && isValidBook(incoming(), userId, bookId)
           && incoming().id == existing().id
           && incoming().ownerId == existing().ownerId
+          && incoming().format == existing().format
+          && incoming().addedAt == existing().addedAt
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
-          && (
-            incoming().diff(existing()).affectedKeys().hasOnly(['currentPage', 'progress', 'lastOpenedAt', 'isFavorite', 'offlinePinned', 'updatedAt'])
-            || incoming().diff(existing()).affectedKeys().hasOnly(['title', 'author', 'folderPath', 'tags', 'isFavorite', 'offlinePinned', 'updatedAt'])
-            || incoming().diff(existing()).affectedKeys().hasOnly(['pageCount', 'excerpt', 'language', 'updatedAt'])
-          );
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'title', 'author', 'folderPath', 'fileSize', 'pageCount',
+            'currentPage', 'progress', 'isFavorite', 'offlinePinned',
+            'tags', 'coverUrl', 'excerpt', 'language', 'lastOpenedAt', 'updatedAt'
+          ]);
         allow delete: if isValidId(userId) && isValidId(bookId) && isVerifiedOwner(userId);
       }
 
@@ -323,7 +326,7 @@ service cloud.firestore {
           && incoming().diff(existing()).affectedKeys().hasOnly([
             'theme', 'uiTheme', 'accentColor', 'fontFamily', 'fontSize', 'lineHeight',
             'maxWidth', 'columnCount', 'epubViewMode', 'novelIndent', 'novelJustify', 'novelDropCap',
-            'backupFrequency', 'updatedAt'
+            'applyThemeToDocument', 'backupFrequency', 'updatedAt'
           ]);
         allow delete: if isValidId(userId) && isValidId(prefId) && isVerifiedOwner(userId);
       }

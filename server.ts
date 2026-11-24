@@ -182,12 +182,17 @@ async function startServer() {
       mode?: 'course' | 'summary';
     };
 
-    if (!content || typeof content !== 'string' || content.trim().length < 20) {
-      res.status(400).json({error: 'Document content is required (minimum 20 characters).'});
+    const normalizedContent =
+      (typeof content === 'string' && content.trim().length >= 20
+        ? content.trim()
+        : `Title: ${title || 'Untitled Document'}\nAuthor: ${author || 'Unknown'}\n${typeof content === 'string' ? content.trim() : ''}`.trim());
+
+    if (!normalizedContent || normalizedContent.length < 3) {
+      res.status(400).json({error: 'Document title or content is required to generate a study course.'});
       return;
     }
 
-    const clippedContent = content.slice(0, 32000);
+    const clippedContent = normalizedContent.slice(0, 32000);
     const prompt =
       mode === 'summary'
         ? `Analyze the document "${title || 'Untitled'}" by ${author || 'Unknown'} and produce a crisp executive summary, key concepts, and a structured 3-module study guide.\n\nDocument excerpt:\n${clippedContent}`
@@ -199,7 +204,7 @@ async function startServer() {
         contents: prompt,
         config: {
           systemInstruction:
-            'You are an expert academic curriculum designer and research synthesizer. Ground every module, summary, and quiz strictly in the provided document text. Write clear, structured, scholarly prose.',
+            'You are an expert academic curriculum designer and research synthesizer. Ground every module, summary, and quiz in the provided document text or metadata. Write clear, structured, scholarly prose.',
           thinkingConfig: {thinkingLevel: ThinkingLevel.LOW},
           responseMimeType: 'application/json',
           responseSchema: {
@@ -245,7 +250,10 @@ async function startServer() {
         },
       });
 
-      const parsed = JSON.parse((response.text ?? '{}').trim());
+      let rawJson = (response.text ?? '{}').trim();
+      const fence = rawJson.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      if (fence) rawJson = fence[1].trim();
+      const parsed = JSON.parse(rawJson);
       res.json(parsed);
     } catch (error) {
       console.error('Gemini course generation error:', error);

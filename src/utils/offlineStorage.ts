@@ -90,6 +90,7 @@ export const DEFAULT_PREFERENCES: ReaderPreferences = {
   novelIndent: true,
   novelJustify: true,
   novelDropCap: true,
+  applyThemeToDocument: true,
   backupFrequency: 'onChange',
   updatedAtMs: Date.now(),
 };

@@ -36,6 +36,7 @@ export async function ensureDjvuInit(): Promise<boolean> {
 export interface DjvuOutlineItem {
   title: string;
   page: number;
+  depth: number;
 }
 
 export interface ParsedDjvuInfo {
@@ -76,13 +77,14 @@ function flattenDjvuJsBookmarks(
   depth = 0,
 ): void {
   for (const item of items) {
-    if (out.length >= 60) break;
+    if (out.length >= 250) break;
     const rawTitle = (item.description || '').trim();
     const resolvedPage = item.url ? doc.getPageNumberByUrl(item.url) : null;
     if (rawTitle && resolvedPage && resolvedPage >= 1) {
       out.push({
-        title: depth > 0 ? `${'  '.repeat(Math.min(depth, 3))}${rawTitle}` : rawTitle,
+        title: rawTitle,
         page: resolvedPage,
+        depth: Math.min(depth, 5),
       });
     }
     if (Array.isArray(item.children) && item.children.length > 0) {
